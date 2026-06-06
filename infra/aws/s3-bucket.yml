@@ -1,0 +1,34 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Private S3 bucket for Lyrcloud static site assets.
+
+Parameters:
+  SiteBucketName:
+    Type: String
+    Default: lyrcloud.com
+    Description: Globally unique S3 bucket name for site assets.
+
+Resources:
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SiteBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+Outputs:
+  SiteBucketName:
+    Description: S3 bucket name.
+    Value: !Ref SiteBucket
+  SiteBucketRegionalDomainName:
+    Description: Regional S3 domain name for the bucket.
+    Value: !GetAtt SiteBucket.RegionalDomainName
