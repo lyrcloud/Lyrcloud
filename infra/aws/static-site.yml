@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lyrcloud static site on S3, Lambda@Edge, CloudFront, and Route53.
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: lyrcloud.com
+    Description: Apex domain to host.
+  SiteBucketName:
+    Type: String
+    Default: lyrcloud.com
+    Description: Existing private S3 bucket name for site assets.
+  HostedZoneId:
+    Type: String
+    Description: Existing public Route53 hosted zone ID for DomainName.
+
+Resources:
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      SubjectAlternativeNames:
+        - !Sub 'www.${DomainName}'
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+        - DomainName: !Sub 'www.${DomainName}'
+          HostedZoneId: !Ref HostedZoneId
+
+  EdgeFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  ViewerRequestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-viewer-request'
+      Runtime: nodejs24.x
+      Handler: index.handler
+      Role: !GetAtt EdgeFunctionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            const request = event.Records[0].cf.request;
+            const uri = request.uri || '/';
+
+            if (uri.endsWith('/')) {
+              request.uri = `${uri}index.html`;
+              return request;
+            }
+
+            const lastSegment = uri.substring(uri.lastIndexOf('/') + 1);
+            if (!lastSegment.includes('.')) {
+              request.uri = '/index.html';
+            }
+
+            return request;
+          };
+
+  ViewerRequestFunctionVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref ViewerRequestFunction
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-s3-oac'
+        Description: Access control for the private Lyrcloud S3 origin.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn:
+      - Certificate
+      - ViewerRequestFunctionVersion
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${DomainName} static site'
+        DefaultRootObject: index.html
+        Aliases:
+          - !Ref DomainName
+          - !Sub 'www.${DomainName}'
+        Origins:
+          - Id: s3-origin
+            DomainName: !Sub '${SiteBucketName}.s3.${AWS::Region}.amazonaws.com'
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: s3-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          LambdaFunctionAssociations:
+            - EventType: viewer-request
+              LambdaFunctionARN: !Ref ViewerRequestFunctionVersion
+              IncludeBody: false
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${SiteBucketName}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  ApexARecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub '${DomainName}.'
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  ApexAAAARecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub '${DomainName}.'
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  WwwARecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub 'www.${DomainName}.'
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  WwwAAAARecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub 'www.${DomainName}.'
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+Outputs:
+  SiteBucketName:
+    Description: S3 bucket that receives built static assets.
+    Value: !Ref SiteBucketName
+  DistributionId:
+    Description: CloudFront distribution ID.
+    Value: !Ref Distribution
+  DistributionDomainName:
+    Description: CloudFront distribution domain.
+    Value: !GetAtt Distribution.DomainName
+  SiteUrl:
+    Description: Public site URL.
+    Value: !Sub 'https://${DomainName}'

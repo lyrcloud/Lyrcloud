@@ -1,0 +1,22 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Route53 public hosted zone for Lyrcloud.
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: lyrcloud.com
+    Description: Apex domain for the public hosted zone.
+
+Resources:
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Sub '${DomainName}.'
+
+Outputs:
+  HostedZoneId:
+    Description: Public Route53 hosted zone ID.
+    Value: !Ref HostedZone
+  NameServers:
+    Description: Set these at the domain registrar before deploying the CloudFront stack.
+    Value: !Join [',', !GetAtt HostedZone.NameServers]
