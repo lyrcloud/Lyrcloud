@@ -301,7 +301,7 @@ function sidebar(route) {
   const accountLinks = [
     ['#/', 'Account home', icons.home, route.view === 'home'],
     ['#/add-site', 'Add a site', icons.add, route.view === 'add-site'],
-    ['#/projects', 'Projects', icons.projects, route.view.startsWith('project')],
+    ...(PROJECTS_ENABLED ? [['#/projects', 'Projects', icons.projects, route.view.startsWith('project')]] : []),
     ['#/workers', 'Edge Functions', icons.workers, route.view.startsWith('worker')],
     ['#/settings', 'Account settings', icons.settings, route.view === 'settings'],
   ];
@@ -702,16 +702,16 @@ const views = {
     return views.admin(route);
   },
 
-  projects: (route) => projectsView(route),
-  project: (route) => projectView(route),
+  projects: (route) => (PROJECTS_ENABLED ? projectsView(route) : views.missing()),
+  project: (route) => (PROJECTS_ENABLED ? projectView(route) : views.missing()),
 
   admin(route) {
     if (profileFailed) return `<section class="panel"><p class="form-error">Couldn’t load your account. Reload the page to try again.</p></section>`;
     if (!profile) return '<section class="panel"><p class="muted">Loading…</p></section>';
     if (!isStaff(profile.role)) return views.missing();
     const isSuper = profile.role === 'superadmin';
-    const tab = ['overview', 'users', 'projects', 'settings'].includes(route.params.get('tab')) ? route.params.get('tab') : 'overview';
-    const tabs = [['overview', 'Overview'], ['users', `Users${adminUsers.list ? ` (${adminUsers.list.length})` : ''}`], ['projects', 'Projects'], ['settings', 'Site settings']]
+    const tab = ['overview', 'users', ...(PROJECTS_ENABLED ? ['projects'] : []), 'settings'].includes(route.params.get('tab')) ? route.params.get('tab') : 'overview';
+    const tabs = [['overview', 'Overview'], ['users', `Users${adminUsers.list ? ` (${adminUsers.list.length})` : ''}`], ...(PROJECTS_ENABLED ? [['projects', 'Projects']] : []), ['settings', 'Site settings']]
       .map(([id, label]) => `<a class="admin-tab" href="#/admin?tab=${id}"${id === tab ? ' aria-current="page"' : ''}>${label}</a>`)
       .join('');
     const body = adminUsers.error
@@ -1093,6 +1093,8 @@ const adminGithubApp = { data: null, error: '', loading: false };
 let projectsTimer = null;
 
 const projectsApi = (path, options) => api(path, options, PROJECTS_API_BASE);
+// Projects stays hidden until its API is deployed and PROJECTS_API_BASE (src/auth.js) points at it.
+const PROJECTS_ENABLED = !PROJECTS_API_BASE.endsWith('.invalid');
 
 const DEPLOY_STATUS = {
   queued: ['pending', '◌ Queued'], building: ['pending', '◌ Building'], live: ['ok', '● Live'], ready: ['', 'Ready'],
@@ -1476,12 +1478,12 @@ function render() {
   app.classList.remove('sidebar-open');
   bindCharts();
   if (currentRoute.view === 'settings') showProfile();
-  if (currentRoute.view.startsWith('project')) projectsAfterRender(currentRoute);
+  if (PROJECTS_ENABLED && currentRoute.view.startsWith('project')) projectsAfterRender(currentRoute);
   if (isAdminView() && profile && isStaff(profile.role)) {
     if (!adminUsers.list && !adminUsers.loading && !adminUsers.error) loadUsers();
     if (currentRoute.params.get('tab') === 'settings' && !adminSettings.data && !adminSettings.loading) loadAdminSettings();
-    if (currentRoute.params.get('tab') === 'settings' && !adminGithubApp.data && !adminGithubApp.loading) loadAdminGithubApp();
-    if (currentRoute.params.get('tab') === 'projects' && !adminProjects.list && !adminProjects.loading) loadAdminProjects();
+    if (PROJECTS_ENABLED && currentRoute.params.get('tab') === 'settings' && !adminGithubApp.data && !adminGithubApp.loading) loadAdminGithubApp();
+    if (PROJECTS_ENABLED && currentRoute.params.get('tab') === 'projects' && !adminProjects.list && !adminProjects.loading) loadAdminProjects();
     applyAdminSearch();
   }
   document.title = `${document.querySelector('.page-head h1')?.textContent || 'Dashboard'} | Lyrcloud`;
