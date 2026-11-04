@@ -1,3 +1,4 @@
+import { logo } from '../src/logo.js';
 import { products } from './products.mjs';
 
 export const escape = (value) =>
@@ -20,8 +21,7 @@ function header(active) {
   return `
     <header class="site-header">
       <a class="brand" href="/" aria-label="Lyrcloud home">
-        <span class="brand-mark" aria-hidden="true">✦</span>
-        <span>Lyrcloud</span>
+        ${logo('header')}
       </a>
       <nav aria-label="Main navigation">
         <div class="nav-dropdown">
@@ -56,7 +56,7 @@ function footer() {
   return `
     <footer class="footer">
       <div class="footer-brand">
-        <div class="brand"><span class="brand-mark" aria-hidden="true">✦</span><span>Lyrcloud</span></div>
+        <div class="brand">${logo('footer')}</div>
         <p>Build, secure, and scale every digital experience on one global cloud.</p>
       </div>
       <div class="footer-columns">
@@ -92,7 +92,11 @@ export function renderPage({ route, title, description, body, bodyClass = '', ch
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="${escape(description)}" />
     <title>${escape(fullTitle)}</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E✦%3C/text%3E%3C/svg%3E" />
+    <link rel="icon" href="/favicon.ico" sizes="48x48" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <meta name="theme-color" content="#0ea5e9" />
     ${styleTags}
   </head>
   <body${bodyClass ? ` class="${bodyClass}"` : ''}>${chrome ? header(route) : ''}
