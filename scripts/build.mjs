@@ -27,6 +27,8 @@ const assetBase = `/assets/${await hashDirectory('src')}/`;
 await rm('dist', { recursive: true, force: true });
 await mkdir('dist', { recursive: true });
 await cp('src', join('dist', assetBase), { recursive: true });
+// public/ holds root-level files (favicons, logo, manifest) that need stable URLs.
+await cp('public', 'dist', { recursive: true });
 
 for (const page of pages) {
   const file = outputPath(page.route);

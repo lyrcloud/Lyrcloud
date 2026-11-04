@@ -146,14 +146,42 @@ p {
   font-size: 1.18rem;
 }
 
-.brand-mark {
-  display: grid;
-  place-items: center;
-  width: 36px;
-  height: 36px;
-  border-radius: 12px;
-  background: linear-gradient(135deg, var(--brand), var(--accent));
-  box-shadow: 0 0 40px rgba(50, 211, 255, 0.35);
+/* Logo markup lives in src/logo.js. The cloud floats gently and a sheen sweeps across it. */
+.brand-logo {
+  display: block;
+  height: 30px;
+  width: auto;
+  color: var(--text);
+  overflow: visible;
+}
+
+.brand-cloud {
+  animation: brand-float 4s ease-in-out infinite;
+}
+
+.brand-sheen {
+  animation: brand-sheen 5s ease-in-out infinite;
+}
+
+.brand:hover .brand-cloud {
+  animation-duration: 1.6s;
+}
+
+@keyframes brand-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-2.5px); }
+}
+
+@keyframes brand-sheen {
+  0%, 55% { transform: skewX(-20deg) translateX(0); }
+  85%, 100% { transform: skewX(-20deg) translateX(100px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .brand-cloud,
+  .brand-sheen {
+    animation: none;
+  }
 }
 
 nav {

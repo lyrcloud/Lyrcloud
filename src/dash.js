@@ -3,6 +3,7 @@
 // a server yet: they live in localStorage, and analytics are generated sample data (clearly
 // labeled in the UI). DNS lookups and nameserver checks are real, using public DNS-over-HTTPS.
 import { authFetch, redirectToLogin } from './auth.js';
+import { logo } from './logo.js';
 import { endSession, getSession } from './session.js';
 
 const STORE_KEY = 'lyrcloud.dash.v1';
@@ -284,7 +285,7 @@ function sidebar(route) {
 
   return `
     <aside class="dash-sidebar">
-      <a class="brand" href="/"><span class="brand-mark" aria-hidden="true">✦</span><span>Lyrcloud</span></a>
+      <a class="brand" href="/" aria-label="Lyrcloud home">${logo('dash')}</a>
       <nav aria-label="Dashboard">
         ${accountLinks.map(link).join('')}
         ${zone ? `<p class="nav-label">${esc(zone.name)}</p>${zoneLinks.map(link).join('')}` : ''}

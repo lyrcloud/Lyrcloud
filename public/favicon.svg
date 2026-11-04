@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><style>
+.c{animation:f 3.2s ease-in-out infinite}
+.s{animation:s 4.5s ease-in-out infinite}
+@keyframes f{0%,100%{transform:translateY(0)}50%{transform:translateY(-2.5px)}}
+@keyframes s{0%,50%{transform:skewX(-20deg) translateX(0)}85%,100%{transform:skewX(-20deg) translateX(110px)}}
+@media (prefers-reduced-motion:reduce){.c,.s{animation:none}}
+</style><defs><linearGradient id="g" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#0ea5e9"/><stop offset="1" stop-color="#7c3aed"/></linearGradient><linearGradient id="h" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#7dd3fc" stop-opacity="0"/><stop offset=".5" stop-color="#7dd3fc" stop-opacity=".9"/><stop offset="1" stop-color="#7dd3fc" stop-opacity="0"/></linearGradient><clipPath id="k"><path d="M18 46A10 10 0 1 1 18.53 26.01A14 14 0 0 1 45.92 23.01A11.5 11.5 0 1 1 46.5 46Z" transform="translate(32 33.5) scale(1.12) translate(-32.5 -29.5)"/></clipPath></defs><rect width="64" height="64" rx="15" fill="url(#g)"/><g class="c"><path d="M18 46A10 10 0 1 1 18.53 26.01A14 14 0 0 1 45.92 23.01A11.5 11.5 0 1 1 46.5 46Z" transform="translate(32 33.5) scale(1.12) translate(-32.5 -29.5)" fill="#fff"/><g clip-path="url(#k)"><rect class="s" x="-26" y="0" width="20" height="64" fill="url(#h)" transform="skewX(-20)"/></g></g></svg>
