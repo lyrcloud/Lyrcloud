@@ -1212,6 +1212,62 @@ a.stat:hover {
   resize: vertical;
 }
 
+/* Mobile number and update emails */
+
+.setting-control.phone-control {
+  flex: 0 1 auto;
+  display: grid;
+  gap: 8px;
+  justify-items: end;
+}
+
+.phone-control p {
+  margin: 0;
+  font-size: 0.82rem;
+}
+
+.phone-form input {
+  width: 13rem;
+  max-width: 100%;
+}
+
+.stack .field {
+  max-width: none;
+  margin-bottom: 0;
+}
+
+.update-list {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.update-list li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 12px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+}
+
+@media (max-width: 640px) {
+  .setting-row:has(.phone-control) {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .setting-control.phone-control {
+    justify-items: start;
+  }
+
+  .phone-form input {
+    flex: 1 1 10rem;
+  }
+}
+
 /* ---------------------------------------------------------------- responsive */
 
 @media (max-width: 1020px) {

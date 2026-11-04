@@ -35,6 +35,11 @@ To add a page, add an entry to the `pages` array in `site/pages.mjs`. To add a p
 
 Sign-in is real: `/login/` and `/sign-up/` send visitors to the Cognito Hosted UI (`lyrcloud-users` pool), which offers Google and GitHub. Cognito only accepts `/callback.html` as the redirect and `/index.html` as the logout page (on `https://www.lyrcloud.com` and `http://localhost:5173`), so keep those paths. Profile data in Settings comes from the account API (`GET /me`).
 
+- **Email and password:** `/sign-up/` and `/login/` also have their own forms (`src/login.js`, `src/cognito.js`) that call the Cognito API directly: sign up → 6-digit email code (sent by Cognito) → optional mobile number → texted code. Forgot-password works the same way. Run `python3 scripts/configure-auth.py` (report) then `--apply` to turn self sign-up and the code emails on in the pool.
+- **Mobile numbers:** the account API texts the code through Amazon SNS (`POST /me/phone`, `POST /me/phone/verify`) and stores only a hash of it. New SNS accounts are in the SMS sandbox with a $1/month spend limit.
+- **Emails:** the account API sends a welcome email to each new account and lets the super admin email product updates from the admin console (Settings tab), through Amazon SES from `no-reply@lyrcloud.com`. Each update has a signed unsubscribe link, and people can switch updates off in Account settings. SES needs the `lyrcloud.com` DKIM records in Cloudflare and production access before it can mail everyone.
+- **GitHub:** GitHub isn't an OpenID provider, so `api/github-bridge/` makes it look like one for Cognito. Deploy it with `bash scripts/deploy-github-bridge.sh`, point Cognito at it with `configure-auth.py --github-bridge <url>`, set the GitHub OAuth app's callback URL to `<url>/callback`, then turn on `GITHUB_SIGN_IN_ENABLED` in `site/pages.mjs`.
+
 The dashboard itself is not backed by a server yet:
 
 - **Real:** adding a site scans its existing DNS records over public DNS-over-HTTPS (dns.google), and “Check nameservers” looks up the domain’s live NS records. The Edge Functions preview runs code in an isolated Web Worker in the browser.

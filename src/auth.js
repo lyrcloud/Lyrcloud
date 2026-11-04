@@ -1,5 +1,5 @@
-// Shared auth helpers for Lyrcloud's Cognito Hosted UI login (Google native,
-// GitHub via a custom OIDC bridge — see infra/aws/github-bridge.yml).
+// Shared auth helpers for Lyrcloud's Cognito login: Google and GitHub through the Hosted UI (GitHub via
+// the OIDC bridge in infra/aws/github-bridge.yml), and email-and-password through src/cognito.js.
 // Used by the site header (src/main.js), /callback.html (token exchange), and
 // the dashboard (src/dash.js, via src/session.js).
 //
@@ -8,6 +8,8 @@
 // yet. The access_token (not the id_token) is what's sent to the account
 // API — Cognito access tokens carry `client_id` instead of `aud`, which is
 // exactly what the API's JWT authorizer is configured to check.
+
+import { refresh, revoke, signIn } from './cognito.js';
 
 export const COGNITO_DOMAIN = 'lyrcloud-auth.auth.us-east-1.amazoncognito.com';
 export const CLIENT_ID = '5h78n6dkjbhq92423lscfllj6t';
@@ -49,12 +51,15 @@ export function getTokens() {
   }
 }
 
-function storeTokens(tokenResponse) {
+// `method` is "password" for sessions from the email-and-password form; those refresh through the
+// Cognito API instead of the Hosted UI token endpoint.
+function storeTokens(tokenResponse, method = 'hosted') {
   const tokens = {
     accessToken: tokenResponse.access_token,
     idToken: tokenResponse.id_token,
     refreshToken: tokenResponse.refresh_token,
     expiresAt: Date.now() + tokenResponse.expires_in * 1000,
+    method,
   };
   sessionStorage.setItem(TOKENS_KEY, JSON.stringify(tokens));
   return tokens;
@@ -66,6 +71,17 @@ export function clearTokens() {
 
 export function isLoggedIn() {
   return Boolean(getTokens());
+}
+
+// Signs in with an email and password (see src/cognito.js) and keeps the session like a Hosted UI one.
+export async function passwordSignIn(email, password) {
+  const result = await signIn(CLIENT_ID, email, password);
+  return storeTokens({
+    access_token: result.AccessToken,
+    id_token: result.IdToken,
+    refresh_token: result.RefreshToken,
+    expires_in: result.ExpiresIn,
+  }, 'password');
 }
 
 // Redirects the browser to Cognito. Passing `provider` ('google' or 'github')
@@ -117,6 +133,16 @@ async function refreshTokens() {
   const tokens = getTokens();
   if (!tokens?.refreshToken) return null;
 
+  if (tokens.method === 'password') {
+    try {
+      const result = await refresh(CLIENT_ID, tokens.refreshToken);
+      return storeTokens({ access_token: result.AccessToken, id_token: result.IdToken, refresh_token: tokens.refreshToken, expires_in: result.ExpiresIn }, 'password');
+    } catch {
+      clearTokens();
+      return null;
+    }
+  }
+
   const body = new URLSearchParams({
     grant_type: 'refresh_token',
     client_id: CLIENT_ID,
@@ -162,8 +188,14 @@ export function takeReturnPath(fallback = '/dash/') {
 }
 
 export function logout() {
+  const tokens = getTokens();
   clearTokens();
   sessionStorage.removeItem('lyrcloud.profile');
+  // Password sessions never touched the Hosted UI, so there's no Cognito cookie to clear.
+  if (tokens?.method === 'password') {
+    revoke(CLIENT_ID, tokens.refreshToken).finally(() => location.replace(LOGOUT_URI));
+    return;
+  }
   const url = new URL(`https://${COGNITO_DOMAIN}/logout`);
   url.searchParams.set('client_id', CLIENT_ID);
   url.searchParams.set('logout_uri', LOGOUT_URI);

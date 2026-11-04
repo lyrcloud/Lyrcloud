@@ -550,31 +550,101 @@ const contactPage = {
 
 // ---------------------------------------------------------------- Auth
 
-// GitHub sign-in is off until the GitHub bridge (lyrcloud-github-bridge stack) serves a
-// /userinfo endpoint; without it Cognito rejects every GitHub login.
+// GitHub sign-in needs the OIDC bridge (infra/aws/github-bridge.yml, scripts/deploy-github-bridge.sh)
+// live and the GitHubBridge identity provider pointed at it; turn this on once a GitHub login works.
 const GITHUB_SIGN_IN_ENABLED = false;
-const githubButton = `
-          <button class="provider-button" type="button" data-login="github">
+const githubButton = (isSignUp) => `
+            <button class="provider-button" type="button" data-login="github">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .3a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.7-.3-5.5-1.3-5.5-6 0-1.2.5-2.3 1.3-3.1-.2-.4-.6-1.6.1-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.6 18.3 5 18.3 5c.7 1.6.2 2.8.1 3.2.8.8 1.3 1.9 1.3 3.1 0 4.6-2.8 5.6-5.5 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .3"/></svg>
-            Continue with GitHub
-          </button>`;
+              ${isSignUp ? 'Sign up' : 'Continue'} with GitHub
+            </button>`;
+
+const passwordHint = 'At least 8 characters, with upper and lower case letters, a number and a symbol.';
+const codeInput = '<input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required placeholder="123456" />';
+const formError = '<p class="form-error" role="alert" hidden></p>';
+
+// Every step of email-and-password sign-up, log-in and reset lives on both pages; src/login.js shows
+// one at a time. Each form is a step; [data-goto] buttons switch steps.
+const authSteps = ({ isSignUp }) => `
+        <form class="auth-form" data-step="sign-up"${isSignUp ? '' : ' hidden'}>
+          <label>Full name<input name="name" autocomplete="name" maxlength="120" required /></label>
+          <label>Email<input name="email" type="email" autocomplete="email" required /></label>
+          <label>Password<input name="password" type="password" autocomplete="new-password" minlength="8" required aria-describedby="password-hint" /></label>
+          <p class="form-note" id="password-hint">${passwordHint}</p>
+          ${formError}
+          <button class="button primary large" type="submit">Create account</button>
+          <p class="form-note">We’ll email you a code to confirm your address, plus occasional product updates you can turn off any time.</p>
+        </form>
+        <form class="auth-form" data-step="sign-in"${isSignUp ? ' hidden' : ''}>
+          <label>Email<input name="email" type="email" autocomplete="email" required /></label>
+          <label>Password<input name="password" type="password" autocomplete="current-password" required /></label>
+          ${formError}
+          <button class="button primary large" type="submit">Log in</button>
+          <button class="text-button" type="button" data-goto="forgot">Forgot your password?</button>
+        </form>
+        <form class="auth-form" data-step="confirm" hidden>
+          <h2>Check your email</h2>
+          <p class="form-note">We sent a 6-digit code to <b data-show="email"></b>. It can take a minute to arrive — check spam too.</p>
+          <label>Verification code${codeInput}</label>
+          ${formError}
+          <button class="button primary large" type="submit">Verify email</button>
+          <button class="text-button" type="button" data-action="resend">Send a new code</button>
+        </form>
+        <form class="auth-form" data-step="forgot" hidden>
+          <h2>Reset your password</h2>
+          <p class="form-note">Enter your account’s email and we’ll send you a code.</p>
+          <label>Email<input name="email" type="email" autocomplete="email" required /></label>
+          ${formError}
+          <button class="button primary large" type="submit">Send reset code</button>
+          <button class="text-button" type="button" data-goto="sign-in">Back to log in</button>
+        </form>
+        <form class="auth-form" data-step="reset" hidden>
+          <h2>Choose a new password</h2>
+          <p class="form-note">If <b data-show="email"></b> has an account, a code is on its way.</p>
+          <label>Reset code${codeInput}</label>
+          <label>New password<input name="password" type="password" autocomplete="new-password" minlength="8" required /></label>
+          <p class="form-note">${passwordHint}</p>
+          ${formError}
+          <button class="button primary large" type="submit">Set new password</button>
+        </form>
+        <form class="auth-form" data-step="phone" hidden>
+          <h2>Add your mobile number</h2>
+          <p class="form-note">We’ll text you a code. Your number helps us keep your account secure and reach you about it.</p>
+          <label>Mobile number<input name="phone" type="tel" autocomplete="tel" required placeholder="+91 98765 43210" /></label>
+          <p class="form-note">Include your country code.</p>
+          ${formError}
+          <button class="button primary large" type="submit">Text me a code</button>
+          <button class="text-button" type="button" data-action="finish">Skip for now</button>
+        </form>
+        <form class="auth-form" data-step="phone-code" hidden>
+          <h2>Enter the code</h2>
+          <p class="form-note">We texted a 6-digit code to <b data-show="phone"></b>.</p>
+          <label>Code${codeInput}</label>
+          ${formError}
+          <button class="button primary large" type="submit">Verify number</button>
+          <button class="text-button" type="button" data-goto="phone">Use a different number</button>
+          <button class="text-button" type="button" data-action="finish">Skip for now</button>
+        </form>`;
 
 const authShell = ({ mode }) => {
   const isSignUp = mode === 'sign-up';
   return `
     <main class="auth-page">
       <a class="brand auth-brand" href="/" aria-label="Lyrcloud home">${logo('auth')}</a>
-      <div class="form-card glass-card auth-card">
-        <h1>${isSignUp ? 'Create your account' : 'Log in to Lyrcloud'}</h1>
-        <p>${isSignUp ? 'Free forever on the Launch plan. No credit card required.' : 'Welcome back. Pick up where you left off.'}</p>
-        <div class="provider-buttons">
-          <button class="provider-button" type="button" data-login="google">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#4285F4" d="M23.5 12.3c0-.8-.1-1.6-.2-2.3H12v4.5h6.5a5.6 5.6 0 0 1-2.4 3.6v3h3.9c2.2-2.1 3.5-5.1 3.5-8.8z"/><path fill="#34A853" d="M12 24c3.2 0 6-1.1 8-2.9l-3.9-3c-1.1.7-2.5 1.2-4.1 1.2-3.1 0-5.8-2.1-6.7-5H1.3v3.1A12 12 0 0 0 12 24z"/><path fill="#FBBC05" d="M5.3 14.3a7.2 7.2 0 0 1 0-4.6V6.6H1.3a12 12 0 0 0 0 10.8l4-3.1z"/><path fill="#EA4335" d="M12 4.8c1.8 0 3.3.6 4.6 1.8l3.4-3.4A12 12 0 0 0 1.3 6.6l4 3.1c.9-2.9 3.6-4.9 6.7-4.9z"/></svg>
-            Continue with Google
-          </button>
-          ${GITHUB_SIGN_IN_ENABLED ? githubButton : ''}
+      <div class="form-card glass-card auth-card" data-mode="${mode}">
+        <div class="auth-intro">
+          <h1>${isSignUp ? 'Create your account' : 'Log in to Lyrcloud'}</h1>
+          <p>${isSignUp ? 'Free forever on the Launch plan. No credit card required.' : 'Welcome back. Pick up where you left off.'}</p>
+          <div class="provider-buttons">
+            <button class="provider-button" type="button" data-login="google">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#4285F4" d="M23.5 12.3c0-.8-.1-1.6-.2-2.3H12v4.5h6.5a5.6 5.6 0 0 1-2.4 3.6v3h3.9c2.2-2.1 3.5-5.1 3.5-8.8z"/><path fill="#34A853" d="M12 24c3.2 0 6-1.1 8-2.9l-3.9-3c-1.1.7-2.5 1.2-4.1 1.2-3.1 0-5.8-2.1-6.7-5H1.3v3.1A12 12 0 0 0 12 24z"/><path fill="#FBBC05" d="M5.3 14.3a7.2 7.2 0 0 1 0-4.6V6.6H1.3a12 12 0 0 0 0 10.8l4-3.1z"/><path fill="#EA4335" d="M12 4.8c1.8 0 3.3.6 4.6 1.8l3.4-3.4A12 12 0 0 0 1.3 6.6l4 3.1c.9-2.9 3.6-4.9 6.7-4.9z"/></svg>
+              ${isSignUp ? 'Sign up' : 'Continue'} with Google
+            </button>
+            ${GITHUB_SIGN_IN_ENABLED ? githubButton(isSignUp) : ''}
+          </div>
+          <p class="auth-divider"><span>or with email</span></p>
         </div>
-        ${isSignUp ? '<p class="form-note">Your Lyrcloud account is created the first time you sign in.</p>' : ''}
+        ${authSteps({ isSignUp })}
         <p class="auth-switch">${isSignUp ? 'Already have an account? <a class="text-link" href="/login/">Log in</a>' : 'New to Lyrcloud? <a class="text-link" href="/sign-up/">Create an account</a>'}</p>
       </div>
     </main>`;

@@ -1,0 +1,104 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: GitHub to OpenID Connect bridge so the Lyrcloud Cognito user pool can offer "Continue with GitHub".
+# Deploy with scripts/deploy-github-bridge.sh; Lambda source is in api/github-bridge/.
+
+Parameters:
+  ArtifactsBucketName:
+    Type: String
+    Default: lyrcloud-deploy-artifacts
+  LambdaCodeS3Key:
+    Type: String
+  KeySecretName:
+    Type: String
+    Default: lyrcloud/github-bridge-signing-key
+    Description: Secrets Manager secret holding the PEM RSA key that signs id_tokens (created by the deploy script).
+  CognitoRedirectUri:
+    Type: String
+    Default: https://lyrcloud-auth.auth.us-east-1.amazoncognito.com/oauth2/idpresponse
+
+Resources:
+  BridgeFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SigningKey
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${KeySecretName}-*'
+
+  BridgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt BridgeFunctionRole.Arn
+      MemorySize: 256
+      Timeout: 15
+      Environment:
+        Variables:
+          KEY_SECRET_NAME: !Ref KeySecretName
+          COGNITO_REDIRECT_URI: !Ref CognitoRedirectUri
+      Code:
+        S3Bucket: !Ref ArtifactsBucketName
+        S3Key: !Ref LambdaCodeS3Key
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt BridgeFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: '$default'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    DependsOn: [DefaultRoute]
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 20
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref BridgeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*'
+
+Outputs:
+  BridgeUrl:
+    Description: The OIDC issuer for the GitHubBridge identity provider.
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  GitHubCallbackUrl:
+    Description: Set this as the GitHub OAuth app's Authorization callback URL.
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/callback'

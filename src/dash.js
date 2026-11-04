@@ -48,6 +48,7 @@ const formatBytes = (bytes) => {
   }
   return `${bytes.toFixed(bytes < 10 ? 1 : 0)} ${units[index]}`;
 };
+const PROVIDER_LABELS = { GoogleOIDC: 'Google', GitHubBridge: 'GitHub', Cognito: 'Email and password' };
 const formatDate = (iso) => new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 
 let toastTimer;
@@ -431,6 +432,66 @@ function profilePanel() {
     </section>`;
 }
 
+// Mobile number: null shows the number (or the form to add one); 'code' asks for the texted code;
+// 'edit' replaces a verified number.
+let phoneStep = null;
+let phoneBusy = false;
+
+function contactPanel() {
+  if (!profile) return '';
+  const busy = phoneBusy ? ' disabled' : '';
+  let phone;
+  if (phoneStep === 'code' && profile.phonePending) {
+    phone = `
+      <form class="row phone-form" data-form="phone-verify">
+        <input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required placeholder="6-digit code" aria-label="Code we texted you"${busy} />
+        <button class="btn primary" type="submit"${busy}>Verify</button>
+        <button class="btn" type="button" data-action="phone-edit"${busy}>Change number</button>
+      </form>
+      <p class="muted">We texted a code to <span class="mono">${esc(profile.phonePending)}</span>. It expires in 10 minutes.</p>`;
+  } else if (profile.phoneVerified && phoneStep !== 'edit') {
+    phone = `
+      <div class="row"><span class="mono">${esc(profile.phone)}</span><span class="status ok">● Verified</span></div>
+      <div class="row">
+        <button class="btn" data-action="phone-edit">Change</button>
+        <button class="btn danger" data-action="phone-remove"${busy}>Remove</button>
+      </div>`;
+  } else {
+    phone = `
+      <form class="row phone-form" data-form="phone-send">
+        <input name="phone" type="tel" autocomplete="tel" required placeholder="+91 98765 43210" aria-label="Mobile number with country code"${busy} />
+        <button class="btn primary" type="submit"${busy}>Text me a code</button>
+        ${phoneStep === 'edit' ? '<button class="btn" type="button" data-action="phone-cancel">Cancel</button>' : ''}
+      </form>
+      <p class="muted">Include your country code. Standard text message rates may apply.</p>`;
+  }
+  return `
+    <section class="panel">
+      <div class="setting-row">
+        <div><h3>Mobile number</h3><p>Verified by a code we text you. Used to reach you about your account.</p></div>
+        <div class="setting-control phone-control">${phone}</div>
+      </div>
+      ${settingRow('Product update emails', 'Occasional news about Lyrcloud features. Emails about your account and security always arrive.', toggle('email-updates', profile.emailUpdates !== false, 'Product update emails'))}
+    </section>`;
+}
+
+async function phoneRequest(path, options, message) {
+  phoneBusy = true;
+  render();
+  try {
+    profile = { ...profile, ...(await api(path, options)) };
+    cacheProfile(profile);
+    if (message) toast(message);
+    return true;
+  } catch (error) {
+    toast(error.message);
+    return false;
+  } finally {
+    phoneBusy = false;
+    render();
+  }
+}
+
 let profileSaving = false;
 async function saveProfile(changes, message) {
   profileSaving = true;
@@ -598,6 +659,7 @@ const views = {
     return `
       ${pageHead('Account settings')}
       ${profilePanel()}
+      ${contactPanel()}
       <section class="panel">
         ${settingRow('Email', 'The address you sign in with.', `<span class="mono">${esc(session.email)}</span>`)}
         ${settingRow('Signed in with', 'Your identity provider.', '<span id="profile-provider" class="muted">Loading…</span>')}
@@ -902,7 +964,7 @@ const adminTabs = {
       </div>
       <div class="grid-2">
         <section class="panel"><div class="panel-head"><h2>Plans</h2></div>${bars(countBy(users, (user) => user.plan), Object.fromEntries(PLAN_IDS.map((id) => [id, planName(id)])))}</section>
-        <section class="panel"><div class="panel-head"><h2>Sign-in methods</h2></div>${bars(countBy(users, (user) => user.provider || 'Unknown'), { GoogleOIDC: 'Google', GitHubBridge: 'GitHub' })}</section>
+        <section class="panel"><div class="panel-head"><h2>Sign-in methods</h2></div>${bars(countBy(users, (user) => user.provider || 'Unknown'), PROVIDER_LABELS)}</section>
       </div>
       <section class="panel">
         <div class="panel-head"><h2>Recent sign-ins</h2><a href="#/admin?tab=users">All users →</a></div>
@@ -941,7 +1003,7 @@ const adminTabs = {
             <div class="badges">
               ${badge(`role-badge role-${esc(user.role)}`, ROLE_LABELS[user.role] || esc(user.role))}
               ${badge('plan-badge', `${esc(planName(user.plan))} plan`)}
-              ${badge('', esc({ GoogleOIDC: 'Google', GitHubBridge: 'GitHub' }[user.provider] || user.provider || '—'))}
+              ${badge('', esc(PROVIDER_LABELS[user.provider] || user.provider || '—'))}
               ${user.disabled ? badge('badge-danger', 'Disabled') : ''}
               ${self ? badge('', 'You') : ''}
               <small class="muted">Joined ${user.createdAt ? new Date(user.createdAt).toLocaleDateString() : '—'} · last sign-in ${user.lastLoginAt ? formatDate(user.lastLoginAt) : '—'}</small>
@@ -979,6 +1041,7 @@ const adminTabs = {
           ${isSuper ? '<div class="row"><button class="btn primary" type="submit">Save announcement</button></div>' : '<p class="muted">Only the super admin can change site settings.</p>'}
         </form>
       </section>
+      ${adminUpdatesPanel(isSuper)}
       <section class="panel">
         <div class="panel-head"><h2>Access rules</h2></div>
         <dl class="facts">
@@ -989,6 +1052,31 @@ const adminTabs = {
       </section>`;
   },
 };
+
+function adminUpdatesPanel(isSuper) {
+  const data = adminUpdates.data;
+  if (!data) return '';
+  const sending = adminUpdates.sending;
+  const history = data.updates.length
+    ? `<ul class="update-list">${data.updates.map((update) => `
+        <li><b>${esc(update.subject)}</b><span class="muted">${formatDate(update.sentAt)} · ${update.sent} sent${update.failed ? ` · ${update.failed} failed` : ''}</span></li>`).join('')}</ul>`
+    : '<p class="muted">No updates sent yet.</p>';
+  return `
+    <section class="panel">
+      <div class="panel-head"><h2>Email an update</h2><span class="muted">${data.recipients} subscribed</span></div>
+      <p class="muted">Goes to every active account with product updates turned on. Each email has an unsubscribe link.</p>
+      ${data.mailEnabled ? '' : '<p class="form-error">Email sending isn’t set up on the server yet.</p>'}
+      ${isSuper
+        ? `<form data-form="admin-update" class="stack">
+            <label class="field">Subject<input name="subject" maxlength="150" required placeholder="e.g. Edge functions are now in beta"${sending ? ' disabled' : ''} /></label>
+            <label class="field">Message<textarea name="message" rows="6" maxlength="5000" required placeholder="Plain text. Blank lines start new paragraphs; https:// links become clickable."${sending ? ' disabled' : ''}></textarea></label>
+            <div class="row"><button class="btn primary" type="submit"${sending || !data.mailEnabled ? ' disabled' : ''}>${sending ? esc(sending) : `Send to ${data.recipients} account${data.recipients === 1 ? '' : 's'}`}</button></div>
+          </form>`
+        : '<p class="muted">Only the super admin can send updates.</p>'}
+      <h3>Sent</h3>
+      ${history}
+    </section>`;
+}
 
 // ------------------------------------------------------------------ routing
 
@@ -1054,7 +1142,7 @@ function showProfile() {
     if (node) node.textContent = text;
   };
   if (profile) {
-    set('profile-provider', profile.provider || '—');
+    set('profile-provider', PROVIDER_LABELS[profile.provider] || profile.provider || '—');
     set('profile-role', ROLE_LABELS[profile.role] || profile.role || '—');
     set('profile-created', profile.createdAt ? new Date(profile.createdAt).toLocaleDateString() : '—');
   } else if (profileFailed) {
@@ -1065,6 +1153,7 @@ function showProfile() {
 // Admin console data (GET /admin/users, GET /admin/settings) and the user-list filter.
 const adminUsers = { list: null, error: '', loading: false };
 const adminSettings = { data: null, error: '', loading: false };
+const adminUpdates = { data: null, error: '', sending: null };
 const adminFilter = { q: '', role: 'all' };
 let adminEditing = null;
 const isAdminView = () => currentRoute?.view === 'admin' || currentRoute?.view === 'users';
@@ -1094,12 +1183,40 @@ async function loadUsers() {
 async function loadAdminSettings() {
   adminSettings.loading = true;
   try {
-    adminSettings.data = await api('/admin/settings');
+    [adminSettings.data, adminUpdates.data] = await Promise.all([api('/admin/settings'), api('/admin/updates')]);
     adminSettings.error = '';
+    adminUpdates.error = '';
   } catch (error) {
     adminSettings.error = error.message;
   }
   adminSettings.loading = false;
+  if (isAdminView()) render();
+}
+
+// Emails an update, calling again with its id while recipients remain (each call runs ~20 seconds).
+async function sendAdminUpdate(button, body, form) {
+  button.disabled = true;
+  adminUpdates.sending = 'Sending…';
+  if (isAdminView()) render();
+  try {
+    let request = body;
+    for (;;) {
+      const { update, remaining } = await api('/admin/updates', { method: 'POST', body: JSON.stringify(request) });
+      const list = (adminUpdates.data?.updates || []).filter((item) => item.id !== update.id);
+      adminUpdates.data = { ...adminUpdates.data, updates: [update, ...list] };
+      if (!remaining) {
+        toast(`Sent to ${update.sent} account${update.sent === 1 ? '' : 's'}${update.failed ? `, ${update.failed} failed` : ''}`);
+        form?.reset();
+        break;
+      }
+      adminUpdates.sending = `Sent ${update.sent}, ${remaining} to go…`;
+      if (isAdminView()) render();
+      request = { updateId: update.id };
+    }
+  } catch (error) {
+    toast(error.message);
+  }
+  adminUpdates.sending = null;
   if (isAdminView()) render();
 }
 
@@ -1312,6 +1429,19 @@ const clickActions = {
   'account-menu': (target) => setAccountMenu(target.getAttribute('aria-expanded') !== 'true'),
   'avatar-provider': () => saveProfile({ avatar: null }, 'Using your sign-in photo'),
   'avatar-initials': () => saveProfile({ avatar: 'initials' }, 'Photo removed'),
+  'phone-edit': () => {
+    phoneStep = 'edit';
+    render();
+  },
+  'phone-cancel': () => {
+    phoneStep = null;
+    render();
+  },
+  'phone-remove': (target) => {
+    if (!confirmed(target, 'Remove your mobile number from your account?')) return;
+    phoneStep = null;
+    phoneRequest('/me/phone', { method: 'DELETE' }, 'Mobile number removed');
+  },
   'sign-out': (target) => {
     target.disabled = true;
     target.textContent = 'Signing out…';
@@ -1327,6 +1457,7 @@ const clickActions = {
 };
 
 const changeActions = {
+  'email-updates': (target) => saveProfile({ emailUpdates: target.checked }, target.checked ? 'You’ll get product updates' : 'Product update emails turned off'),
   'avatar-file': async (target) => {
     const [file] = target.files;
     target.value = '';
@@ -1379,6 +1510,27 @@ const RECORD_VALIDATORS = {
 };
 
 const formActions = {
+  'phone-send': async (form, data) => {
+    if (await phoneRequest('/me/phone', { method: 'POST', body: JSON.stringify({ phone: String(data.get('phone')) }) }, 'Code sent')) {
+      phoneStep = 'code';
+      render();
+      app.querySelector('[data-form="phone-verify"] input')?.focus();
+    }
+  },
+  'phone-verify': async (form, data) => {
+    if (await phoneRequest('/me/phone/verify', { method: 'POST', body: JSON.stringify({ code: String(data.get('code')).trim() }) }, 'Mobile number verified')) {
+      phoneStep = null;
+      render();
+    }
+  },
+  'admin-update': (form, data) => {
+    const button = form.querySelector('[type="submit"]');
+    const subject = String(data.get('subject')).trim();
+    const message = String(data.get('message')).trim();
+    if (!subject || !message) return toast('Add a subject and a message.');
+    if (!confirmed(button, `Email “${subject}” to ${adminUpdates.data?.recipients ?? 'every'} subscribed account(s)? This can’t be undone.`)) return;
+    sendAdminUpdate(button, { subject, message }, form);
+  },
   'profile-name': (form, data) => {
     const name = String(data.get('name') || '').trim();
     if (!name) return toast('Enter a name.');
