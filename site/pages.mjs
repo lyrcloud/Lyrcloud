@@ -85,7 +85,7 @@ const home = {
       <section id="top" class="hero section-grid">
         <div class="hero-copy">
           <a class="eyebrow" href="/products/edge-functions/">↗ Edge Functions now run in 180+ cities</a>
-          <h1>Build, secure, and scale every digital experience on one cloud.</h1>
+          <h1>Build, secure, and scale every digital experience on <span class="text-gradient">one cloud</span>.</h1>
           <p class="hero-lede">Lyrcloud brings application delivery, edge compute, Zero Trust access, and AI workflow hosting into a single, elegant control plane for modern teams.</p>
           <div class="cta-row">
             <a class="button primary large" href="/sign-up/">Start building for free <span aria-hidden="true">→</span></a>
