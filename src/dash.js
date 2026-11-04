@@ -64,6 +64,28 @@ function toast(message) {
   toastTimer = setTimeout(() => node.classList.remove('show'), 2600);
 }
 
+// Two-tap confirmation on the button itself. window.confirm() is blocked or auto-cancelled in many
+// mobile and in-app browsers, which made confirmed actions (like the super admin's role buttons)
+// silently do nothing. The first tap arms the button and explains; a second tap within 5 s proceeds.
+function confirmed(target, message) {
+  if (target.dataset.confirming === '1') {
+    clearTimeout(Number(target.dataset.confirmTimer));
+    delete target.dataset.confirming;
+    return true;
+  }
+  const label = target.textContent;
+  target.dataset.confirming = '1';
+  target.classList.add('is-confirming');
+  target.textContent = 'Tap again to confirm';
+  toast(message);
+  target.dataset.confirmTimer = String(setTimeout(() => {
+    delete target.dataset.confirming;
+    target.classList.remove('is-confirming');
+    target.textContent = label;
+  }, 5000));
+  return false;
+}
+
 // ------------------------------------------------------------------ state
 
 const NAMESERVER_NAMES = ['ada', 'bea', 'cruz', 'dax', 'eli', 'fay', 'gus', 'ivy', 'kai', 'leo', 'max', 'nia', 'oz', 'rae', 'sol', 'zed'];
@@ -865,13 +887,13 @@ const clickActions = {
     target.disabled = false;
   },
   'force-active': () => updateZone((zone) => { zone.status = 'active'; }, 'Marked active (preview only)'),
-  'purge-all': () => {
-    if (!confirm('Purge every cached file for this site?')) return;
+  'purge-all': (target) => {
+    if (!confirmed(target, 'Purge every cached file for this site?')) return;
     updateZone((zone) => { zone.caching.lastPurge = new Date().toISOString(); }, 'Purge requested for all files');
   },
-  'delete-zone': () => {
+  'delete-zone': (target) => {
     const zone = currentZone();
-    if (!confirm(`Remove ${zone.name} from Lyrcloud? DNS records and settings will be deleted.`)) return;
+    if (!confirmed(target, `Remove ${zone.name} from Lyrcloud? DNS records and settings will be deleted.`)) return;
     state.zones = state.zones.filter((item) => item.id !== zone.id);
     for (const worker of state.workers) worker.routes = worker.routes.filter((pattern) => !pattern.startsWith(`${zone.name}/`));
     save();
@@ -906,7 +928,7 @@ const clickActions = {
   },
   'delete-worker': (target) => {
     const worker = findWorker(target.dataset.id);
-    if (!confirm(`Delete ${worker.name}?`)) return;
+    if (!confirmed(target, `Delete ${worker.name}?`)) return;
     state.workers = state.workers.filter((item) => item.id !== worker.id);
     save();
     go('#/workers');
@@ -921,7 +943,7 @@ const clickActions = {
     const user = adminUsers.list?.find((item) => item.userId === target.dataset.id);
     const role = target.dataset.role;
     const who = user?.email || 'this account';
-    if (!confirm(role === 'admin' ? `Give ${who} admin access?` : `Remove admin access from ${who}?`)) return;
+    if (!confirmed(target, role === 'admin' ? `Give ${who} admin access?` : `Remove admin access from ${who}?`)) return;
     target.disabled = true;
     try {
       const response = await authFetch(`/admin/users/${encodeURIComponent(target.dataset.id)}`, {
@@ -940,8 +962,8 @@ const clickActions = {
     }
   },
   'sign-out': () => endSession(),
-  reset: () => {
-    if (!confirm('Delete all websites and functions stored in this browser?')) return;
+  reset: (target) => {
+    if (!confirmed(target, 'Delete all websites and functions stored in this browser?')) return;
     state.zones = [];
     state.workers = [];
     save();

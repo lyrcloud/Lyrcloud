@@ -266,6 +266,11 @@
   background: rgba(255, 107, 107, 0.08);
 }
 
+.btn.is-confirming {
+  border-color: var(--danger-ink);
+  color: var(--danger-ink);
+}
+
 .btn.small {
   min-height: 30px;
   padding: 0 10px;
