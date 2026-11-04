@@ -29,6 +29,47 @@ export function roleFor(profile, superAdminEmail) {
 
 export const isStaff = (role) => role === 'admin' || role === 'superadmin';
 
+export const PLANS = ['launch', 'scale', 'enterprise'];
+export const DEFAULT_PLAN = 'launch';
+export const planFor = (profile) => (PLANS.includes(profile?.plan) ? profile.plan : DEFAULT_PLAN);
+
+// Who manages whom (same rule as Lyrtrip): admins manage regular users; only the super admin
+// manages admins; nobody manages the super admin through the admin API.
+export function canManage(actorRole, targetRole) {
+  if (targetRole === 'user') return isStaff(actorRole);
+  if (targetRole === 'admin') return actorRole === 'superadmin';
+  return false;
+}
+
+const EDITABLE_FIELDS = ['role', 'plan', 'disabled', 'name'];
+
+// Returns [statusCode, message] when `actorRole` may not apply `changes` to an account whose role is
+// `targetRole`, else null. `changes` may hold role, plan, disabled and name.
+export function userUpdateError(actorRole, targetRole, changes) {
+  if (!isStaff(actorRole)) return [403, 'Admins only.'];
+  const keys = Object.keys(changes || {});
+  if (!keys.length) return [400, 'Nothing to change.'];
+  const unknown = keys.find((key) => !EDITABLE_FIELDS.includes(key));
+  if (unknown) return [400, `Unknown field "${unknown}".`];
+  if (targetRole === 'superadmin') return [400, "The super admin's account can't be changed here."];
+  if (!canManage(actorRole, targetRole)) return [403, 'Only the super admin can manage admins.'];
+  if ('role' in changes) {
+    const refused = roleChangeError(actorRole, targetRole, changes.role);
+    if (refused) return refused;
+  }
+  if ('plan' in changes && !PLANS.includes(changes.plan)) return [400, `Plan must be one of ${PLANS.join(', ')}.`];
+  if ('disabled' in changes && typeof changes.disabled !== 'boolean') return [400, '"disabled" must be true or false.'];
+  if ('name' in changes && (typeof changes.name !== 'string' || changes.name.length > 120)) return [400, 'Name must be text of at most 120 characters.'];
+  return null;
+}
+
+// Deleting an account: super admin only, never the super admin.
+export function deleteUserError(actorRole, targetRole) {
+  if (actorRole !== 'superadmin') return [403, 'Only the super admin can delete accounts.'];
+  if (targetRole === 'superadmin') return [400, "The super admin's account can't be deleted."];
+  return null;
+}
+
 // Returns [statusCode, message] when `actorRole` may not give `target` the role `newRole`, else null.
 // Admins can see every account; only the super admin grants or removes admin.
 export function roleChangeError(actorRole, targetRole, newRole) {
@@ -47,6 +88,8 @@ export function publicProfile(profile, superAdminEmail) {
     picture: profile.picture ?? null,
     provider: normalizeProvider(profile.provider),
     role: roleFor(profile, superAdminEmail),
+    plan: planFor(profile),
+    disabled: profile.disabled === true && roleFor(profile, superAdminEmail) !== 'superadmin',
     createdAt: profile.createdAt ?? null,
     lastLoginAt: profile.lastLoginAt ?? null,
   };

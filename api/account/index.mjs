@@ -1,8 +1,13 @@
 // Lyrcloud account API.
-//   GET /me                    the signed-in profile, including its role
-//   GET /admin/users           every account (admins and the super admin)
-//   PUT /admin/users/{userId}  { role: "admin" | "user" } (super admin only)
-//   POST /public/lyrbot        the site's help assistant (lyrbot.mjs); the only public route
+//   GET /me                               the signed-in profile (role, plan) and the site announcement
+//   PUT /me                               { plan } change your own plan (billing isn't connected yet)
+//   GET /admin/users                      every account (admins and the super admin)
+//   PUT /admin/users/{userId}             { role?, plan?, disabled?, name? } (rules in roles.mjs)
+//   DELETE /admin/users/{userId}          delete the account from Lyrcloud and Cognito (super admin)
+//   POST /admin/users/{userId}/sign-out   sign the account out on every device
+//   GET /admin/settings                   site settings (admins and the super admin)
+//   PUT /admin/settings                   { announcement } (super admin only)
+//   POST /public/lyrbot                   the site's help assistant (lyrbot.mjs); the only public route
 //
 // The other routes are protected by an API Gateway HTTP API JWT authorizer validating the Cognito
 // *access token*. Access tokens only carry `sub`/`username`, not profile
@@ -10,7 +15,15 @@
 // (authenticated by the bearer token itself) for email/name/picture, then upserts the profile row in
 // DynamoDB with the AWS SDK that ships with the Lambda Node.js runtime.
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand, PutCommand, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { DeleteCommand, DynamoDBDocumentClient, GetCommand, PutCommand, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import {
+  AdminDeleteUserCommand,
+  AdminDisableUserCommand,
+  AdminEnableUserCommand,
+  AdminUserGlobalSignOutCommand,
+  CognitoIdentityProviderClient,
+  ListUsersCommand,
+} from '@aws-sdk/client-cognito-identity-provider';
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import {
   cleanLyrbotMessages,
@@ -21,10 +34,25 @@ import {
   LYRBOT_HOURLY_MESSAGE,
   lyrbotReply,
 } from './lyrbot.mjs';
-import { isStaff, normalizeProvider, publicProfile, roleChangeError, roleFor } from './roles.mjs';
+import {
+  canManage,
+  deleteUserError,
+  isStaff,
+  normalizeProvider,
+  PLANS,
+  publicProfile,
+  roleFor,
+  userUpdateError,
+} from './roles.mjs';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+const cognito = new CognitoIdentityProviderClient({});
 const TABLE_NAME = process.env.TABLE_NAME;
+const USER_POOL_ID = process.env.USER_POOL_ID;
+// Site-wide settings live in the users table under this key. Cognito subs are UUIDs, so it can't
+// collide with an account, and listProfiles() skips it.
+const SETTINGS_KEY = '#settings';
+const ANNOUNCEMENT_MAX = 500;
 const SUPER_ADMIN_EMAIL = process.env.SUPER_ADMIN_EMAIL || 'lyrclouds@gmail.com';
 // Cognito Hosted UI domain; its userInfo endpoint turns an access token into the caller's profile.
 const COGNITO_DOMAIN = process.env.COGNITO_DOMAIN || 'lyrcloud-auth.auth.us-east-1.amazoncognito.com';
@@ -83,8 +111,11 @@ async function upsertCaller(event) {
   const profile = {
     ...existing,
     userId,
+    // The Cognito username ("GoogleOIDC_123…"), needed to disable, sign out or delete the account.
+    username: claims.username || existing?.username || null,
     email: email ?? existing?.email ?? null,
-    name: name ?? existing?.name ?? null,
+    // A name set by an admin sticks; otherwise follow the identity provider.
+    name: existing?.nameLocked ? existing.name : name ?? existing?.name ?? null,
     picture: picture ?? existing?.picture ?? null,
     provider: normalizeProvider(provider),
     createdAt: existing?.createdAt || now,
@@ -100,7 +131,7 @@ async function listProfiles() {
   let ExclusiveStartKey;
   do {
     const page = await ddb.send(new ScanCommand({ TableName: TABLE_NAME, ExclusiveStartKey }));
-    items.push(...(page.Items || []));
+    items.push(...(page.Items || []).filter((item) => item.userId !== SETTINGS_KEY));
     ExclusiveStartKey = page.LastEvaluatedKey;
   } while (ExclusiveStartKey);
   return items;
@@ -113,6 +144,123 @@ function parseBody(event) {
   } catch {
     return null;
   }
+}
+
+// ------------------------------------------------------------------ admin
+
+async function getSettings() {
+  const item = (await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { userId: SETTINGS_KEY } }))).Item;
+  return { announcement: item?.announcement || '', updatedAt: item?.updatedAt || null };
+}
+
+// The Cognito username for a stored profile. Rows written before usernames were stored are looked
+// up by sub.
+async function cognitoUsername(profile) {
+  if (profile.username) return profile.username;
+  const sub = String(profile.userId).replace(/[^0-9a-f-]/gi, '');
+  const { Users } = await cognito.send(new ListUsersCommand({ UserPoolId: USER_POOL_ID, Filter: `sub = "${sub}"`, Limit: 1 }));
+  return Users?.[0]?.Username || null;
+}
+
+// Runs a Cognito admin call for `profile`; an account that no longer exists in Cognito is not an error.
+async function onCognitoUser(profile, makeCommand) {
+  const Username = await cognitoUsername(profile);
+  if (!Username) return false;
+  try {
+    await cognito.send(makeCommand({ UserPoolId: USER_POOL_ID, Username }));
+    return true;
+  } catch (err) {
+    if (err.name === 'UserNotFoundException') return false;
+    throw err;
+  }
+}
+
+const getProfile = async (userId) => (await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { userId } }))).Item;
+
+async function adminRoutes(event, method, path, caller, callerRole) {
+  if (!isStaff(callerRole)) return errorResponse(403, 'Admins only.');
+
+  if (path === '/admin/settings') {
+    if (method === 'GET') return jsonResponse(200, await getSettings());
+    if (method === 'PUT') {
+      if (callerRole !== 'superadmin') return errorResponse(403, 'Only the super admin can change site settings.');
+      const body = parseBody(event);
+      if (!body || typeof body.announcement !== 'string') return errorResponse(400, 'Send { "announcement": "…" }.');
+      const announcement = body.announcement.trim().slice(0, ANNOUNCEMENT_MAX);
+      const updatedAt = new Date().toISOString();
+      await ddb.send(new PutCommand({ TableName: TABLE_NAME, Item: { userId: SETTINGS_KEY, announcement, updatedAt, updatedBy: caller.userId } }));
+      return jsonResponse(200, { announcement, updatedAt });
+    }
+    return errorResponse(404, 'not_found');
+  }
+
+  if (method === 'GET' && path === '/admin/users') {
+    const users = (await listProfiles())
+      .map((profile) => publicProfile(profile, SUPER_ADMIN_EMAIL))
+      .sort((a, b) => String(b.lastLoginAt).localeCompare(String(a.lastLoginAt)));
+    return jsonResponse(200, { users });
+  }
+
+  const match = path.match(/^\/admin\/users\/([^/]+)(\/sign-out)?$/);
+  if (!match) return errorResponse(404, 'not_found');
+  const userId = decodeURIComponent(event.pathParameters?.userId || match[1]);
+  const target = await getProfile(userId);
+  if (!target) return errorResponse(404, 'No such user.');
+  const targetRole = roleFor(target, SUPER_ADMIN_EMAIL);
+
+  if (match[2]) {
+    if (method !== 'POST') return errorResponse(404, 'not_found');
+    if (!canManage(callerRole, targetRole)) return errorResponse(403, 'You can’t sign this account out.');
+    return jsonResponse(200, { signedOut: await onCognitoUser(target, (input) => new AdminUserGlobalSignOutCommand(input)) });
+  }
+
+  if (method === 'DELETE') {
+    const refused = deleteUserError(callerRole, targetRole);
+    if (refused) return errorResponse(...refused);
+    await onCognitoUser(target, (input) => new AdminDeleteUserCommand(input));
+    await ddb.send(new DeleteCommand({ TableName: TABLE_NAME, Key: { userId } }));
+    return jsonResponse(200, { deleted: userId });
+  }
+
+  if (method === 'PUT') {
+    const body = parseBody(event);
+    if (!body) return errorResponse(400, 'Invalid JSON body.');
+    const changes = Object.fromEntries(Object.entries(body).filter(([, value]) => value !== undefined));
+    const refused = userUpdateError(callerRole, targetRole, changes);
+    if (refused) return errorResponse(...refused);
+
+    // Disabling also blocks sign-in in Cognito and ends the account's current sessions.
+    if ('disabled' in changes && changes.disabled !== (target.disabled === true)) {
+      await onCognitoUser(target, (input) => (changes.disabled ? new AdminDisableUserCommand(input) : new AdminEnableUserCommand(input)));
+      if (changes.disabled) await onCognitoUser(target, (input) => new AdminUserGlobalSignOutCommand(input));
+    }
+
+    const names = {};
+    const values = { ':now': new Date().toISOString(), ':by': caller.userId };
+    const sets = ['updatedAt = :now', 'updatedBy = :by'];
+    for (const [key, value] of Object.entries(changes)) {
+      names[`#${key}`] = key;
+      values[`:${key}`] = key === 'name' ? value.trim() || null : value;
+      sets.push(`#${key} = :${key}`);
+    }
+    if ('name' in changes) {
+      // An admin-set name stays put on later sign-ins; clearing it hands the name back to the provider.
+      sets.push('nameLocked = :locked');
+      values[':locked'] = Boolean(values[':name']);
+    }
+    const { Attributes } = await ddb.send(new UpdateCommand({
+      TableName: TABLE_NAME,
+      Key: { userId },
+      UpdateExpression: `SET ${sets.join(', ')}`,
+      ConditionExpression: 'attribute_exists(userId)',
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
+      ReturnValues: 'ALL_NEW',
+    }));
+    return jsonResponse(200, { user: publicProfile(Attributes, SUPER_ADMIN_EMAIL) });
+  }
+
+  return errorResponse(404, 'not_found');
 }
 
 // ------------------------------------------------------------------ Lyrbot
@@ -169,42 +317,30 @@ export const handler = async (event) => {
   if (!caller) return errorResponse(401, 'unauthorized');
   const callerRole = roleFor(caller, SUPER_ADMIN_EMAIL);
 
-  if (method === 'GET' && path === '/me') {
-    return jsonResponse(200, publicProfile(caller, SUPER_ADMIN_EMAIL));
-  }
+  // Disabled accounts are also blocked in Cognito; this covers tokens issued before that.
+  if (caller.disabled === true && callerRole !== 'superadmin') return errorResponse(403, 'This account has been disabled.');
 
-  if (path === '/admin/users' || path.startsWith('/admin/users/')) {
-    if (!isStaff(callerRole)) return errorResponse(403, 'Admins only.');
-
-    if (method === 'GET' && path === '/admin/users') {
-      const users = (await listProfiles())
-        .map((profile) => publicProfile(profile, SUPER_ADMIN_EMAIL))
-        .sort((a, b) => String(b.lastLoginAt).localeCompare(String(a.lastLoginAt)));
-      return jsonResponse(200, { users });
+  if (path === '/me') {
+    if (method === 'GET') {
+      const { announcement } = await getSettings();
+      return jsonResponse(200, { ...publicProfile(caller, SUPER_ADMIN_EMAIL), announcement });
     }
-
     if (method === 'PUT') {
-      const userId = decodeURIComponent(event.pathParameters?.userId || path.slice('/admin/users/'.length));
       const body = parseBody(event);
-      if (!body) return errorResponse(400, 'Invalid JSON body.');
-      const target = (await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { userId } }))).Item;
-      if (!target) return errorResponse(404, 'No such user.');
-
-      const refused = roleChangeError(callerRole, roleFor(target, SUPER_ADMIN_EMAIL), body.role);
-      if (refused) return errorResponse(...refused);
-
+      if (!body || !PLANS.includes(body.plan)) return errorResponse(400, `Plan must be one of ${PLANS.join(', ')}.`);
       const { Attributes } = await ddb.send(new UpdateCommand({
         TableName: TABLE_NAME,
-        Key: { userId },
-        UpdateExpression: 'SET #role = :role, roleUpdatedAt = :now, roleUpdatedBy = :by',
-        ConditionExpression: 'attribute_exists(userId)',
-        ExpressionAttributeNames: { '#role': 'role' },
-        ExpressionAttributeValues: { ':role': body.role, ':now': new Date().toISOString(), ':by': caller.userId },
+        Key: { userId: caller.userId },
+        UpdateExpression: 'SET #plan = :plan, planUpdatedAt = :now',
+        ExpressionAttributeNames: { '#plan': 'plan' },
+        ExpressionAttributeValues: { ':plan': body.plan, ':now': new Date().toISOString() },
         ReturnValues: 'ALL_NEW',
       }));
-      return jsonResponse(200, { user: publicProfile(Attributes, SUPER_ADMIN_EMAIL) });
+      return jsonResponse(200, publicProfile(Attributes, SUPER_ADMIN_EMAIL));
     }
   }
+
+  if (path.startsWith('/admin/')) return adminRoutes(event, method, path, caller, callerRole);
 
   return errorResponse(404, 'not_found');
 };

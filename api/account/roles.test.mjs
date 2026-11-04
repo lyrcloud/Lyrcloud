@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { publicProfile, roleChangeError, roleFor } from './roles.mjs';
+import { canManage, deleteUserError, planFor, publicProfile, roleChangeError, roleFor, userUpdateError } from './roles.mjs';
 
 const SUPER = 'lyrclouds@gmail.com';
 
@@ -36,4 +36,44 @@ test('publicProfile reports the derived role', () => {
   const profile = publicProfile({ userId: 'u1', provider: 'GoogleOIDC', email: SUPER, role: 'user' }, SUPER);
   assert.equal(profile.role, 'superadmin');
   assert.equal(profile.userId, 'u1');
+});
+
+test('plans default to launch and only known plans are reported', () => {
+  assert.equal(planFor({}), 'launch');
+  assert.equal(planFor({ plan: 'scale' }), 'scale');
+  assert.equal(planFor({ plan: 'gold' }), 'launch');
+  assert.equal(publicProfile({ userId: 'u1', plan: 'enterprise' }, SUPER).plan, 'enterprise');
+});
+
+test('admins manage users, only the super admin manages admins, nobody manages the super admin', () => {
+  assert.equal(canManage('admin', 'user'), true);
+  assert.equal(canManage('admin', 'admin'), false);
+  assert.equal(canManage('superadmin', 'admin'), true);
+  assert.equal(canManage('superadmin', 'superadmin'), false);
+  assert.equal(canManage('user', 'user'), false);
+});
+
+test('account updates', () => {
+  assert.equal(userUpdateError('admin', 'user', { plan: 'scale', disabled: true, name: 'Ann' }), null);
+  assert.deepEqual(userUpdateError('admin', 'user', { role: 'admin' })?.[0], 403);
+  assert.deepEqual(userUpdateError('admin', 'admin', { plan: 'scale' })?.[0], 403);
+  assert.equal(userUpdateError('superadmin', 'admin', { plan: 'enterprise', disabled: false }), null);
+  assert.deepEqual(userUpdateError('superadmin', 'superadmin', { plan: 'scale' })?.[0], 400);
+  assert.deepEqual(userUpdateError('superadmin', 'user', { plan: 'gold' })?.[0], 400);
+  assert.deepEqual(userUpdateError('superadmin', 'user', { disabled: 'yes' })?.[0], 400);
+  assert.deepEqual(userUpdateError('superadmin', 'user', { email: 'x@y.z' })?.[0], 400);
+  assert.deepEqual(userUpdateError('superadmin', 'user', {})?.[0], 400);
+  assert.deepEqual(userUpdateError('user', 'user', { plan: 'scale' })?.[0], 403);
+});
+
+test('only the super admin deletes accounts, never their own', () => {
+  assert.equal(deleteUserError('superadmin', 'user'), null);
+  assert.equal(deleteUserError('superadmin', 'admin'), null);
+  assert.deepEqual(deleteUserError('admin', 'user')?.[0], 403);
+  assert.deepEqual(deleteUserError('superadmin', 'superadmin')?.[0], 400);
+});
+
+test('a disabled flag is never reported for the super admin', () => {
+  assert.equal(publicProfile({ userId: 'u1', provider: 'GoogleOIDC', email: SUPER, disabled: true }, SUPER).disabled, false);
+  assert.equal(publicProfile({ userId: 'u2', disabled: true }, SUPER).disabled, true);
 });

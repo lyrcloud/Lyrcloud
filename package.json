@@ -9,10 +9,11 @@
     "check": "node scripts/check.mjs",
     "create:s3": "bash scripts/create-s3.sh",
     "deploy:aws": "bash scripts/deploy-aws.sh",
-    "test": "node --test api/account/roles.test.mjs api/account/lyrbot.test.mjs"
+    "test": "node --test api/account/roles.test.mjs api/account/handler.test.mjs api/account/lyrbot.test.mjs"
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.133.0",
+    "@aws-sdk/client-cognito-identity-provider": "^3.1161.0",
     "@aws-sdk/client-dynamodb": "^3.682.0",
     "@aws-sdk/client-secrets-manager": "^3.1152.0",
     "@aws-sdk/lib-dynamodb": "^3.682.0",

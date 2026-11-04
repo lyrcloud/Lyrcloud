@@ -276,11 +276,24 @@ function bindCharts() {
 
 const icons = {
   home: '⌂', sites: '◎', workers: '{}', settings: '⚙', overview: '▤', analytics: '📈',
-  dns: '☍', ssl: '🔒', security: '🛡', caching: '⚡', add: '+', users: '👥',
+  dns: '☍', ssl: '🔒', security: '🛡', caching: '⚡', add: '+', users: '👥', plans: '★',
 };
 
 const ROLE_LABELS = { superadmin: 'Super admin', admin: 'Admin', user: 'User' };
 const isStaff = (role) => role === 'admin' || role === 'superadmin';
+// Mirrors canManage() in api/account/roles.mjs; the API enforces it.
+const canManage = (actorRole, targetRole) =>
+  targetRole === 'user' ? isStaff(actorRole) : targetRole === 'admin' ? actorRole === 'superadmin' : false;
+
+const PLAN_INFO = {
+  launch: { name: 'Launch', price: '$0', blurb: 'CDN, TLS and DDoS protection for every site.', features: ['Global CDN', 'Free TLS certificates', 'Unmetered DDoS protection', '5 custom firewall rules'] },
+  scale: { name: 'Scale', price: '$29/mo', blurb: 'Adds the managed WAF and image optimization.', features: ['Everything in Launch', 'Managed WAF rules', 'Image optimization', 'Priority email support'] },
+  enterprise: { name: 'Enterprise', price: 'Custom', blurb: 'SLAs, bot management and dedicated support.', features: ['Everything in Scale', '100% uptime SLA', 'Advanced bot management', 'Dedicated support engineer'] },
+};
+const PLAN_IDS = Object.keys(PLAN_INFO);
+const planName = (plan) => PLAN_INFO[plan]?.name || plan;
+const planSelect = (action, current, extra = '') =>
+  `<select data-action="${action}"${extra}>${PLAN_IDS.map((id) => `<option value="${id}"${id === current ? ' selected' : ''}>${planName(id)}</option>`).join('')}</select>`;
 
 function sidebar(route) {
   const accountLinks = [
@@ -289,7 +302,8 @@ function sidebar(route) {
     ['#/workers', 'Edge Functions', icons.workers, route.view.startsWith('worker')],
     ['#/settings', 'Account settings', icons.settings, route.view === 'settings'],
   ];
-  if (isStaff(profile?.role)) accountLinks.push(['#/users', 'Users', icons.users, route.view === 'users']);
+  accountLinks.splice(3, 0, ['#/plans', 'Plans', icons.plans, route.view === 'plans']);
+  if (isStaff(profile?.role)) accountLinks.push(['#/admin', 'Admin console', icons.users, route.view === 'admin' || route.view === 'users']);
   const zone = route.zone && findZone(route.zone);
   const zoneLinks = zone
     ? [
@@ -326,8 +340,8 @@ function topbar(route) {
       ${state.zones.length ? `<label class="zone-picker"><span class="visually-hidden">Website</span><select data-action="pick-zone"><option value="">All websites</option>${options}</select></label>` : '<span></span>'}
       <div class="topbar-right">
         <span class="preview-pill" title="No backend yet: data is stored in this browser">Preview</span>
-        ${isStaff(profile?.role) ? `<a class="role-pill" href="#/users" title="Manage users">${ROLE_LABELS[profile.role]} · Users</a>` : ''}
-        <span class="plan-pill">${esc(state.plan)} plan</span>
+        ${isStaff(profile?.role) ? `<a class="role-pill" href="#/admin" title="Open the admin console">${ROLE_LABELS[profile.role]} · Admin</a>` : ''}
+        <a class="plan-pill" href="#/plans" title="Change plan">${esc(planName(state.plan))} plan</a>
         <span class="avatar" title="${esc(session.email)}">${esc(session.email[0].toUpperCase())}</span>
       </div>
     </header>`;
@@ -368,7 +382,7 @@ const views = {
                     (zone) => `
                   <a class="zone-row" href="#/zones/${encodeURIComponent(zone.name)}/overview">
                     <span class="zone-favicon" aria-hidden="true">${esc(zone.name[0].toUpperCase())}</span>
-                    <span class="zone-name"><b>${esc(zone.name)}</b><small>${esc(zone.plan)} plan · ${zone.dns.length} DNS records</small></span>
+                    <span class="zone-name"><b>${esc(zone.name)}</b><small>${esc(planName(zone.plan))} plan · ${zone.dns.length} DNS records</small></span>
                     ${statusBadge(zone.status)}
                   </a>`,
                   )
@@ -387,13 +401,13 @@ const views = {
       }
       ${
         isStaff(profile?.role)
-          ? `<a class="panel quick staff-quick" href="#/users"><span aria-hidden="true">${icons.users}</span><h3>Users</h3><p>${profile.role === 'superadmin' ? 'See every account and grant or remove admin access' : 'See every Lyrcloud account'}</p></a>`
+          ? `<a class="panel quick staff-quick" href="#/admin"><span aria-hidden="true">${icons.users}</span><h3>${ROLE_LABELS[profile.role]} console</h3><p>${profile.role === 'superadmin' ? 'Accounts, roles, plans, access and site announcements' : 'Accounts, plans and access for Lyrcloud users'}</p></a>`
           : ''
       }
       <div class="grid-3">
         <a class="panel quick" href="#/workers"><span aria-hidden="true">{}</span><h3>Edge Functions</h3><p>${state.workers.length} created · run code in 180+ cities</p></a>
         <a class="panel quick" href="/developers/#quickstart"><span aria-hidden="true">⌘</span><h3>Install the CLI</h3><p>Deploy from your terminal with <code>lyrcloud deploy</code></p></a>
-        <a class="panel quick" href="/pricing/"><span aria-hidden="true">↑</span><h3>Upgrade plan</h3><p>Unlock the managed WAF and image optimization</p></a>
+        <a class="panel quick" href="#/plans"><span aria-hidden="true">${icons.plans}</span><h3>${state.plan === 'launch' ? 'Upgrade plan' : 'Your plan'}</h3><p>${esc(planName(state.plan))} · ${state.plan === 'launch' ? 'unlock the managed WAF and image optimization' : 'change plan or apply it to your sites'}</p></a>
       </div>`;
   },
 
@@ -401,11 +415,7 @@ const views = {
     const step = route.params.get('step') || 'domain';
     const domain = route.params.get('domain') || '';
     if (step === 'plan') {
-      const plans = [
-        ['launch', 'Launch', '$0', 'CDN, TLS, DDoS protection'],
-        ['scale', 'Scale', '$29/mo', 'Adds managed WAF & image optimization'],
-        ['enterprise', 'Enterprise', 'Custom', 'SLAs, bot management, dedicated support'],
-      ];
+      const plans = PLAN_IDS.map((id) => [id, PLAN_INFO[id].name, PLAN_INFO[id].price, PLAN_INFO[id].blurb]);
       return `
         ${pageHead('Select a plan', `for <b>${esc(domain)}</b>`)}
         <form class="panel" data-form="choose-plan">
@@ -413,9 +423,9 @@ const views = {
           <div class="plan-options">
             ${plans
               .map(
-                ([id, name, price, text], index) => `
+                ([id, name, price, text]) => `
               <label class="plan-option">
-                <input type="radio" name="plan" value="${id}"${index === 0 ? ' checked' : ''} />
+                <input type="radio" name="plan" value="${id}"${id === state.plan ? ' checked' : ''} />
                 <span><b>${name}</b><strong>${price}</strong><small>${text}</small></span>
               </label>`,
               )
@@ -511,43 +521,60 @@ const views = {
         ${settingRow('Signed in with', 'Your identity provider.', '<span id="profile-provider" class="muted">Loading…</span>')}
         ${settingRow('Role', 'What you can manage in Lyrcloud.', '<span id="profile-role" class="muted">Loading…</span>')}
         ${settingRow('Member since', 'When your Lyrcloud account was created.', '<span id="profile-created" class="muted">Loading…</span>')}
-        ${settingRow('Plan', 'Default plan for new websites.', `
-          <select data-action="account-plan">${['launch', 'scale', 'enterprise'].map((plan) => `<option${plan === state.plan ? ' selected' : ''}>${plan}</option>`).join('')}</select>`)}
+        ${settingRow('Plan', 'Your account plan, used for new websites. <a href="#/plans">Compare plans</a>', planSelect('account-plan', state.plan))}
         ${settingRow('Sign out', 'End your session in this browser.', '<button class="btn" data-action="sign-out">Sign out</button>')}
         ${settingRow('Reset preview data', 'Delete all websites and functions stored in this browser.', '<button class="btn danger" data-action="reset">Reset</button>')}
       </section>`;
   },
 
-  users() {
-    if (profile && !isStaff(profile.role)) return views.missing();
-    const canChangeRoles = profile?.role === 'superadmin';
-    const roleButton = (user) => {
-      if (!canChangeRoles || user.role === 'superadmin') return '';
-      const next = user.role === 'admin' ? 'user' : 'admin';
-      return `<button class="btn small" data-action="set-role" data-id="${esc(user.userId)}" data-role="${next}">${next === 'admin' ? 'Make admin' : 'Remove admin'}</button>`;
-    };
-    const body = adminUsers.error
-      ? `<p class="form-error">${esc(adminUsers.error)}</p>`
-      : !adminUsers.list
-        ? '<p class="muted">Loading accounts…</p>'
-        : `<div class="table-scroll"><table class="table">
-            <thead><tr><th>Account</th><th>Signed in with</th><th>Role</th><th>Last sign-in</th><th></th></tr></thead>
-            <tbody>${adminUsers.list
-              .map(
-                (user) => `
-              <tr>
-                <td><b>${esc(user.name || user.email || user.userId)}</b><br><small class="muted mono">${esc(user.email || '—')}</small></td>
-                <td>${esc(user.provider || '—')}</td>
-                <td><span class="role-badge role-${esc(user.role)}">${ROLE_LABELS[user.role] || esc(user.role)}</span></td>
-                <td>${user.lastLoginAt ? formatDate(user.lastLoginAt) : '—'}</td>
-                <td>${roleButton(user)}</td>
-              </tr>`,
-              )
-              .join('')}</tbody>
-          </table></div>`;
+  plans() {
+    const current = state.plan;
+    const cards = PLAN_IDS.map((id) => {
+      const plan = PLAN_INFO[id];
+      const isCurrent = id === current;
+      return `
+        <section class="panel plan-card${isCurrent ? ' is-current' : ''}">
+          <div class="plan-card-head"><h2>${plan.name}</h2>${isCurrent ? '<span class="status ok">● Current plan</span>' : ''}</div>
+          <strong class="plan-price">${plan.price}</strong>
+          <p class="muted">${plan.blurb}</p>
+          <ul class="plan-features">${plan.features.map((feature) => `<li>${feature}</li>`).join('')}</ul>
+          ${isCurrent
+            ? '<button class="btn" disabled>Your plan</button>'
+            : `<button class="btn${PLAN_IDS.indexOf(id) > PLAN_IDS.indexOf(current) ? ' primary' : ''}" data-action="set-account-plan" data-plan="${id}">${PLAN_IDS.indexOf(id) > PLAN_IDS.indexOf(current) ? 'Upgrade' : 'Switch'} to ${plan.name}</button>`}
+        </section>`;
+    }).join('');
     return `
-      ${pageHead('Users', canChangeRoles ? 'Everyone with a Lyrcloud account. You can grant or remove admin access.' : 'Everyone with a Lyrcloud account. Only the super admin can change roles.')}
-      <section class="panel">${body}</section>`;
+      ${pageHead('Plans', 'Your plan is saved to your Lyrcloud account and used for new websites.')}
+      ${profileFailed ? '<p class="form-error">Couldn’t reach your account, so plan changes can’t be saved right now. Reload to try again.</p>' : ''}
+      <div class="grid-3 plan-grid">${cards}</div>
+      ${state.zones.length
+        ? `<label class="check-row"><input type="checkbox" id="plan-apply-sites" checked /> Also switch my ${state.zones.length} existing website${state.zones.length === 1 ? '' : 's'} to the new plan</label>`
+        : ''}
+      <p class="muted">Billing isn’t connected yet, so every plan is free during the preview.</p>`;
+  },
+
+  users(route) {
+    return views.admin(route);
+  },
+
+  admin(route) {
+    if (profileFailed) return `<section class="panel"><p class="form-error">Couldn’t load your account. Reload the page to try again.</p></section>`;
+    if (!profile) return '<section class="panel"><p class="muted">Loading…</p></section>';
+    if (!isStaff(profile.role)) return views.missing();
+    const isSuper = profile.role === 'superadmin';
+    const tab = ['overview', 'users', 'settings'].includes(route.params.get('tab')) ? route.params.get('tab') : 'overview';
+    const tabs = [['overview', 'Overview'], ['users', `Users${adminUsers.list ? ` (${adminUsers.list.length})` : ''}`], ['settings', 'Site settings']]
+      .map(([id, label]) => `<a class="admin-tab" href="#/admin?tab=${id}"${id === tab ? ' aria-current="page"' : ''}>${label}</a>`)
+      .join('');
+    const body = adminUsers.error
+      ? `<section class="panel"><p class="form-error">${esc(adminUsers.error)}</p><button class="btn" data-action="admin-refresh">Try again</button></section>`
+      : !adminUsers.list && tab !== 'settings'
+        ? '<section class="panel"><p class="muted">Loading accounts…</p></section>'
+        : adminTabs[tab](isSuper);
+    return `
+      ${pageHead(isSuper ? 'Super admin console' : 'Admin console', `${esc(profile.email || session.email)} · ${ROLE_LABELS[profile.role]}`, '<button class="btn" data-action="admin-refresh">Refresh</button>')}
+      <nav class="admin-tabs" aria-label="Admin sections">${tabs}</nav>
+      ${body}`;
   },
 
   missing() {
@@ -560,7 +587,7 @@ const zoneViews = {
     const { rows } = sampleSeries(zone.name, '24h');
     const requests = sum(rows, 'requests');
     return `
-      ${pageHead(esc(zone.name), `${statusBadge(zone.status)} · ${esc(zone.plan)} plan`, `<a class="btn" href="https://${esc(zone.name)}" target="_blank" rel="noopener">Visit site ↗</a>`)}
+      ${pageHead(esc(zone.name), `${statusBadge(zone.status)} · ${esc(planName(zone.plan))} plan`, `<a class="btn" href="https://${esc(zone.name)}" target="_blank" rel="noopener">Visit site ↗</a>`)}
       ${
         zone.status !== 'active'
           ? `<section class="panel callout">
@@ -592,6 +619,7 @@ const zoneViews = {
         <section class="panel">
           <div class="panel-head"><h2>Domain</h2></div>
           <dl class="facts">
+            <dt>Plan</dt><dd>${planSelect('zone-plan', zone.plan, ' aria-label="Plan for this site"')}</dd>
             <dt>Nameservers</dt><dd>${zone.nameservers.map((ns) => `<code>${ns}</code>`).join('<br>')}</dd>
             <dt>SSL/TLS</dt><dd>${esc(zone.ssl.mode)}</dd>
             <dt>DNS records</dt><dd>${zone.dns.length}</dd>
@@ -703,7 +731,7 @@ const zoneViews = {
       <section class="panel">
         ${settingRow('Under Attack mode', 'Show an interstitial challenge to every visitor.', toggle('under-attack', zone.security.underAttack, 'Under Attack mode'))}
         ${settingRow('Bot fight mode', 'Challenge requests that match known bot patterns.', toggle('bot-fight', zone.security.botFight, 'Bot fight mode'))}
-        ${settingRow('Managed WAF rules', zone.plan === 'launch' ? 'Available on Scale and Enterprise plans.' : 'OWASP core ruleset and Lyrcloud managed rules.', zone.plan === 'launch' ? '<a class="btn small" href="/pricing/">Upgrade</a>' : toggle('managed-waf', zone.security.managedWaf, 'Managed WAF rules'))}
+        ${settingRow('Managed WAF rules', zone.plan === 'launch' ? 'Available on Scale and Enterprise plans.' : 'OWASP core ruleset and Lyrcloud managed rules.', zone.plan === 'launch' ? '<button class="btn small" data-action="zone-upgrade">Upgrade to Scale</button>' : toggle('managed-waf', zone.security.managedWaf, 'Managed WAF rules'))}
       </section>
       <section class="panel">
         <div class="panel-head"><h2>Custom rules</h2><span class="muted">${zone.security.rules.length} of 5 used</span></div>
@@ -760,6 +788,126 @@ const zoneViews = {
   },
 };
 
+// ------------------------------------------------------------------ admin console
+
+const DAY = 86_400_000;
+const within = (iso, days) => Boolean(iso) && Date.now() - new Date(iso).getTime() < days * DAY;
+const countBy = (list, key) => list.reduce((counts, item) => ({ ...counts, [key(item)]: (counts[key(item)] || 0) + 1 }), {});
+
+function bars(counts, labels = {}) {
+  const total = Object.values(counts).reduce((a, b) => a + b, 0) || 1;
+  return `<ul class="bars">${Object.entries(counts)
+    .sort((a, b) => b[1] - a[1])
+    .map(([key, count]) => `<li><span>${esc(labels[key] || key)}</span><span class="bar" aria-hidden="true"><i style="width:${(count / total) * 100}%"></i></span><b>${count}</b></li>`)
+    .join('')}</ul>`;
+}
+
+const userLabel = (user) => user.name || user.email || user.userId;
+
+const adminTabs = {
+  overview() {
+    const users = adminUsers.list;
+    const stat = (label, value, href) => `<a class="stat" href="${href}"><span>${label}</span><strong>${value}</strong></a>`;
+    const recent = users.slice(0, 5)
+      .map((user) => `<li><b>${esc(userLabel(user))}</b> <span class="muted">${user.lastLoginAt ? formatDate(user.lastLoginAt) : '—'}</span></li>`)
+      .join('');
+    return `
+      <div class="stat-grid">
+        ${stat('Accounts', users.length, '#/admin?tab=users')}
+        ${stat('Active · 7 days', users.filter((user) => within(user.lastLoginAt, 7)).length, '#/admin?tab=users')}
+        ${stat('New · 7 days', users.filter((user) => within(user.createdAt, 7)).length, '#/admin?tab=users')}
+        ${stat('Admins', users.filter((user) => isStaff(user.role)).length, '#/admin?tab=users')}
+      </div>
+      <div class="grid-2">
+        <section class="panel"><div class="panel-head"><h2>Plans</h2></div>${bars(countBy(users, (user) => user.plan), Object.fromEntries(PLAN_IDS.map((id) => [id, planName(id)])))}</section>
+        <section class="panel"><div class="panel-head"><h2>Sign-in methods</h2></div>${bars(countBy(users, (user) => user.provider || 'Unknown'), { GoogleOIDC: 'Google', GitHubBridge: 'GitHub' })}</section>
+      </div>
+      <section class="panel">
+        <div class="panel-head"><h2>Recent sign-ins</h2><a href="#/admin?tab=users">All users →</a></div>
+        <ul class="recent-list">${recent || '<li class="muted">No accounts yet.</li>'}</ul>
+        ${users.some((user) => user.disabled) ? `<p class="muted">${users.filter((user) => user.disabled).length} disabled account(s).</p>` : ''}
+      </section>`;
+  },
+
+  users(isSuper) {
+    const { q, role } = adminFilter;
+    const rows = adminUsers.list.filter((user) => role === 'all' || (role === 'disabled' ? user.disabled : user.role === role));
+    const badge = (cls, text) => `<span class="badge ${cls}">${text}</span>`;
+    const card = (user) => {
+      const self = user.userId === profile.userId;
+      const manageable = canManage(profile.role, user.role);
+      const actions = manageable
+        ? `<div class="user-actions">
+            <button class="btn small" data-action="admin-edit" data-id="${esc(user.userId)}">${adminEditing === user.userId ? 'Close' : 'Edit'}</button>
+            ${isSuper ? `<button class="btn small" data-action="admin-role" data-id="${esc(user.userId)}" data-role="${user.role === 'admin' ? 'user' : 'admin'}">${user.role === 'admin' ? 'Remove admin' : 'Make admin'}</button>` : ''}
+            <button class="btn small${user.disabled ? '' : ' danger'}" data-action="admin-disable" data-id="${esc(user.userId)}" data-disabled="${!user.disabled}">${user.disabled ? 'Enable' : 'Disable'}</button>
+            <button class="btn small" data-action="admin-sign-out" data-id="${esc(user.userId)}">Sign out everywhere</button>
+            ${isSuper ? `<button class="btn small danger" data-action="admin-delete" data-id="${esc(user.userId)}">Delete</button>` : ''}
+          </div>`
+        : '';
+      const editor = adminEditing === user.userId && manageable
+        ? `<form class="user-editor" data-form="admin-edit-user" data-id="${esc(user.userId)}">
+            <label>Name<input name="name" value="${esc(user.name || '')}" maxlength="120" placeholder="${esc(user.email || '')}" /></label>
+            <label>Plan<select name="plan">${PLAN_IDS.map((id) => `<option value="${id}"${id === user.plan ? ' selected' : ''}>${planName(id)}</option>`).join('')}</select></label>
+            <button class="btn primary" type="submit">Save</button>
+          </form>`
+        : '';
+      return `
+        <li class="user-card" data-search="${esc(`${user.name || ''} ${user.email || ''} ${user.provider || ''} ${user.role} ${user.plan}`.toLowerCase())}">
+          <div class="user-main">
+            <div class="user-who"><b>${esc(userLabel(user))}</b><small class="muted mono">${esc(user.email || '—')}</small></div>
+            <div class="badges">
+              ${badge(`role-badge role-${esc(user.role)}`, ROLE_LABELS[user.role] || esc(user.role))}
+              ${badge('plan-badge', `${esc(planName(user.plan))} plan`)}
+              ${badge('', esc({ GoogleOIDC: 'Google', GitHubBridge: 'GitHub' }[user.provider] || user.provider || '—'))}
+              ${user.disabled ? badge('badge-danger', 'Disabled') : ''}
+              ${self ? badge('', 'You') : ''}
+              <small class="muted">Joined ${user.createdAt ? new Date(user.createdAt).toLocaleDateString() : '—'} · last sign-in ${user.lastLoginAt ? formatDate(user.lastLoginAt) : '—'}</small>
+            </div>
+          </div>
+          ${actions}
+          ${editor}
+        </li>`;
+    };
+    return `
+      <section class="panel">
+        <div class="admin-toolbar">
+          <input type="search" id="admin-search" placeholder="Search name, email, plan or sign-in method" value="${esc(q)}" aria-label="Search users" />
+          <select data-action="admin-role-filter" aria-label="Filter users">
+            ${[['all', 'Everyone'], ['superadmin', 'Super admin'], ['admin', 'Admins'], ['user', 'Users'], ['disabled', 'Disabled']]
+              .map(([id, label]) => `<option value="${id}"${id === role ? ' selected' : ''}>${label}</option>`).join('')}
+          </select>
+        </div>
+        <p class="muted admin-hint">${isSuper ? 'You can manage every account except your own. Destructive actions need a second tap.' : 'You can manage regular users. Only the super admin can manage admins or delete accounts.'}</p>
+        <ul class="user-list">${rows.map(card).join('') || '<li class="muted">No accounts match.</li>'}</ul>
+        <p class="muted" id="admin-no-match" hidden>No accounts match your search.</p>
+      </section>`;
+  },
+
+  settings(isSuper) {
+    if (adminSettings.error) return `<section class="panel"><p class="form-error">${esc(adminSettings.error)}</p></section>`;
+    if (!adminSettings.data) return '<section class="panel"><p class="muted">Loading settings…</p></section>';
+    const { announcement, updatedAt } = adminSettings.data;
+    return `
+      <section class="panel">
+        <div class="panel-head"><h2>Dashboard announcement</h2>${updatedAt ? `<span class="muted">Updated ${formatDate(updatedAt)}</span>` : ''}</div>
+        <p class="muted">Shown at the top of every signed-in user’s dashboard. Leave empty to hide it.</p>
+        <form data-form="admin-settings" class="stack">
+          <textarea name="announcement" rows="3" maxlength="500"${isSuper ? '' : ' disabled'} placeholder="e.g. Scheduled maintenance on Saturday 02:00–03:00 UTC">${esc(announcement)}</textarea>
+          ${isSuper ? '<div class="row"><button class="btn primary" type="submit">Save announcement</button></div>' : '<p class="muted">Only the super admin can change site settings.</p>'}
+        </form>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>Access rules</h2></div>
+        <dl class="facts">
+          <dt>Super admin</dt><dd>The configured owner email, signed in with Google. Can’t be changed, disabled or deleted here.</dd>
+          <dt>Admins</dt><dd>See every account; manage plans, access and sessions for regular users.</dd>
+          <dt>Users</dt><dd>Manage their own websites, functions and plan.</dd>
+        </dl>
+      </section>`;
+  },
+};
+
 // ------------------------------------------------------------------ routing
 
 function parseRoute() {
@@ -780,12 +928,16 @@ function render() {
     ${sidebar(currentRoute)}
     <div class="dash-main">
       ${topbar(currentRoute)}
-      <main class="dash-content">${content}</main>
+      <main class="dash-content">${profile?.announcement ? `<div class="announcement" role="status"><b>Notice</b> ${esc(profile.announcement)}</div>` : ''}${content}</main>
     </div>`;
   app.classList.remove('sidebar-open');
   bindCharts();
   if (currentRoute.view === 'settings') showProfile();
-  if (currentRoute.view === 'users' && !adminUsers.list && !adminUsers.loading) loadUsers();
+  if (isAdminView() && profile && isStaff(profile.role)) {
+    if (!adminUsers.list && !adminUsers.loading && !adminUsers.error) loadUsers();
+    if (currentRoute.params.get('tab') === 'settings' && !adminSettings.data && !adminSettings.loading) loadAdminSettings();
+    applyAdminSearch();
+  }
   document.title = `${document.querySelector('.page-head h1')?.textContent || 'Dashboard'} | Lyrcloud`;
 }
 
@@ -796,8 +948,17 @@ let profileFailed = false;
 async function loadProfile() {
   try {
     const response = await authFetch('/me');
+    if (response.status === 403) {
+      app.innerHTML = `<section class="panel empty disabled-account"><h2>This account has been disabled</h2><p>Contact hello@lyrcloud.com if you think this is a mistake.</p><button class="btn" data-action="sign-out">Sign out</button></section>`;
+      return;
+    }
     if (!response.ok) throw new Error(`me failed: ${response.status}`);
     profile = await response.json();
+    // The account's plan lives on the server; this browser's copy follows it.
+    if (profile.plan && profile.plan !== state.plan) {
+      state.plan = profile.plan;
+      save();
+    }
   } catch {
     profileFailed = true;
   }
@@ -818,21 +979,98 @@ function showProfile() {
   }
 }
 
-// Every account, for admins (GET /admin/users).
+// Admin console data (GET /admin/users, GET /admin/settings) and the user-list filter.
 const adminUsers = { list: null, error: '', loading: false };
+const adminSettings = { data: null, error: '', loading: false };
+const adminFilter = { q: '', role: 'all' };
+let adminEditing = null;
+const isAdminView = () => currentRoute?.view === 'admin' || currentRoute?.view === 'users';
+
+async function api(path, options = {}) {
+  const response = await authFetch(path, {
+    ...options,
+    headers: options.body ? { 'content-type': 'application/json', ...options.headers } : options.headers,
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+  return data;
+}
+
 async function loadUsers() {
   adminUsers.loading = true;
   try {
-    const response = await authFetch('/admin/users');
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || `Couldn’t load accounts (${response.status})`);
-    adminUsers.list = data.users;
+    adminUsers.list = (await api('/admin/users')).users;
     adminUsers.error = '';
   } catch (error) {
     adminUsers.error = error.message;
   }
   adminUsers.loading = false;
-  if (currentRoute.view === 'users') render();
+  if (isAdminView()) render();
+}
+
+async function loadAdminSettings() {
+  adminSettings.loading = true;
+  try {
+    adminSettings.data = await api('/admin/settings');
+    adminSettings.error = '';
+  } catch (error) {
+    adminSettings.error = error.message;
+  }
+  adminSettings.loading = false;
+  if (isAdminView()) render();
+}
+
+// Filters the rendered user cards in place, so typing doesn't re-render (and lose focus).
+function applyAdminSearch() {
+  const list = document.querySelector('.user-list');
+  if (!list) return;
+  const q = adminFilter.q.trim().toLowerCase();
+  let shown = 0;
+  for (const card of list.querySelectorAll('.user-card')) {
+    card.hidden = Boolean(q) && !card.dataset.search.includes(q);
+    if (!card.hidden) shown += 1;
+  }
+  const empty = document.getElementById('admin-no-match');
+  if (empty) empty.hidden = shown > 0 || !list.querySelector('.user-card');
+}
+
+const findAdminUser = (id) => adminUsers.list?.find((user) => user.userId === id);
+const replaceAdminUser = (user) => {
+  adminUsers.list = adminUsers.list.map((item) => (item.userId === user.userId ? user : item));
+};
+
+// Runs an admin action from a button: disables it while the request is in flight.
+async function adminAction(target, request, message) {
+  target.disabled = true;
+  try {
+    const data = await request();
+    if (data?.user) replaceAdminUser(data.user);
+    render();
+    toast(message);
+  } catch (error) {
+    target.disabled = false;
+    toast(error.message);
+  }
+}
+
+async function setAccountPlan(plan, applyToSites) {
+  try {
+    profile = { ...profile, ...(await api('/me', { method: 'PUT', body: JSON.stringify({ plan }) })) };
+  } catch (error) {
+    toast(`Couldn’t change plan: ${error.message}`);
+    render();
+    return;
+  }
+  state.plan = plan;
+  if (applyToSites) {
+    for (const zone of state.zones) {
+      zone.plan = plan;
+      zone.security.managedWaf = plan !== 'launch';
+    }
+  }
+  save();
+  render();
+  toast(`You’re now on the ${planName(plan)} plan${applyToSites && state.zones.length ? ', and so are your websites' : ''}`);
 }
 
 const go = (hash) => {
@@ -944,27 +1182,49 @@ const clickActions = {
     save();
     render();
   },
-  'set-role': async (target) => {
-    const user = adminUsers.list?.find((item) => item.userId === target.dataset.id);
-    const role = target.dataset.role;
-    const who = user?.email || 'this account';
-    if (!confirmed(target, role === 'admin' ? `Give ${who} admin access?` : `Remove admin access from ${who}?`)) return;
+  'set-account-plan': (target) => {
     target.disabled = true;
-    try {
-      const response = await authFetch(`/admin/users/${encodeURIComponent(target.dataset.id)}`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ role }),
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
-      adminUsers.list = adminUsers.list.map((item) => (item.userId === data.user.userId ? data.user : item));
-      render();
-      toast(role === 'admin' ? `${who} is now an admin` : `${who} is no longer an admin`);
-    } catch (error) {
-      target.disabled = false;
-      toast(error.message);
-    }
+    setAccountPlan(target.dataset.plan, document.getElementById('plan-apply-sites')?.checked ?? false);
+  },
+  'zone-upgrade': () => updateZone((zone) => { zone.plan = 'scale'; zone.security.managedWaf = true; }, 'Upgraded this site to Scale: managed WAF rules are on'),
+  'admin-refresh': () => {
+    adminUsers.list = null;
+    adminUsers.error = '';
+    adminSettings.data = null;
+    adminSettings.error = '';
+    render();
+  },
+  'admin-edit': (target) => {
+    adminEditing = adminEditing === target.dataset.id ? null : target.dataset.id;
+    render();
+  },
+  'admin-role': (target) => {
+    const user = findAdminUser(target.dataset.id);
+    const role = target.dataset.role;
+    if (!confirmed(target, role === 'admin' ? `Give ${userLabel(user)} admin access?` : `Remove admin access from ${userLabel(user)}?`)) return;
+    adminAction(target, () => api(`/admin/users/${encodeURIComponent(user.userId)}`, { method: 'PUT', body: JSON.stringify({ role }) }),
+      role === 'admin' ? `${userLabel(user)} is now an admin` : `${userLabel(user)} is no longer an admin`);
+  },
+  'admin-disable': (target) => {
+    const user = findAdminUser(target.dataset.id);
+    const disabled = target.dataset.disabled === 'true';
+    if (disabled && !confirmed(target, `Disable ${userLabel(user)}? They’ll be signed out and can’t sign in until you enable them.`)) return;
+    adminAction(target, () => api(`/admin/users/${encodeURIComponent(user.userId)}`, { method: 'PUT', body: JSON.stringify({ disabled }) }),
+      disabled ? `${userLabel(user)} is disabled` : `${userLabel(user)} is enabled again`);
+  },
+  'admin-sign-out': (target) => {
+    const user = findAdminUser(target.dataset.id);
+    if (!confirmed(target, `Sign ${userLabel(user)} out on every device?`)) return;
+    adminAction(target, () => api(`/admin/users/${encodeURIComponent(user.userId)}/sign-out`, { method: 'POST' }),
+      `${userLabel(user)} will be asked to sign in again`);
+  },
+  'admin-delete': (target) => {
+    const user = findAdminUser(target.dataset.id);
+    if (!confirmed(target, `Delete ${userLabel(user)}? This removes the account for good.`)) return;
+    adminAction(target, async () => {
+      await api(`/admin/users/${encodeURIComponent(user.userId)}`, { method: 'DELETE' });
+      adminUsers.list = adminUsers.list.filter((item) => item.userId !== user.userId);
+    }, `${userLabel(user)} was deleted`);
   },
   'sign-out': () => endSession(),
   reset: (target) => {
@@ -992,11 +1252,15 @@ const changeActions = {
   'min-tls': (target) => updateZone((zone) => { zone.ssl.minTls = target.value; }, `Minimum TLS set to ${target.value}`),
   'cache-level': (target) => updateZone((zone) => { zone.caching.level = target.value; }, 'Caching level updated'),
   'browser-ttl': (target) => updateZone((zone) => { zone.caching.browserTtl = target.value; }, 'Browser cache TTL updated'),
-  'account-plan': (target) => {
-    state.plan = target.value;
-    save();
+  'account-plan': (target) => setAccountPlan(target.value, false),
+  'zone-plan': (target) =>
+    updateZone((zone) => {
+      zone.plan = target.value;
+      zone.security.managedWaf = target.value !== 'launch';
+    }, `This site is now on the ${planName(target.value)} plan`),
+  'admin-role-filter': (target) => {
+    adminFilter.role = target.value;
     render();
-    toast('Plan updated');
   },
 };
 
@@ -1015,6 +1279,37 @@ const RECORD_VALIDATORS = {
 };
 
 const formActions = {
+  'admin-edit-user': async (form, data) => {
+    const user = findAdminUser(form.dataset.id);
+    const button = form.querySelector('[type="submit"]');
+    button.disabled = true;
+    try {
+      const { user: saved } = await api(`/admin/users/${encodeURIComponent(user.userId)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ name: String(data.get('name')), plan: String(data.get('plan')) }),
+      });
+      replaceAdminUser(saved);
+      adminEditing = null;
+      render();
+      toast(`Saved ${userLabel(saved)}`);
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message);
+    }
+  },
+  'admin-settings': async (form, data) => {
+    const button = form.querySelector('[type="submit"]');
+    button.disabled = true;
+    try {
+      adminSettings.data = await api('/admin/settings', { method: 'PUT', body: JSON.stringify({ announcement: String(data.get('announcement')) }) });
+      profile = { ...profile, announcement: adminSettings.data.announcement };
+      render();
+      toast(adminSettings.data.announcement ? 'Announcement published' : 'Announcement removed');
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message);
+    }
+  },
   'add-domain': async (form, data) => {
     const domain = String(data.get('domain')).trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/^www\./, '');
     if (!DOMAIN_RE.test(domain)) return showFormError(form, 'Enter a valid domain like example.com.');
@@ -1084,6 +1379,12 @@ app.addEventListener('click', (event) => {
 app.addEventListener('change', (event) => {
   const target = event.target.closest('[data-action]');
   if (target) changeActions[target.dataset.action]?.(target);
+});
+
+app.addEventListener('input', (event) => {
+  if (event.target.id !== 'admin-search') return;
+  adminFilter.q = event.target.value;
+  applyAdminSearch();
 });
 
 app.addEventListener('submit', (event) => {

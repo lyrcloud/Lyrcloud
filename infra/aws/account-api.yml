@@ -81,10 +81,24 @@ Resources:
                   - dynamodb:PutItem
                   - dynamodb:UpdateItem
                   - dynamodb:Scan
+                  - dynamodb:DeleteItem
                 Resource: !GetAtt UsersTable.Arn
               - Effect: Allow
                 Action: dynamodb:UpdateItem
                 Resource: !GetAtt RateLimitTable.Arn
+        - PolicyName: UserPoolAdmin
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Disable/enable, sign out everywhere and delete accounts from the admin console.
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminDisableUser
+                  - cognito-idp:AdminEnableUser
+                  - cognito-idp:AdminUserGlobalSignOut
+                  - cognito-idp:AdminDeleteUser
+                  - cognito-idp:ListUsers
+                Resource: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPoolId}'
         - !If
           - HasAnthropicSecret
           - PolicyName: LyrbotSecret
@@ -110,6 +124,7 @@ Resources:
           TABLE_NAME: !Ref UsersTable
           RATE_TABLE_NAME: !Ref RateLimitTable
           SUPER_ADMIN_EMAIL: !Ref SuperAdminEmail
+          USER_POOL_ID: !Ref UserPoolId
           ANTHROPIC_SECRET: !Ref AnthropicSecretName
       Code:
         S3Bucket: !Ref ArtifactsBucketName
@@ -126,6 +141,7 @@ Resources:
           - GET
           - PUT
           - POST
+          - DELETE
           - OPTIONS
         AllowHeaders:
           - Authorization
@@ -175,6 +191,51 @@ Resources:
     Properties:
       ApiId: !Ref HttpApi
       RouteKey: 'PUT /admin/users/{userId}'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  UpdateMeRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'PUT /me'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  DeleteUserRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'DELETE /admin/users/{userId}'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  SignOutUserRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /admin/users/{userId}/sign-out'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  GetSettingsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /admin/settings'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  PutSettingsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'PUT /admin/settings'
       Target: !Sub 'integrations/${LambdaIntegration}'
       AuthorizationType: JWT
       AuthorizerId: !Ref JwtAuthorizer
