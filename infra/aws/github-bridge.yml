@@ -1,0 +1,141 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: GitHub-to-OIDC bridge so Cognito can federate GitHub login (GitHub has no native OIDC id_token support).
+# Deploy with scripts/deploy-github-bridge.sh; Lambda source is in api/github-bridge/. The secret's values are
+# set outside CloudFormation, so leave BridgeSecret's placeholder SecretString unchanged or they're wiped.
+
+Parameters:
+  ArtifactsBucketName:
+    Type: String
+  LambdaCodeS3Key:
+    Type: String
+  AllowedRedirectUri:
+    Type: String
+    Description: The exact Cognito Hosted UI redirect URI (https://<domain>/oauth2/idpresponse) this bridge will accept.
+
+Resources:
+  BridgeSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: lyrcloud/github-bridge
+      Description: GitHub OAuth App credentials + JWT signing material for the Cognito GitHub bridge.
+      SecretString: '{"githubClientId":"","githubClientSecret":"","rsaPrivateKeyPem":"","keyId":"","internalCodeHmacSecret":"","bridgeClientId":"lyrcloud-github-bridge"}'
+
+  BridgeFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BridgeSecretAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref BridgeSecret
+
+  BridgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-bridge'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt BridgeFunctionRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref BridgeSecret
+          BRIDGE_BASE_URL: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+          ALLOWED_REDIRECT_URI: !Ref AllowedRedirectUri
+      Code:
+        S3Bucket: !Ref ArtifactsBucketName
+        S3Key: !Ref LambdaCodeS3Key
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt BridgeFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  AuthorizeRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /authorize'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  CallbackRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /callback'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  TokenRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /token'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  JwksRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /.well-known/jwks.json'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  DiscoveryRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /.well-known/openid-configuration'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  # Cognito reads the account's attributes here after /token.
+  UserinfoRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /userinfo'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref BridgeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*'
+
+Outputs:
+  BridgeApiBaseUrl:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  BridgeCallbackUrl:
+    Description: Register this exact URL as the GitHub OAuth App's "Authorization callback URL".
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/callback'
+  BridgeSecretArn:
+    Value: !Ref BridgeSecret
+

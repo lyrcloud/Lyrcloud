@@ -1,0 +1,492 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lyrcloud Projects - import git repositories, build them on CodeBuild and serve them at <name>.<SitesDomain>.
+# Deploy with scripts/deploy-projects.sh. Lambda source: api/projects/ (plus api/account/roles.mjs).
+# Router: infra/cloudfront/sites-router.js, passed in as RouterCode.
+
+Parameters:
+  ArtifactsBucketName:
+    Type: String
+    Default: lyrcloud-deploy-artifacts
+  LambdaCodeS3Key:
+    Type: String
+  UserPoolId:
+    Type: String
+  UserPoolClientId:
+    Type: String
+  SitesDomain:
+    Type: String
+    Default: lyrcloud.app
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: The Route 53 zone of SitesDomain.
+  RouterCode:
+    Type: String
+    Description: Source of infra/cloudfront/sites-router.js with the domain filled in.
+  UsersTableName:
+    Type: String
+    Default: lyrcloud-users
+  SuperAdminEmail:
+    Type: String
+    Default: lyrclouds@gmail.com
+  AllowedOrigins:
+    Type: CommaDelimitedList
+    Default: 'https://www.lyrcloud.com,http://localhost:5173'
+
+Resources:
+  # ---------------------------------------------------------------- data and secrets
+
+  ProjectsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: lyrcloud-projects
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: ownerId, AttributeType: S }
+        - { AttributeName: createdAt, AttributeType: S }
+        - { AttributeName: repoKey, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: byOwner
+          KeySchema:
+            - { AttributeName: ownerId, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: byRepo
+          KeySchema:
+            - { AttributeName: repoKey, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+
+  # Signs GitHub "state" values and encrypts stored GitHub user tokens.
+  ProjectsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: lyrcloud/projects
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  # The GitHub App's credentials. The API writes them once, when the super admin creates the app;
+  # leave this placeholder unchanged or the stored values are replaced.
+  GithubAppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: lyrcloud/github-app
+      Description: Lyrcloud GitHub App (id, private key, OAuth client, webhook secret). Written by the projects API.
+      SecretString: '{}'
+
+  # ---------------------------------------------------------------- storage
+
+  SitesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'lyrcloud-sites-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  SitesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SitesBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${SitesBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  # Where builds drop their output for the publisher to check. Builds can write here, never to SitesBucket.
+  BuildOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'lyrcloud-builds-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLeftovers
+            Status: Enabled
+            ExpirationInDays: 2
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  # ---------------------------------------------------------------- builder
+
+  BuilderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/codebuild/lyrcloud-site-builder
+      RetentionInDays: 14
+
+  # Everything here is reachable by the user's own build scripts, so it's only "write logs and drop output".
+  BuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BuildOutputOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${BuilderLogGroup.Arn}:*'
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${BuildOutputBucket.Arn}/builds/*'
+              - Effect: Allow
+                Action: [s3:GetBucketAcl, s3:GetBucketLocation]
+                Resource: !GetAtt BuildOutputBucket.Arn
+
+  Builder:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: lyrcloud-site-builder
+      Description: Builds Lyrcloud Projects. The buildspec comes from the projects API with each build.
+      ServiceRole: !GetAtt BuilderRole.Arn
+      TimeoutInMinutes: 15
+      QueuedTimeoutInMinutes: 60
+      ConcurrentBuildLimit: 10
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - echo "Started without the projects API's buildspec" && exit 1
+      Artifacts:
+        Type: S3
+        Location: !Ref BuildOutputBucket
+        Packaging: NONE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuilderLogGroup
+
+  # ---------------------------------------------------------------- API and publisher
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: Projects
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:Scan]
+                Resource: [!GetAtt ProjectsTable.Arn, !Sub '${ProjectsTable.Arn}/index/*']
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${UsersTableName}'
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource: !GetAtt Builder.Arn
+              - Effect: Allow
+                Action: logs:GetLogEvents
+                Resource: !Sub '${BuilderLogGroup.Arn}:*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: [!GetAtt BuildOutputBucket.Arn, !GetAtt SitesBucket.Arn]
+              - Effect: Allow
+                Action: [s3:GetObject, s3:DeleteObject]
+                Resource: !Sub '${BuildOutputBucket.Arn}/*'
+              - Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject]
+                Resource: !Sub '${SitesBucket.Arn}/*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref ProjectsSecret, !Ref GithubAppSecret]
+              - Effect: Allow
+                Action: secretsmanager:PutSecretValue
+                Resource: !Ref GithubAppSecret
+              - Effect: Allow
+                Action: [cloudfront-keyvaluestore:DescribeKeyValueStore, cloudfront-keyvaluestore:GetKey, cloudfront-keyvaluestore:PutKey, cloudfront-keyvaluestore:DeleteKey]
+                Resource: !GetAtt SitesRoutes.Arn
+
+  ProjectsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lyrcloud-projects
+      Runtime: nodejs22.x
+      Handler: projects/index.handler
+      Role: !GetAtt FunctionRole.Arn
+      MemorySize: 1024
+      Timeout: 300 # publishing copies every file; API Gateway still answers callers within 30 s
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ProjectsTable
+          USERS_TABLE_NAME: !Ref UsersTableName
+          SITES_BUCKET: !Ref SitesBucket
+          ARTIFACTS_BUCKET: !Ref BuildOutputBucket
+          BUILDER_PROJECT: !Ref Builder
+          KVS_ARN: !GetAtt SitesRoutes.Arn
+          SITES_DOMAIN: !Ref SitesDomain
+          PROJECTS_SECRET_NAME: !Ref ProjectsSecret
+          GITHUB_APP_SECRET_NAME: !Ref GithubAppSecret
+          SUPER_ADMIN_EMAIL: !Ref SuperAdminEmail
+          DASH_URL: https://www.lyrcloud.com/dash/
+      Code:
+        S3Bucket: !Ref ArtifactsBucketName
+        S3Key: !Ref LambdaCodeS3Key
+
+  BuildEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: CodeBuild progress of Lyrcloud Projects builds, for the publisher.
+      EventPattern:
+        source: [aws.codebuild]
+        detail-type: [CodeBuild Build State Change]
+        detail:
+          project-name: [!Ref Builder]
+      Targets:
+        - Id: projects
+          Arn: !GetAtt ProjectsFunction.Arn
+
+  BuildEventsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProjectsFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BuildEventsRule.Arn
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: lyrcloud-projects-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: !Ref AllowedOrigins
+        AllowMethods: [GET, PUT, POST, DELETE, OPTIONS]
+        AllowHeaders: [Authorization, Content-Type]
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      Name: CognitoJwtAuthorizer
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration:
+        Audience: [!Ref UserPoolClientId]
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}'
+
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ProjectsFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  ListProjectsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /projects', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  CreateProjectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'POST /projects', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  ProjectGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /projects/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  ProjectPostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'POST /projects/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  ProjectPutRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'PUT /projects/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  ProjectDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'DELETE /projects/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  AdminGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /admin/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  AdminPostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'POST /admin/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  AdminPutRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'PUT /admin/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  # Unauthenticated: GitHub's redirects and webhooks (checked by signed state and webhook signature).
+  GithubCallbackRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /public/github/callback', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE }
+  GithubAppCreatedRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /public/github-app/created', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE }
+  GithubWebhookRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'POST /public/github/webhook', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE }
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 20
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProjectsFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*'
+
+  # ---------------------------------------------------------------- serving
+
+  SitesRoutes:
+    Type: AWS::CloudFront::KeyValueStore
+    Properties:
+      Name: lyrcloud-sites-routes
+      Comment: Project name -> live deployment, read by the sites router.
+
+  SitesRouter:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: lyrcloud-sites-router
+      AutoPublish: true
+      FunctionCode: !Ref RouterCode
+      FunctionConfig:
+        Comment: Maps <name>.<domain> to its live deployment in the sites bucket.
+        Runtime: cloudfront-js-2.0
+        KeyValueStoreAssociations:
+          - KeyValueStoreARN: !GetAtt SitesRoutes.Arn
+
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Sub '*.${SitesDomain}'
+      SubjectAlternativeNames: [!Ref SitesDomain]
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Sub '*.${SitesDomain}'
+          HostedZoneId: !Ref HostedZoneId
+        - DomainName: !Ref SitesDomain
+          HostedZoneId: !Ref HostedZoneId
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: lyrcloud-sites
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: Lyrcloud Projects (*.lyrcloud.app)
+        Enabled: true
+        Aliases: [!Sub '*.${SitesDomain}', !Ref SitesDomain]
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: sites
+            DomainName: !GetAtt SitesBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: sites
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03 # Managed-SecurityHeadersPolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt SitesRouter.FunctionMetadata.FunctionARN
+        CustomErrorResponses:
+          - { ErrorCode: 403, ResponseCode: 404, ResponsePagePath: /_lyrcloud/404.html, ErrorCachingMinTTL: 10 }
+          - { ErrorCode: 404, ResponseCode: 404, ResponsePagePath: /_lyrcloud/404.html, ErrorCachingMinTTL: 10 }
+
+  WildcardRecordA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub '*.${SitesDomain}'
+      Type: A
+      AliasTarget: { DNSName: !GetAtt Distribution.DomainName, HostedZoneId: Z2FDTNDATAQYW2 }
+  WildcardRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub '*.${SitesDomain}'
+      Type: AAAA
+      AliasTarget: { DNSName: !GetAtt Distribution.DomainName, HostedZoneId: Z2FDTNDATAQYW2 }
+  ApexRecordA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref SitesDomain
+      Type: A
+      AliasTarget: { DNSName: !GetAtt Distribution.DomainName, HostedZoneId: Z2FDTNDATAQYW2 }
+  ApexRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref SitesDomain
+      Type: AAAA
+      AliasTarget: { DNSName: !GetAtt Distribution.DomainName, HostedZoneId: Z2FDTNDATAQYW2 }
+
+Outputs:
+  ProjectsApiBaseUrl:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  SitesBucketName:
+    Value: !Ref SitesBucket
+  DistributionId:
+    Value: !Ref Distribution

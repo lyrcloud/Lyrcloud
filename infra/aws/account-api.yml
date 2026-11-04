@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Lyrcloud account API (profile and admin user management) backed by DynamoDB, protected by a Cognito JWT authorizer, plus the public Lyrbot help assistant.
+Description: Lyrcloud account API (profile, mobile verification, welcome and update emails, admin user management) backed by DynamoDB, protected by a Cognito JWT authorizer, plus the public Lyrbot help assistant.
 # Deploy with scripts/deploy-account-api.sh; Lambda source is in api/account/.
 
 Parameters:
@@ -22,10 +22,32 @@ Parameters:
     Default: lyrshop/anthropic
     Description: Secrets Manager secret holding the Anthropic API key Lyrbot uses (shared with Lyrshop and Lyrsoft). Blank turns Lyrbot off.
 
+  MailFrom:
+    Type: String
+    Default: 'Lyrcloud <no-reply@lyrcloud.com>'
+    Description: Sender of the welcome and update emails; its domain must be a verified SES identity. Blank turns email off.
+  MailReplyTo:
+    Type: String
+    Default: hello@lyrcloud.com
+  SmsSenderId:
+    Type: String
+    Default: ''
+    Description: Optional alphanumeric sender ID for verification texts, where the destination country allows one.
+
 Conditions:
   HasAnthropicSecret: !Not [!Equals [!Ref AnthropicSecretName, '']]
 
 Resources:
+  # Signs unsubscribe links and mobile verification codes.
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/app-secret'
+      Description: Signs Lyrcloud unsubscribe links and mobile verification codes.
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+
   UsersTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -98,7 +120,23 @@ Resources:
                   - cognito-idp:AdminUserGlobalSignOut
                   - cognito-idp:AdminDeleteUser
                   - cognito-idp:ListUsers
+                  - cognito-idp:AdminGetUser
                 Resource: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPoolId}'
+        - PolicyName: MessagesAndSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Welcome and update emails. identity/* because the SES sandbox also checks the recipient.
+              - Effect: Allow
+                Action: ses:SendEmail
+                Resource: !Sub 'arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*'
+              # Verification texts go straight to a phone number, which has no ARN.
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: '*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppSecret
         - !If
           - HasAnthropicSecret
           - PolicyName: LyrbotSecret
@@ -126,6 +164,10 @@ Resources:
           SUPER_ADMIN_EMAIL: !Ref SuperAdminEmail
           USER_POOL_ID: !Ref UserPoolId
           ANTHROPIC_SECRET: !Ref AnthropicSecretName
+          APP_SECRET_NAME: !Ref AppSecret
+          MAIL_FROM: !Ref MailFrom
+          MAIL_REPLY_TO: !Ref MailReplyTo
+          SMS_SENDER_ID: !Ref SmsSenderId
       Code:
         S3Bucket: !Ref ArtifactsBucketName
         S3Key: !Ref LambdaCodeS3Key
@@ -240,7 +282,68 @@ Resources:
       AuthorizationType: JWT
       AuthorizerId: !Ref JwtAuthorizer
 
-  # The one unauthenticated route. Throttled here, and per IP in the Lambda.
+  SendPhoneCodeRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /me/phone'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  VerifyPhoneRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /me/phone/verify'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  DeletePhoneRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'DELETE /me/phone'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  ListUpdatesRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /admin/updates'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  SendUpdateRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /admin/updates'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  UnsubscribePageRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /public/unsubscribe'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+      AuthorizationType: NONE
+
+  UnsubscribeRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /public/unsubscribe'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+      AuthorizationType: NONE
+
+  # Unauthenticated. Throttled here, and per IP in the Lambda.
   LyrbotRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
@@ -251,7 +354,7 @@ Resources:
 
   Stage:
     Type: AWS::ApiGatewayV2::Stage
-    DependsOn: [LyrbotRoute]
+    DependsOn: [LyrbotRoute, SendPhoneCodeRoute, UnsubscribePageRoute, UnsubscribeRoute]
     Properties:
       ApiId: !Ref HttpApi
       StageName: '$default'
@@ -263,6 +366,15 @@ Resources:
         'POST /public/lyrbot':
           ThrottlingBurstLimit: 10
           ThrottlingRateLimit: 2
+        'POST /me/phone':
+          ThrottlingBurstLimit: 5
+          ThrottlingRateLimit: 1
+        'GET /public/unsubscribe':
+          ThrottlingBurstLimit: 20
+          ThrottlingRateLimit: 5
+        'POST /public/unsubscribe':
+          ThrottlingBurstLimit: 20
+          ThrottlingRateLimit: 5
 
   LambdaInvokePermission:
     Type: AWS::Lambda::Permission
