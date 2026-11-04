@@ -562,7 +562,7 @@ const authShell = ({ mode }) => {
   const isSignUp = mode === 'sign-up';
   return `
     <main class="auth-page">
-      <a class="brand auth-brand" href="/"><span class="brand-mark" aria-hidden="true">✦</span><span>Lyrcloud</span></a>
+      <a class="brand auth-brand" href="/" aria-label="Lyrcloud home"><img class="brand-logo" src="/logo.svg" alt="Lyrcloud" width="165" height="26" /></a>
       <div class="form-card glass-card auth-card">
         <h1>${isSignUp ? 'Create your account' : 'Log in to Lyrcloud'}</h1>
         <p>${isSignUp ? 'Free forever on the Launch plan. No credit card required.' : 'Welcome back. Pick up where you left off.'}</p>
