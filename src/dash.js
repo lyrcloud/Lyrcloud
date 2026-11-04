@@ -284,7 +284,7 @@ function sidebar(route) {
 
   return `
     <aside class="dash-sidebar">
-      <a class="brand" href="/"><span class="brand-mark" aria-hidden="true">✦</span><span>Lyrcloud</span></a>
+      <a class="brand" href="/" aria-label="Lyrcloud home"><img class="brand-logo" src="/logo.svg" alt="Lyrcloud" width="165" height="26" /></a>
       <nav aria-label="Dashboard">
         ${accountLinks.map(link).join('')}
         ${zone ? `<p class="nav-label">${esc(zone.name)}</p>${zoneLinks.map(link).join('')}` : ''}

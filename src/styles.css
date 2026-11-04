@@ -146,6 +146,12 @@ p {
   font-size: 1.18rem;
 }
 
+.brand-logo {
+  display: block;
+  height: 26px;
+  width: auto;
+}
+
 .brand-mark {
   display: grid;
   place-items: center;
