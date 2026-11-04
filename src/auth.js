@@ -163,6 +163,7 @@ export function takeReturnPath(fallback = '/dash/') {
 
 export function logout() {
   clearTokens();
+  sessionStorage.removeItem('lyrcloud.profile');
   const url = new URL(`https://${COGNITO_DOMAIN}/logout`);
   url.searchParams.set('client_id', CLIENT_ID);
   url.searchParams.set('logout_uri', LOGOUT_URI);

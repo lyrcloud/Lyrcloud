@@ -1,3 +1,9 @@
+/* The hidden attribute always wins. Without this, any element whose class sets display
+   (such as the account menu panels, display: grid) stays visible after el.hidden = true. */
+[hidden] {
+  display: none !important;
+}
+
 /* Self-hosted Latin subsets (SIL Open Font License): Inter for text, Plus Jakarta Sans for
    headings, matching the wordmark in src/logo.js. */
 @font-face {
@@ -1419,39 +1425,57 @@ code.inline {
 
 .footer {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) 2fr;
-  gap: 40px;
-  margin-top: 40px;
-  padding: 56px 0 50px;
+  grid-template-columns: minmax(200px, 1fr) minmax(0, 2fr);
+  gap: 20px 40px;
+  margin-top: 32px;
+  padding: 28px 0 calc(20px + env(safe-area-inset-bottom, 0px));
   border-top: 1px solid var(--line);
   color: var(--muted);
+  font-size: 0.875rem;
 }
 
 .footer .brand {
   color: var(--text);
 }
 
+.footer-brand p {
+  max-width: 32ch;
+  margin: 8px 0 0;
+  line-height: 1.5;
+}
+
 .footer-columns {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 24px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 20px 24px;
 }
 
 .footer-columns div {
   display: grid;
   align-content: start;
-  gap: 10px;
+  gap: 6px;
+  min-width: 0;
+}
+
+.footer-columns a {
+  padding-block: 2px;
+  overflow-wrap: anywhere;
 }
 
 .footer h4 {
-  margin: 0 0 6px;
+  margin: 0 0 4px;
   color: var(--text);
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 .footer-legal {
   grid-column: 1 / -1;
   margin: 0;
-  font-size: 0.85rem;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+  font-size: 0.8rem;
 }
 
 @media (max-width: 1020px) {
@@ -1462,6 +1486,17 @@ code.inline {
 
   .footer {
     grid-template-columns: 1fr;
+  }
+
+  .footer-brand {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 16px;
+  }
+
+  .footer-brand p {
+    margin: 0;
   }
 
   .nav-dropdown .mega-menu {
@@ -1475,9 +1510,27 @@ code.inline {
 
 @media (max-width: 680px) {
   .card-grid.three,
-  .region-grid,
-  .footer-columns {
+  .region-grid {
     grid-template-columns: 1fr;
+  }
+
+  .footer {
+    width: calc(100% - 32px);
+    gap: 18px;
+    padding-top: 22px;
+  }
+
+  .footer-columns {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 18px 16px;
+  }
+
+  .footer-columns a {
+    padding-block: 4px;
+  }
+
+  .footer-legal {
+    text-align: center;
   }
 
   .page-hero {
@@ -1490,25 +1543,114 @@ code.inline {
   }
 }
 
-.user-pill {
-  display: flex;
+.user-menu {
+  position: relative;
+}
+
+.user-menu-button {
+  display: inline-flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
+  min-height: 42px;
+  padding: 4px 12px 4px 4px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--ink-soft);
+  background: var(--panel);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.user-menu-button:hover,
+.user-menu-button[aria-expanded="true"] {
+  border-color: var(--brand);
+}
+
+.user-menu-caret {
+  font-size: 0.75rem;
+  color: var(--muted);
 }
 
 .user-avatar {
-  width: 28px;
-  height: 28px;
-  border: 1px solid var(--line);
+  position: relative;
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  overflow: hidden;
   border-radius: 999px;
+  color: #03131d;
+  background: linear-gradient(135deg, var(--brand), var(--accent));
+  font-weight: 800;
+  line-height: 1;
+}
+
+.user-avatar img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
   object-fit: cover;
 }
 
-.user-pill button.link-button {
+.user-menu-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 30;
+  display: grid;
+  width: min(260px, calc(100vw - 32px));
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface-solid);
+  box-shadow: var(--shadow);
+}
+
+.user-menu-who {
+  display: grid;
+  gap: 2px;
+  margin-bottom: 6px;
+  padding: 6px 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.user-menu-who b,
+.user-menu-who small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-menu-who small {
+  color: var(--muted);
+}
+
+.user-menu-panel a,
+.user-menu-signout {
+  display: block;
+  width: 100%;
+  padding: 10px;
   border: 0;
-  background: transparent;
+  border-radius: 8px;
+  color: var(--text);
+  background: none;
   font: inherit;
+  text-align: left;
   cursor: pointer;
+}
+
+.user-menu-panel a:hover,
+.user-menu-signout:hover {
+  background: var(--hover);
+}
+
+.user-menu-signout {
+  margin-top: 6px;
+  color: var(--danger-ink);
+  font-weight: 650;
 }
 
 /* Mobile header: brand and menu toggle stay on the top row; the menu opens as a panel below. */
@@ -1568,11 +1710,27 @@ code.inline {
   }
 
   .site-header.nav-open .header-actions .link-button,
-  .site-header.nav-open .header-actions .user-pill {
+  .site-header.nav-open .header-actions .user-menu {
     grid-column: 1 / -1;
     justify-content: flex-start;
     min-height: 0;
     padding: 0 4px 6px;
+  }
+
+  /* In the open mobile menu the account panel sits inline instead of floating. */
+  .site-header.nav-open .user-menu-button {
+    width: 100%;
+  }
+
+  .site-header.nav-open .user-menu-caret {
+    margin-left: auto;
+  }
+
+  .site-header.nav-open .user-menu-panel {
+    position: static;
+    width: 100%;
+    margin-top: 8px;
+    box-shadow: none;
   }
 }
 
