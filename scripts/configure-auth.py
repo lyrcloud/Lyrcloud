@@ -108,8 +108,11 @@ def configure_pool(apply, ses_ready):
             'EmailMessage': VERIFY_MESSAGE,
             'SmsMessage': SMS_MESSAGE,
         },
-        'AccountRecoverySetting': {'RecoveryMechanisms': [{'Priority': 1, 'Name': 'verified_email'}]},
     }
+    # Keep existing recovery options; only make sure a verified email can recover the account.
+    recovery = pool.get('AccountRecoverySetting', {}).get('RecoveryMechanisms', [])
+    if not any(item['Name'] == 'verified_email' for item in recovery):
+        wanted['AccountRecoverySetting'] = {'RecoveryMechanisms': [{'Priority': 1, 'Name': 'verified_email'}]}
     # The older top-level copies of the message override the template if left in place.
     for legacy in ('EmailVerificationMessage', 'EmailVerificationSubject', 'SmsVerificationMessage'):
         params.pop(legacy, None)
@@ -122,9 +125,10 @@ def configure_pool(apply, ses_ready):
     else:
         print('  (Cognito keeps its own email sender until the SES identity is verified)')
 
+    current = {**pool, 'AdminCreateUserConfig': admin_create}
     changed = False
     for key, value in wanted.items():
-        changed |= show_change(key, pool.get(key), value)
+        changed |= show_change(key, current.get(key), value)
         params[key] = value
     if changed and apply:
         idp.update_user_pool(**params)
@@ -149,7 +153,7 @@ def configure_pool(apply, ses_ready):
 def configure_sms(apply):
     print('\nSNS text messages (mobile verification codes)')
     sns = client('sns')
-    attrs = sns.get_sms_attributes(attributeNames=['DefaultSMSType', 'MonthlySpendLimit']).get('attributes', {})
+    attrs = sns.get_sms_attributes(attributes=['DefaultSMSType', 'MonthlySpendLimit']).get('attributes', {})
     if show_change('DefaultSMSType', attrs.get('DefaultSMSType'), 'Transactional') and apply:
         sns.set_sms_attributes(attributes={'DefaultSMSType': 'Transactional'})
         print('  updated')
@@ -161,27 +165,47 @@ def configure_sms(apply):
         print(f'  SMS sandbox status unavailable: {err}')
 
 
-def configure_github(apply, bridge):
+BRIDGE_SECRET = 'lyrcloud/github-bridge'
+
+
+def configure_github(apply, bridge, add_client_secret=False):
+    """Points GitHubBridge at the bridge. Cognito authenticates to the bridge with bridgeClientId and
+    bridgeClientSecret from the bridge's secret; the secret gets a bridgeClientSecret if it lacks one."""
     print(f'\nIdentity provider {GITHUB_PROVIDER} -> {bridge}')
+    secrets = client('secretsmanager')
+    secret = json.loads(secrets.get_secret_value(SecretId=BRIDGE_SECRET)['SecretString'])
+    if not secret.get('bridgeClientSecret'):
+        print(f'  {"+" if add_client_secret else "-"} {BRIDGE_SECRET}: no bridgeClientSecret'
+              + ('' if add_client_secret else ' (the bridge accepts any client secret; --add-bridge-client-secret adds one)'))
+        if apply and add_client_secret:
+            import secrets as random_secrets
+            secret['bridgeClientSecret'] = random_secrets.token_urlsafe(32)
+            secrets.put_secret_value(SecretId=BRIDGE_SECRET, SecretString=json.dumps(secret))
+            print('  updated (the bridge picks it up on its next cold start)')
+
     idp = client('cognito-idp')
     provider = idp.describe_identity_provider(UserPoolId=USER_POOL_ID, ProviderName=GITHUB_PROVIDER)['IdentityProvider']
     details = dict(provider['ProviderDetails'])
     wanted = {
+        'client_id': secret['bridgeClientId'],
         'oidc_issuer': bridge,
         'authorize_url': f'{bridge}/authorize',
         'token_url': f'{bridge}/token',
         'attributes_url': f'{bridge}/userinfo',
-        'jwks_uri': f'{bridge}/jwks.json',
+        'jwks_uri': f'{bridge}/.well-known/jwks.json',
         'attributes_request_method': 'GET',
         'authorize_scopes': 'openid email profile',
     }
     changed = False
     for key, value in wanted.items():
         changed |= show_change(key, details.get(key), value)
+    if secret.get('bridgeClientSecret') and details.get('client_secret') != secret['bridgeClientSecret']:
+        print('  ~ client_secret: set to the bridge secret\'s bridgeClientSecret')
+        wanted['client_secret'] = secret['bridgeClientSecret']
+        changed = True
     details.update(wanted)
-    # Cognito adds these itself and rejects them on update.
-    for key in ('attributes_url_add_attributes',):
-        details.pop(key, None)
+    # Cognito adds this itself and rejects it on update.
+    details.pop('attributes_url_add_attributes', None)
     mapping = {**provider.get('AttributeMapping', {})}
     for attribute, claim in {'email': 'email', 'email_verified': 'email_verified', 'name': 'name', 'picture': 'picture', 'username': 'sub'}.items():
         mapping.setdefault(attribute, claim)
@@ -214,7 +238,8 @@ def account_id():
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--apply', action='store_true', help='make the changes (default: report only)')
-    parser.add_argument('--github-bridge', help='the GitHub bridge URL (BridgeUrl output of the lyrcloud-github-oidc stack)')
+    parser.add_argument('--add-bridge-client-secret', action='store_true', help='also make Cognito and the bridge share a client secret')
+    parser.add_argument('--github-bridge', help='the GitHub bridge URL (BridgeApiBaseUrl output of the lyrcloud-github-bridge stack)')
     args = parser.parse_args()
     global USER_POOL_ID
     USER_POOL_ID = find_user_pool()
@@ -223,7 +248,7 @@ def main():
     configure_pool(args.apply, ses_ready)
     configure_sms(args.apply)
     if args.github_bridge:
-        configure_github(args.apply, args.github_bridge.rstrip('/'))
+        configure_github(args.apply, args.github_bridge.rstrip('/'), args.add_bridge_client_secret)
 
 
 if __name__ == '__main__':
