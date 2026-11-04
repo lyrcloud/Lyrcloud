@@ -1419,39 +1419,57 @@ code.inline {
 
 .footer {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) 2fr;
-  gap: 40px;
-  margin-top: 40px;
-  padding: 56px 0 50px;
+  grid-template-columns: minmax(200px, 1fr) minmax(0, 2fr);
+  gap: 20px 40px;
+  margin-top: 32px;
+  padding: 28px 0 calc(20px + env(safe-area-inset-bottom, 0px));
   border-top: 1px solid var(--line);
   color: var(--muted);
+  font-size: 0.875rem;
 }
 
 .footer .brand {
   color: var(--text);
 }
 
+.footer-brand p {
+  max-width: 32ch;
+  margin: 8px 0 0;
+  line-height: 1.5;
+}
+
 .footer-columns {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 24px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 20px 24px;
 }
 
 .footer-columns div {
   display: grid;
   align-content: start;
-  gap: 10px;
+  gap: 6px;
+  min-width: 0;
+}
+
+.footer-columns a {
+  padding-block: 2px;
+  overflow-wrap: anywhere;
 }
 
 .footer h4 {
-  margin: 0 0 6px;
+  margin: 0 0 4px;
   color: var(--text);
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 .footer-legal {
   grid-column: 1 / -1;
   margin: 0;
-  font-size: 0.85rem;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+  font-size: 0.8rem;
 }
 
 @media (max-width: 1020px) {
@@ -1462,6 +1480,17 @@ code.inline {
 
   .footer {
     grid-template-columns: 1fr;
+  }
+
+  .footer-brand {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 16px;
+  }
+
+  .footer-brand p {
+    margin: 0;
   }
 
   .nav-dropdown .mega-menu {
@@ -1475,9 +1504,27 @@ code.inline {
 
 @media (max-width: 680px) {
   .card-grid.three,
-  .region-grid,
-  .footer-columns {
+  .region-grid {
     grid-template-columns: 1fr;
+  }
+
+  .footer {
+    width: calc(100% - 32px);
+    gap: 18px;
+    padding-top: 22px;
+  }
+
+  .footer-columns {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 18px 16px;
+  }
+
+  .footer-columns a {
+    padding-block: 4px;
+  }
+
+  .footer-legal {
+    text-align: center;
   }
 
   .page-hero {
