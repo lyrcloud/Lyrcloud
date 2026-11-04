@@ -1,5 +1,16 @@
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { logo } from '../src/logo.js';
 import { products } from './products.mjs';
+
+// Browsers cache favicons in their own long-lived store keyed by URL, so a redesigned icon at
+// the same /favicon.svg can keep showing the old one for weeks. A content hash in the query
+// string gives every icon change a fresh URL.
+const iconFiles = ['favicon.ico', 'favicon.svg', 'apple-touch-icon.png', 'site.webmanifest'];
+const iconVersion = createHash('sha256')
+  .update(iconFiles.map((file) => readFileSync(new URL(`../public/${file}`, import.meta.url))).join(''))
+  .digest('hex')
+  .slice(0, 8);
 
 export const escape = (value) =>
   String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
@@ -92,10 +103,10 @@ export function renderPage({ route, title, description, body, bodyClass = '', ch
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="${escape(description)}" />
     <title>${escape(fullTitle)}</title>
-    <link rel="icon" href="/favicon.ico" sizes="48x48" />
-    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <link rel="manifest" href="/site.webmanifest" />
+    <link rel="icon" href="/favicon.ico?v=${iconVersion}" sizes="32x32" />
+    <link rel="icon" href="/favicon.svg?v=${iconVersion}" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=${iconVersion}" />
+    <link rel="manifest" href="/site.webmanifest?v=${iconVersion}" />
     <meta name="theme-color" content="#0ea5e9" />
     ${styleTags}
   </head>
