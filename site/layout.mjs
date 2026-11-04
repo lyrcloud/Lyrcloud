@@ -85,7 +85,7 @@ function footer() {
           ['/contact/', 'Contact sales'],
         ])}
       </div>
-      <p class="footer-legal">© ${new Date().getFullYear()} Lyrcloud. Built for secure, high-performance cloud experiences.</p>
+      <p class="footer-legal">© ${new Date().getFullYear()} Lyrcloud. All rights reserved.</p>
     </footer>`;
 }
 
