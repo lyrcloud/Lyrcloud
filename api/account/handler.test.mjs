@@ -72,6 +72,23 @@ test('anyone can change their own plan, and it sticks', async () => {
   assert.equal((await call(USER, 'PUT', '/me', { plan: 'gold' })).status, 400);
 });
 
+test('anyone can set their own name and photo, and they survive the next sign-in', async () => {
+  const photo = `data:image/jpeg;base64,${'A'.repeat(400)}`;
+  let res = await call(USER, 'PUT', '/me', { name: '  Ada Lovelace ', avatar: photo });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.name, 'Ada Lovelace');
+  assert.equal(res.body.avatar, photo);
+  assert.equal(res.body.avatarSource, 'upload');
+  res = await call(USER, 'GET', '/me');
+  assert.equal(res.body.name, 'Ada Lovelace');
+  assert.equal(res.body.avatar, photo);
+  assert.equal((await call(USER, 'PUT', '/me', { avatar: 'initials' })).body.avatar, null);
+  assert.equal((await call(USER, 'PUT', '/me', { avatar: null })).body.avatarSource, 'provider');
+  assert.equal((await call(USER, 'PUT', '/me', { avatar: 'https://evil.example/x.png' })).status, 400);
+  assert.equal((await call(USER, 'PUT', '/me', { name: '' })).status, 400);
+  assert.equal((await call(USER, 'PUT', '/me', { role: 'admin' })).status, 400);
+});
+
 test('the super admin manages every account except their own', async () => {
   let res = await call(SUPER, 'PUT', `/admin/users/${ADMIN.sub}`, { plan: 'enterprise', role: 'user' });
   assert.equal(res.status, 200);

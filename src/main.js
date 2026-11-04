@@ -1,4 +1,5 @@
 import { isLoggedIn, logout } from './auth.js';
+import { avatarHtml, cachedProfile } from './avatar.js';
 import { getSession } from './session.js';
 import './lyrbot.js';
 
@@ -39,24 +40,44 @@ if (revealTargets.length && 'IntersectionObserver' in window && !matchMedia('(pr
 const loginLink = document.getElementById('login-link');
 if (loginLink && isLoggedIn()) {
   const session = getSession();
-  const pill = document.createElement('div');
-  pill.className = 'user-pill';
-  if (session.picture) {
-    const avatar = document.createElement('img');
-    avatar.className = 'user-avatar';
-    avatar.src = session.picture;
-    avatar.alt = '';
-    pill.append(avatar);
-  }
-  const dashboard = document.createElement('a');
-  dashboard.className = 'link-button';
-  dashboard.href = '/dash/';
-  dashboard.textContent = 'Dashboard';
-  const logoutButton = document.createElement('button');
-  logoutButton.className = 'link-button';
-  logoutButton.type = 'button';
-  logoutButton.textContent = 'Log out';
-  logoutButton.addEventListener('click', logout);
-  pill.append(dashboard, logoutButton);
-  loginLink.replaceWith(pill);
+  // The dashboard caches the account's chosen name and photo; fall back to the sign-in claims.
+  const person = { ...session, ...(cachedProfile() || {}) };
+  if (!cachedProfile()) person.avatar = session.picture;
+  const menu = document.createElement('div');
+  menu.className = 'user-menu';
+  menu.innerHTML = `
+    <button class="user-menu-button" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="user-menu-panel">
+      ${avatarHtml(person, 'user-avatar')}<span class="user-menu-label">Account</span><span class="user-menu-caret" aria-hidden="true">▾</span>
+    </button>
+    <div class="user-menu-panel" id="user-menu-panel" hidden>
+      <div class="user-menu-who"><b></b><small></small></div>
+      <a href="/dash/">Dashboard</a>
+      <a href="/dash/#/settings">Profile and photo</a>
+      <button class="user-menu-signout" type="button">Sign out</button>
+    </div>`;
+  menu.querySelector('.user-menu-who b').textContent = person.name || 'Signed in';
+  menu.querySelector('.user-menu-who small').textContent = person.email || '';
+  const button = menu.querySelector('.user-menu-button');
+  const panel = menu.querySelector('.user-menu-panel');
+  const setOpen = (open) => {
+    panel.hidden = !open;
+    button.setAttribute('aria-expanded', String(open));
+  };
+  button.addEventListener('click', () => setOpen(panel.hidden));
+  document.addEventListener('click', (event) => {
+    if (!menu.contains(event.target)) setOpen(false);
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !panel.hidden) {
+      setOpen(false);
+      button.focus();
+    }
+  });
+  const signOut = menu.querySelector('.user-menu-signout');
+  signOut.addEventListener('click', () => {
+    signOut.disabled = true;
+    signOut.textContent = 'Signing out…';
+    logout();
+  });
+  loginLink.replaceWith(menu);
 }

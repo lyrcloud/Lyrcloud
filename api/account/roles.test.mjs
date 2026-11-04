@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { canManage, deleteUserError, planFor, publicProfile, roleChangeError, roleFor, userUpdateError } from './roles.mjs';
+import { avatarFor, canManage, deleteUserError, planFor, publicProfile, roleChangeError, roleFor, selfUpdateError, userUpdateError } from './roles.mjs';
 
 const SUPER = 'lyrclouds@gmail.com';
 
@@ -76,4 +76,17 @@ test('only the super admin deletes accounts, never their own', () => {
 test('a disabled flag is never reported for the super admin', () => {
   assert.equal(publicProfile({ userId: 'u1', provider: 'GoogleOIDC', email: SUPER, disabled: true }, SUPER).disabled, false);
   assert.equal(publicProfile({ userId: 'u2', disabled: true }, SUPER).disabled, true);
+});
+
+test('profile photos: uploads win, "initials" hides the photo, otherwise the provider photo', () => {
+  const upload = 'data:image/png;base64,iVBORw0KGgo=';
+  assert.equal(avatarFor({ picture: 'https://g/p.jpg', avatar: upload }), upload);
+  assert.equal(avatarFor({ picture: 'https://g/p.jpg', avatar: 'initials' }), null);
+  assert.equal(avatarFor({ picture: 'https://g/p.jpg' }), 'https://g/p.jpg');
+  assert.equal(avatarFor({ picture: 'https://g/p.jpg', avatar: 'javascript:alert(1)' }), 'https://g/p.jpg');
+  assert.equal(selfUpdateError({ avatar: upload }), null);
+  assert.equal(selfUpdateError({ avatar: 'data:image/svg+xml;base64,PHN2Zz4=' })?.[0], 400);
+  assert.equal(selfUpdateError({ avatar: `data:image/jpeg;base64,${'A'.repeat(70_000)}` })?.[0], 400);
+  assert.equal(selfUpdateError({ plan: 'scale', name: 'Ada' }), null);
+  assert.equal(selfUpdateError({ role: 'admin' })?.[0], 400);
 });

@@ -63,6 +63,41 @@ export function userUpdateError(actorRole, targetRole, changes) {
   return null;
 }
 
+// Profile photos: a small image the browser has already resized, stored on the profile row as a
+// data URL. "initials" means the user chose no photo; unset means use the sign-in provider's photo.
+export const AVATAR_MAX_LENGTH = 60_000;
+const AVATAR_RE = /^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
+const SELF_FIELDS = ['plan', 'name', 'avatar'];
+
+// Returns [statusCode, message] when the signed-in user may not make `changes` to their own profile.
+export function selfUpdateError(changes) {
+  const keys = Object.keys(changes || {});
+  if (!keys.length) return [400, 'Nothing to change.'];
+  const unknown = keys.find((key) => !SELF_FIELDS.includes(key));
+  if (unknown) return [400, `Unknown field "${unknown}".`];
+  if ('plan' in changes && !PLANS.includes(changes.plan)) return [400, `Plan must be one of ${PLANS.join(', ')}.`];
+  if ('name' in changes) {
+    const name = typeof changes.name === 'string' ? changes.name.trim() : '';
+    if (!name || name.length > 120) return [400, 'Name must be 1 to 120 characters.'];
+  }
+  if ('avatar' in changes) {
+    const { avatar } = changes;
+    const ok = avatar === null || avatar === 'initials' || (typeof avatar === 'string' && avatar.length <= AVATAR_MAX_LENGTH && AVATAR_RE.test(avatar));
+    if (!ok) return [400, 'Photo must be a JPEG, PNG or WebP image under 45 KB.'];
+  }
+  return null;
+}
+
+// The picture to show for an account: an uploaded photo, none (initials), or the provider's photo.
+export function avatarFor(profile) {
+  if (profile?.avatar === 'initials') return null;
+  if (typeof profile?.avatar === 'string' && AVATAR_RE.test(profile.avatar)) return profile.avatar;
+  return profile?.picture ?? null;
+}
+
+const avatarSourceFor = (profile) =>
+  profile?.avatar === 'initials' ? 'initials' : typeof profile?.avatar === 'string' && AVATAR_RE.test(profile.avatar) ? 'upload' : 'provider';
+
 // Deleting an account: super admin only, never the super admin.
 export function deleteUserError(actorRole, targetRole) {
   if (actorRole !== 'superadmin') return [403, 'Only the super admin can delete accounts.'];
@@ -86,6 +121,8 @@ export function publicProfile(profile, superAdminEmail) {
     email: profile.email ?? null,
     name: profile.name ?? null,
     picture: profile.picture ?? null,
+    avatar: avatarFor(profile),
+    avatarSource: avatarSourceFor(profile),
     provider: normalizeProvider(profile.provider),
     role: roleFor(profile, superAdminEmail),
     plan: planFor(profile),
