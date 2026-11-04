@@ -1,6 +1,6 @@
 // Lyrcloud account API.
 //   GET /me                               the signed-in profile (role, plan) and the site announcement
-//   PUT /me                               { plan } change your own plan (billing isn't connected yet)
+//   PUT /me                               { plan?, name?, avatar? } edit your own profile (billing isn't connected yet)
 //   GET /admin/users                      every account (admins and the super admin)
 //   PUT /admin/users/{userId}             { role?, plan?, disabled?, name? } (rules in roles.mjs)
 //   DELETE /admin/users/{userId}          delete the account from Lyrcloud and Cognito (super admin)
@@ -42,6 +42,7 @@ import {
   PLANS,
   publicProfile,
   roleFor,
+  selfUpdateError,
   userUpdateError,
 } from './roles.mjs';
 
@@ -327,13 +328,35 @@ export const handler = async (event) => {
     }
     if (method === 'PUT') {
       const body = parseBody(event);
-      if (!body || !PLANS.includes(body.plan)) return errorResponse(400, `Plan must be one of ${PLANS.join(', ')}.`);
+      if (!body) return errorResponse(400, 'Invalid JSON body.');
+      const refused = selfUpdateError(body);
+      if (refused) return errorResponse(...refused);
+      const now = new Date().toISOString();
+      const sets = ['profileUpdatedAt = :now'];
+      const names = {};
+      const values = { ':now': now };
+      if ('plan' in body) {
+        sets.push('#plan = :plan', 'planUpdatedAt = :now');
+        names['#plan'] = 'plan';
+        values[':plan'] = body.plan;
+      }
+      if ('name' in body) {
+        // A name the user picked sticks over the identity provider's on later sign-ins.
+        sets.push('#name = :name', 'nameLocked = :locked');
+        names['#name'] = 'name';
+        values[':name'] = body.name.trim();
+        values[':locked'] = true;
+      }
+      if ('avatar' in body) {
+        sets.push('avatar = :avatar');
+        values[':avatar'] = body.avatar;
+      }
       const { Attributes } = await ddb.send(new UpdateCommand({
         TableName: TABLE_NAME,
         Key: { userId: caller.userId },
-        UpdateExpression: 'SET #plan = :plan, planUpdatedAt = :now',
-        ExpressionAttributeNames: { '#plan': 'plan' },
-        ExpressionAttributeValues: { ':plan': body.plan, ':now': new Date().toISOString() },
+        UpdateExpression: `SET ${sets.join(', ')}`,
+        ...(Object.keys(names).length ? { ExpressionAttributeNames: names } : {}),
+        ExpressionAttributeValues: values,
         ReturnValues: 'ALL_NEW',
       }));
       return jsonResponse(200, publicProfile(Attributes, SUPER_ADMIN_EMAIL));

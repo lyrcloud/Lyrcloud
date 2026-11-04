@@ -1537,25 +1537,114 @@ code.inline {
   }
 }
 
-.user-pill {
-  display: flex;
+.user-menu {
+  position: relative;
+}
+
+.user-menu-button {
+  display: inline-flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
+  min-height: 42px;
+  padding: 4px 12px 4px 4px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--ink-soft);
+  background: var(--panel);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.user-menu-button:hover,
+.user-menu-button[aria-expanded="true"] {
+  border-color: var(--brand);
+}
+
+.user-menu-caret {
+  font-size: 0.75rem;
+  color: var(--muted);
 }
 
 .user-avatar {
-  width: 28px;
-  height: 28px;
-  border: 1px solid var(--line);
+  position: relative;
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  overflow: hidden;
   border-radius: 999px;
+  color: #03131d;
+  background: linear-gradient(135deg, var(--brand), var(--accent));
+  font-weight: 800;
+  line-height: 1;
+}
+
+.user-avatar img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
   object-fit: cover;
 }
 
-.user-pill button.link-button {
+.user-menu-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 30;
+  display: grid;
+  width: min(260px, calc(100vw - 32px));
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface-solid);
+  box-shadow: var(--shadow);
+}
+
+.user-menu-who {
+  display: grid;
+  gap: 2px;
+  margin-bottom: 6px;
+  padding: 6px 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.user-menu-who b,
+.user-menu-who small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-menu-who small {
+  color: var(--muted);
+}
+
+.user-menu-panel a,
+.user-menu-signout {
+  display: block;
+  width: 100%;
+  padding: 10px;
   border: 0;
-  background: transparent;
+  border-radius: 8px;
+  color: var(--text);
+  background: none;
   font: inherit;
+  text-align: left;
   cursor: pointer;
+}
+
+.user-menu-panel a:hover,
+.user-menu-signout:hover {
+  background: var(--hover);
+}
+
+.user-menu-signout {
+  margin-top: 6px;
+  color: var(--danger-ink);
+  font-weight: 650;
 }
 
 /* Mobile header: brand and menu toggle stay on the top row; the menu opens as a panel below. */
@@ -1615,11 +1704,27 @@ code.inline {
   }
 
   .site-header.nav-open .header-actions .link-button,
-  .site-header.nav-open .header-actions .user-pill {
+  .site-header.nav-open .header-actions .user-menu {
     grid-column: 1 / -1;
     justify-content: flex-start;
     min-height: 0;
     padding: 0 4px 6px;
+  }
+
+  /* In the open mobile menu the account panel sits inline instead of floating. */
+  .site-header.nav-open .user-menu-button {
+    width: 100%;
+  }
+
+  .site-header.nav-open .user-menu-caret {
+    margin-left: auto;
+  }
+
+  .site-header.nav-open .user-menu-panel {
+    position: static;
+    width: 100%;
+    margin-top: 8px;
+    box-shadow: none;
   }
 }
 

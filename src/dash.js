@@ -3,6 +3,7 @@
 // a server yet: they live in localStorage, and analytics are generated sample data (clearly
 // labeled in the UI). DNS lookups and nameserver checks are real, using public DNS-over-HTTPS.
 import { authFetch, redirectToLogin } from './auth.js';
+import { avatarHtml, cacheProfile, imageFileToAvatar } from './avatar.js';
 import { logo } from './logo.js';
 import { endSession, getSession } from './session.js';
 
@@ -342,9 +343,42 @@ function topbar(route) {
         <span class="preview-pill" title="No backend yet: data is stored in this browser">Preview</span>
         ${isStaff(profile?.role) ? `<a class="role-pill" href="#/admin" title="Open the admin console">${ROLE_LABELS[profile.role]} · Admin</a>` : ''}
         <a class="plan-pill" href="#/plans" title="Change plan">${esc(planName(state.plan))} plan</a>
-        <span class="avatar" title="${esc(session.email)}">${esc(session.email[0].toUpperCase())}</span>
+        ${accountMenu()}
       </div>
     </header>`;
+}
+
+// Who is signed in: the API profile once loaded, the ID token's claims until then.
+const me = () => profile || { name: session.name, email: session.email, picture: session.picture };
+
+function accountMenu() {
+  const person = me();
+  const staff = isStaff(profile?.role);
+  return `
+    <div class="account-menu">
+      <button class="account-button" type="button" data-action="account-menu" aria-haspopup="true" aria-expanded="false" aria-controls="account-panel" aria-label="Account menu">
+        ${avatarHtml(person)}
+      </button>
+      <div class="account-panel" id="account-panel" hidden>
+        <div class="account-who">
+          ${avatarHtml(person, 'avatar large')}
+          <div><b>${esc(person.name || 'Your account')}</b><small>${esc(person.email || '')}</small>${profile ? `<small>${ROLE_LABELS[profile.role] || ''} · ${esc(planName(state.plan))} plan</small>` : ''}</div>
+        </div>
+        <a href="#/settings">Profile and photo</a>
+        <a href="#/plans">Plans</a>
+        ${staff ? '<a href="#/admin">Admin console</a>' : ''}
+        <a href="/">Lyrcloud home</a>
+        <button class="account-signout" type="button" data-action="sign-out">Sign out</button>
+      </div>
+    </div>`;
+}
+
+function setAccountMenu(open) {
+  const button = app.querySelector('.account-button');
+  const panel = document.getElementById('account-panel');
+  if (!button || !panel) return;
+  button.setAttribute('aria-expanded', String(open));
+  panel.hidden = !open;
 }
 
 const pageHead = (title, subtitle = '', actions = '') => `
@@ -364,6 +398,53 @@ const settingRow = (title, description, control) => `
     <div><h3>${title}</h3><p>${description}</p></div>
     <div class="setting-control">${control}</div>
   </div>`;
+
+function profilePanel() {
+  const person = me();
+  const source = profile?.avatarSource;
+  const busy = profileSaving ? ' disabled' : '';
+  const photoButtons = !profile
+    ? '<p class="muted">Loading your profile…</p>'
+    : `
+        <label class="btn primary file-button${profileSaving ? ' is-busy' : ''}">
+          ${source === 'upload' ? 'Change photo' : 'Upload photo'}
+          <input type="file" accept="image/*" data-action="avatar-file"${busy} />
+        </label>
+        ${profile.picture && source !== 'provider' ? `<button class="btn" data-action="avatar-provider"${busy}>Use ${profile.provider === 'GitHubBridge' ? 'GitHub' : 'Google'} photo</button>` : ''}
+        ${source !== 'initials' && (source === 'upload' || profile.picture) ? `<button class="btn" data-action="avatar-initials"${busy}>Remove photo</button>` : ''}`;
+  return `
+    <section class="panel profile-panel">
+      <div class="profile-photo">
+        ${avatarHtml(person, 'avatar xl')}
+        <div>
+          <h2>Profile photo</h2>
+          <p class="muted">Shown in the dashboard and the site header. Square photos work best.</p>
+          <div class="row">${photoButtons}</div>
+        </div>
+      </div>
+      <form class="profile-name" data-form="profile-name">
+        <label class="field">Display name
+          <input name="name" maxlength="120" autocomplete="name" required value="${esc(person.name || '')}" placeholder="Your name"${profile ? '' : ' disabled'} />
+        </label>
+        <button class="btn" type="submit"${profile && !profileSaving ? '' : ' disabled'}>Save name</button>
+      </form>
+    </section>`;
+}
+
+let profileSaving = false;
+async function saveProfile(changes, message) {
+  profileSaving = true;
+  render();
+  try {
+    profile = { ...profile, ...(await api('/me', { method: 'PUT', body: JSON.stringify(changes) })) };
+    cacheProfile(profile);
+    toast(message);
+  } catch (error) {
+    toast(error.message);
+  }
+  profileSaving = false;
+  render();
+}
 
 // ------------------------------------------------------------------ views
 
@@ -516,6 +597,7 @@ const views = {
   settings() {
     return `
       ${pageHead('Account settings')}
+      ${profilePanel()}
       <section class="panel">
         ${settingRow('Email', 'The address you sign in with.', `<span class="mono">${esc(session.email)}</span>`)}
         ${settingRow('Signed in with', 'Your identity provider.', '<span id="profile-provider" class="muted">Loading…</span>')}
@@ -954,6 +1036,7 @@ async function loadProfile() {
     }
     if (!response.ok) throw new Error(`me failed: ${response.status}`);
     profile = await response.json();
+    cacheProfile(profile);
     // The account's plan lives on the server; this browser's copy follows it.
     if (profile.plan && profile.plan !== state.plan) {
       state.plan = profile.plan;
@@ -1226,7 +1309,14 @@ const clickActions = {
       adminUsers.list = adminUsers.list.filter((item) => item.userId !== user.userId);
     }, `${userLabel(user)} was deleted`);
   },
-  'sign-out': () => endSession(),
+  'account-menu': (target) => setAccountMenu(target.getAttribute('aria-expanded') !== 'true'),
+  'avatar-provider': () => saveProfile({ avatar: null }, 'Using your sign-in photo'),
+  'avatar-initials': () => saveProfile({ avatar: 'initials' }, 'Photo removed'),
+  'sign-out': (target) => {
+    target.disabled = true;
+    target.textContent = 'Signing out…';
+    endSession();
+  },
   reset: (target) => {
     if (!confirmed(target, 'Delete all websites and functions stored in this browser?')) return;
     state.zones = [];
@@ -1237,6 +1327,16 @@ const clickActions = {
 };
 
 const changeActions = {
+  'avatar-file': async (target) => {
+    const [file] = target.files;
+    target.value = '';
+    if (!file) return;
+    try {
+      await saveProfile({ avatar: await imageFileToAvatar(file) }, 'Profile photo updated');
+    } catch (error) {
+      toast(error.message);
+    }
+  },
   'pick-zone': (target) => go(target.value ? `#/zones/${encodeURIComponent(target.value)}/overview` : '#/'),
   'under-attack': (target) => updateZone((zone) => { zone.security.underAttack = target.checked; }, `Under Attack mode ${target.checked ? 'on' : 'off'}`),
   'dev-mode': (target) => updateZone((zone) => { zone.caching.devMode = target.checked; }, `Development mode ${target.checked ? 'on' : 'off'}`),
@@ -1279,6 +1379,12 @@ const RECORD_VALIDATORS = {
 };
 
 const formActions = {
+  'profile-name': (form, data) => {
+    const name = String(data.get('name') || '').trim();
+    if (!name) return toast('Enter a name.');
+    if (name === profile?.name) return toast('That’s already your name.');
+    saveProfile({ name }, 'Name saved');
+  },
   'admin-edit-user': async (form, data) => {
     const user = findAdminUser(form.dataset.id);
     const button = form.querySelector('[type="submit"]');
@@ -1371,6 +1477,8 @@ const formActions = {
 };
 
 app.addEventListener('click', (event) => {
+  // Any click outside the account menu closes it.
+  if (!event.target.closest('.account-menu')) setAccountMenu(false);
   const target = event.target.closest('[data-action]');
   if (!target || target.matches('select, input')) return;
   clickActions[target.dataset.action]?.(target);
@@ -1392,6 +1500,12 @@ app.addEventListener('submit', (event) => {
   if (!form) return;
   event.preventDefault();
   formActions[form.dataset.form]?.(form, new FormData(form));
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape' || document.getElementById('account-panel')?.hidden !== false) return;
+  setAccountMenu(false);
+  app.querySelector('.account-button')?.focus();
 });
 
 // Tab inserts two spaces in the code editor instead of moving focus.
