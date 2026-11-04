@@ -326,7 +326,7 @@ function topbar(route) {
       ${state.zones.length ? `<label class="zone-picker"><span class="visually-hidden">Website</span><select data-action="pick-zone"><option value="">All websites</option>${options}</select></label>` : '<span></span>'}
       <div class="topbar-right">
         <span class="preview-pill" title="No backend yet: data is stored in this browser">Preview</span>
-        ${isStaff(profile?.role) ? `<span class="role-pill">${ROLE_LABELS[profile.role]}</span>` : ''}
+        ${isStaff(profile?.role) ? `<a class="role-pill" href="#/users" title="Manage users">${ROLE_LABELS[profile.role]} · Users</a>` : ''}
         <span class="plan-pill">${esc(state.plan)} plan</span>
         <span class="avatar" title="${esc(session.email)}">${esc(session.email[0].toUpperCase())}</span>
       </div>
@@ -384,6 +384,11 @@ const views = {
                 <button class="btn" data-action="add-sample">Explore with a sample site</button>
               </div>
             </section>`
+      }
+      ${
+        isStaff(profile?.role)
+          ? `<a class="panel quick staff-quick" href="#/users"><span aria-hidden="true">${icons.users}</span><h3>Users</h3><p>${profile.role === 'superadmin' ? 'See every account and grant or remove admin access' : 'See every Lyrcloud account'}</p></a>`
+          : ''
       }
       <div class="grid-3">
         <a class="panel quick" href="#/workers"><span aria-hidden="true">{}</span><h3>Edge Functions</h3><p>${state.workers.length} created · run code in 180+ cities</p></a>

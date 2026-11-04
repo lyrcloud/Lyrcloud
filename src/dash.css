@@ -173,6 +173,14 @@
   color: var(--brand-strong);
 }
 
+a.role-pill:hover {
+  text-decoration: underline;
+}
+
+.staff-quick {
+  display: block;
+}
+
 .role-badge.role-admin {
   background: var(--badge-bg);
   color: var(--badge-ink);
