@@ -1,3 +1,9 @@
+/* The hidden attribute always wins. Without this, any element whose class sets display
+   (such as the account menu panels, display: grid) stays visible after el.hidden = true. */
+[hidden] {
+  display: none !important;
+}
+
 /* Self-hosted Latin subsets (SIL Open Font License): Inter for text, Plus Jakarta Sans for
    headings, matching the wordmark in src/logo.js. */
 @font-face {
