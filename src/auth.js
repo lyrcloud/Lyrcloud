@@ -14,6 +14,9 @@ import { refresh, revoke, signIn } from './cognito.js';
 export const COGNITO_DOMAIN = 'lyrcloud-auth.auth.us-east-1.amazoncognito.com';
 export const CLIENT_ID = '5h78n6dkjbhq92423lscfllj6t';
 export const ACCOUNT_API_BASE = 'https://wcqz7ix4t7.execute-api.us-east-1.amazonaws.com';
+// Lyrcloud Projects (import, build and host git repositories); the lyrcloud-projects stack's API.
+export const PROJECTS_API_BASE = 'https://projects-api.invalid';
+export const SITES_DOMAIN = 'lyrcloud.app';
 
 const REDIRECT_URI = `${location.origin}/callback.html`;
 const LOGOUT_URI = `${location.origin}/index.html`;
