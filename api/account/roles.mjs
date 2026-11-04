@@ -9,9 +9,19 @@
 export const SUPER_ADMIN_PROVIDER = 'GoogleOIDC';
 export const ASSIGNABLE_ROLES = ['admin', 'user'];
 
+const KNOWN_PROVIDERS = ['GoogleOIDC', 'GitHubBridge'];
+
+// Cognito builds federated usernames as "<provider>_<id>" but may lowercase the provider part
+// ("googleoidc_123…"), so an exact match on "GoogleOIDC" never recognised the super admin.
+// Map any casing back to the provider's configured name.
+export function normalizeProvider(provider) {
+  const raw = String(provider || '');
+  return KNOWN_PROVIDERS.find((name) => name.toLowerCase() === raw.toLowerCase()) || raw || null;
+}
+
 export function roleFor(profile, superAdminEmail) {
   const email = String(profile?.email || '').toLowerCase();
-  if (profile?.provider === SUPER_ADMIN_PROVIDER && email && email === String(superAdminEmail).toLowerCase()) {
+  if (normalizeProvider(profile?.provider) === SUPER_ADMIN_PROVIDER && email && email === String(superAdminEmail).toLowerCase()) {
     return 'superadmin';
   }
   return profile?.role === 'admin' ? 'admin' : 'user';
@@ -35,7 +45,7 @@ export function publicProfile(profile, superAdminEmail) {
     email: profile.email ?? null,
     name: profile.name ?? null,
     picture: profile.picture ?? null,
-    provider: profile.provider ?? null,
+    provider: normalizeProvider(profile.provider),
     role: roleFor(profile, superAdminEmail),
     createdAt: profile.createdAt ?? null,
     lastLoginAt: profile.lastLoginAt ?? null,

@@ -10,6 +10,13 @@ test('super admin needs the configured email and a Google sign-in', () => {
   assert.equal(roleFor({ provider: 'GoogleOIDC', email: null }, SUPER), 'user');
 });
 
+test('provider names from Cognito match in any casing', () => {
+  assert.equal(roleFor({ provider: 'googleoidc', email: SUPER }, SUPER), 'superadmin');
+  assert.equal(roleFor({ provider: 'GOOGLEOIDC', email: SUPER }, SUPER), 'superadmin');
+  assert.equal(roleFor({ provider: 'githubbridge', email: SUPER }, SUPER), 'user');
+  assert.equal(publicProfile({ userId: 'u1', provider: 'googleoidc', email: SUPER }, SUPER).provider, 'GoogleOIDC');
+});
+
 test('stored roles: only "admin" is honoured, superadmin is never read from storage', () => {
   assert.equal(roleFor({ provider: 'GoogleOIDC', email: 'a@b.com', role: 'admin' }, SUPER), 'admin');
   assert.equal(roleFor({ provider: 'GoogleOIDC', email: 'a@b.com', role: 'superadmin' }, SUPER), 'user');

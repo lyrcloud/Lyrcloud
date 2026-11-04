@@ -21,7 +21,7 @@ import {
   LYRBOT_HOURLY_MESSAGE,
   lyrbotReply,
 } from './lyrbot.mjs';
-import { isStaff, publicProfile, roleChangeError, roleFor } from './roles.mjs';
+import { isStaff, normalizeProvider, publicProfile, roleChangeError, roleFor } from './roles.mjs';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const TABLE_NAME = process.env.TABLE_NAME;
@@ -86,7 +86,7 @@ async function upsertCaller(event) {
     email: email ?? existing?.email ?? null,
     name: name ?? existing?.name ?? null,
     picture: picture ?? existing?.picture ?? null,
-    provider,
+    provider: normalizeProvider(provider),
     createdAt: existing?.createdAt || now,
     lastLoginAt: now,
   };
