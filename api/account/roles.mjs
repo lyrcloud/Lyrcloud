@@ -6,10 +6,14 @@
 // email GitHub reports, so the email alone isn't proof of ownership. Google
 // only issues @gmail.com identities to the mailbox owner, so the super admin
 // must also have signed in through Google.
+import { maskPhone } from './phone.mjs';
+
 export const SUPER_ADMIN_PROVIDER = 'GoogleOIDC';
 export const ASSIGNABLE_ROLES = ['admin', 'user'];
 
-const KNOWN_PROVIDERS = ['GoogleOIDC', 'GitHubBridge'];
+// "Cognito" is an email-and-password account made on Lyrcloud's own sign-up form.
+export const EMAIL_PROVIDER = 'Cognito';
+const KNOWN_PROVIDERS = ['GoogleOIDC', 'GitHubBridge', EMAIL_PROVIDER];
 
 // Cognito builds federated usernames as "<provider>_<id>" but may lowercase the provider part
 // ("googleoidc_123…"), so an exact match on "GoogleOIDC" never recognised the super admin.
@@ -17,6 +21,14 @@ const KNOWN_PROVIDERS = ['GoogleOIDC', 'GitHubBridge'];
 export function normalizeProvider(provider) {
   const raw = String(provider || '');
   return KNOWN_PROVIDERS.find((name) => name.toLowerCase() === raw.toLowerCase()) || raw || null;
+}
+
+// The provider behind a Cognito username: federated ones are "<provider>_<id>"; anything else (the
+// email an account signed up with) is an email-and-password account.
+export function providerFromUsername(username) {
+  const prefix = String(username || '').split('_')[0];
+  const known = normalizeProvider(prefix);
+  return KNOWN_PROVIDERS.includes(known) && known !== EMAIL_PROVIDER ? known : EMAIL_PROVIDER;
 }
 
 export function roleFor(profile, superAdminEmail) {
@@ -67,7 +79,7 @@ export function userUpdateError(actorRole, targetRole, changes) {
 // data URL. "initials" means the user chose no photo; unset means use the sign-in provider's photo.
 export const AVATAR_MAX_LENGTH = 60_000;
 const AVATAR_RE = /^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
-const SELF_FIELDS = ['plan', 'name', 'avatar'];
+const SELF_FIELDS = ['plan', 'name', 'avatar', 'emailUpdates'];
 
 // Returns [statusCode, message] when the signed-in user may not make `changes` to their own profile.
 export function selfUpdateError(changes) {
@@ -85,6 +97,7 @@ export function selfUpdateError(changes) {
     const ok = avatar === null || avatar === 'initials' || (typeof avatar === 'string' && avatar.length <= AVATAR_MAX_LENGTH && AVATAR_RE.test(avatar));
     if (!ok) return [400, 'Photo must be a JPEG, PNG or WebP image under 45 KB.'];
   }
+  if ('emailUpdates' in changes && typeof changes.emailUpdates !== 'boolean') return [400, '"emailUpdates" must be true or false.'];
   return null;
 }
 
@@ -114,8 +127,9 @@ export function roleChangeError(actorRole, targetRole, newRole) {
   return null;
 }
 
-// The account shape returned to the browser.
-export function publicProfile(profile, superAdminEmail) {
+// The account shape returned to the browser. The full mobile number is only shown to its owner.
+export function publicProfile(profile, superAdminEmail, { self = false } = {}) {
+  const phone = profile.phoneVerified ? profile.phone ?? null : null;
   return {
     userId: profile.userId,
     email: profile.email ?? null,
@@ -129,5 +143,8 @@ export function publicProfile(profile, superAdminEmail) {
     disabled: profile.disabled === true && roleFor(profile, superAdminEmail) !== 'superadmin',
     createdAt: profile.createdAt ?? null,
     lastLoginAt: profile.lastLoginAt ?? null,
+    phoneVerified: Boolean(phone),
+    ...(self ? { phone, phonePending: profile.phonePending?.phone ?? null } : { phone: maskPhone(phone) }),
+    emailUpdates: profile.emailUpdates !== false,
   };
 }
