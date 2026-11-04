@@ -2,7 +2,7 @@
 // Sign-in is real (Cognito, see src/auth.js). Websites, DNS, and settings are not backed by
 // a server yet: they live in localStorage, and analytics are generated sample data (clearly
 // labeled in the UI). DNS lookups and nameserver checks are real, using public DNS-over-HTTPS.
-import { authFetch, redirectToLogin } from './auth.js';
+import { authFetch, PROJECTS_API_BASE, redirectToLogin, SITES_DOMAIN } from './auth.js';
 import { avatarHtml, cacheProfile, imageFileToAvatar } from './avatar.js';
 import { logo } from './logo.js';
 import { endSession, getSession } from './session.js';
@@ -48,6 +48,7 @@ const formatBytes = (bytes) => {
   }
   return `${bytes.toFixed(bytes < 10 ? 1 : 0)} ${units[index]}`;
 };
+const PROVIDER_LABELS = { GoogleOIDC: 'Google', GitHubBridge: 'GitHub', Cognito: 'Email and password' };
 const formatDate = (iso) => new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 
 let toastTimer;
@@ -276,7 +277,7 @@ function bindCharts() {
 // ------------------------------------------------------------------ shell
 
 const icons = {
-  home: '⌂', sites: '◎', workers: '{}', settings: '⚙', overview: '▤', analytics: '📈',
+  home: '⌂', sites: '◎', workers: '{}', projects: '⇪', settings: '⚙', overview: '▤', analytics: '📈',
   dns: '☍', ssl: '🔒', security: '🛡', caching: '⚡', add: '+', users: '👥', plans: '★',
 };
 
@@ -300,6 +301,7 @@ function sidebar(route) {
   const accountLinks = [
     ['#/', 'Account home', icons.home, route.view === 'home'],
     ['#/add-site', 'Add a site', icons.add, route.view === 'add-site'],
+    ...(PROJECTS_ENABLED ? [['#/projects', 'Projects', icons.projects, route.view.startsWith('project')]] : []),
     ['#/workers', 'Edge Functions', icons.workers, route.view.startsWith('worker')],
     ['#/settings', 'Account settings', icons.settings, route.view === 'settings'],
   ];
@@ -429,6 +431,66 @@ function profilePanel() {
         <button class="btn" type="submit"${profile && !profileSaving ? '' : ' disabled'}>Save name</button>
       </form>
     </section>`;
+}
+
+// Mobile number: null shows the number (or the form to add one); 'code' asks for the texted code;
+// 'edit' replaces a verified number.
+let phoneStep = null;
+let phoneBusy = false;
+
+function contactPanel() {
+  if (!profile) return '';
+  const busy = phoneBusy ? ' disabled' : '';
+  let phone;
+  if (phoneStep === 'code' && profile.phonePending) {
+    phone = `
+      <form class="row phone-form" data-form="phone-verify">
+        <input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required placeholder="6-digit code" aria-label="Code we texted you"${busy} />
+        <button class="btn primary" type="submit"${busy}>Verify</button>
+        <button class="btn" type="button" data-action="phone-edit"${busy}>Change number</button>
+      </form>
+      <p class="muted">We texted a code to <span class="mono">${esc(profile.phonePending)}</span>. It expires in 10 minutes.</p>`;
+  } else if (profile.phoneVerified && phoneStep !== 'edit') {
+    phone = `
+      <div class="row"><span class="mono">${esc(profile.phone)}</span><span class="status ok">● Verified</span></div>
+      <div class="row">
+        <button class="btn" data-action="phone-edit">Change</button>
+        <button class="btn danger" data-action="phone-remove"${busy}>Remove</button>
+      </div>`;
+  } else {
+    phone = `
+      <form class="row phone-form" data-form="phone-send">
+        <input name="phone" type="tel" autocomplete="tel" required placeholder="+91 98765 43210" aria-label="Mobile number with country code"${busy} />
+        <button class="btn primary" type="submit"${busy}>Text me a code</button>
+        ${phoneStep === 'edit' ? '<button class="btn" type="button" data-action="phone-cancel">Cancel</button>' : ''}
+      </form>
+      <p class="muted">Include your country code. Standard text message rates may apply.</p>`;
+  }
+  return `
+    <section class="panel">
+      <div class="setting-row">
+        <div><h3>Mobile number</h3><p>Verified by a code we text you. Used to reach you about your account.</p></div>
+        <div class="setting-control phone-control">${phone}</div>
+      </div>
+      ${settingRow('Product update emails', 'Occasional news about Lyrcloud features. Emails about your account and security always arrive.', toggle('email-updates', profile.emailUpdates !== false, 'Product update emails'))}
+    </section>`;
+}
+
+async function phoneRequest(path, options, message) {
+  phoneBusy = true;
+  render();
+  try {
+    profile = { ...profile, ...(await api(path, options)) };
+    cacheProfile(profile);
+    if (message) toast(message);
+    return true;
+  } catch (error) {
+    toast(error.message);
+    return false;
+  } finally {
+    phoneBusy = false;
+    render();
+  }
 }
 
 let profileSaving = false;
@@ -598,6 +660,7 @@ const views = {
     return `
       ${pageHead('Account settings')}
       ${profilePanel()}
+      ${contactPanel()}
       <section class="panel">
         ${settingRow('Email', 'The address you sign in with.', `<span class="mono">${esc(session.email)}</span>`)}
         ${settingRow('Signed in with', 'Your identity provider.', '<span id="profile-provider" class="muted">Loading…</span>')}
@@ -639,18 +702,21 @@ const views = {
     return views.admin(route);
   },
 
+  projects: (route) => (PROJECTS_ENABLED ? projectsView(route) : views.missing()),
+  project: (route) => (PROJECTS_ENABLED ? projectView(route) : views.missing()),
+
   admin(route) {
     if (profileFailed) return `<section class="panel"><p class="form-error">Couldn’t load your account. Reload the page to try again.</p></section>`;
     if (!profile) return '<section class="panel"><p class="muted">Loading…</p></section>';
     if (!isStaff(profile.role)) return views.missing();
     const isSuper = profile.role === 'superadmin';
-    const tab = ['overview', 'users', 'settings'].includes(route.params.get('tab')) ? route.params.get('tab') : 'overview';
-    const tabs = [['overview', 'Overview'], ['users', `Users${adminUsers.list ? ` (${adminUsers.list.length})` : ''}`], ['settings', 'Site settings']]
+    const tab = ['overview', 'users', ...(PROJECTS_ENABLED ? ['projects'] : []), 'settings'].includes(route.params.get('tab')) ? route.params.get('tab') : 'overview';
+    const tabs = [['overview', 'Overview'], ['users', `Users${adminUsers.list ? ` (${adminUsers.list.length})` : ''}`], ...(PROJECTS_ENABLED ? [['projects', 'Projects']] : []), ['settings', 'Site settings']]
       .map(([id, label]) => `<a class="admin-tab" href="#/admin?tab=${id}"${id === tab ? ' aria-current="page"' : ''}>${label}</a>`)
       .join('');
     const body = adminUsers.error
       ? `<section class="panel"><p class="form-error">${esc(adminUsers.error)}</p><button class="btn" data-action="admin-refresh">Try again</button></section>`
-      : !adminUsers.list && tab !== 'settings'
+      : !adminUsers.list && tab !== 'settings' && tab !== 'projects'
         ? '<section class="panel"><p class="muted">Loading accounts…</p></section>'
         : adminTabs[tab](isSuper);
     return `
@@ -887,6 +953,7 @@ function bars(counts, labels = {}) {
 const userLabel = (user) => user.name || user.email || user.userId;
 
 const adminTabs = {
+  projects: () => adminProjectsTab(),
   overview() {
     const users = adminUsers.list;
     const stat = (label, value, href) => `<a class="stat" href="${href}"><span>${label}</span><strong>${value}</strong></a>`;
@@ -902,7 +969,7 @@ const adminTabs = {
       </div>
       <div class="grid-2">
         <section class="panel"><div class="panel-head"><h2>Plans</h2></div>${bars(countBy(users, (user) => user.plan), Object.fromEntries(PLAN_IDS.map((id) => [id, planName(id)])))}</section>
-        <section class="panel"><div class="panel-head"><h2>Sign-in methods</h2></div>${bars(countBy(users, (user) => user.provider || 'Unknown'), { GoogleOIDC: 'Google', GitHubBridge: 'GitHub' })}</section>
+        <section class="panel"><div class="panel-head"><h2>Sign-in methods</h2></div>${bars(countBy(users, (user) => user.provider || 'Unknown'), PROVIDER_LABELS)}</section>
       </div>
       <section class="panel">
         <div class="panel-head"><h2>Recent sign-ins</h2><a href="#/admin?tab=users">All users →</a></div>
@@ -941,7 +1008,7 @@ const adminTabs = {
             <div class="badges">
               ${badge(`role-badge role-${esc(user.role)}`, ROLE_LABELS[user.role] || esc(user.role))}
               ${badge('plan-badge', `${esc(planName(user.plan))} plan`)}
-              ${badge('', esc({ GoogleOIDC: 'Google', GitHubBridge: 'GitHub' }[user.provider] || user.provider || '—'))}
+              ${badge('', esc(PROVIDER_LABELS[user.provider] || user.provider || '—'))}
               ${user.disabled ? badge('badge-danger', 'Disabled') : ''}
               ${self ? badge('', 'You') : ''}
               <small class="muted">Joined ${user.createdAt ? new Date(user.createdAt).toLocaleDateString() : '—'} · last sign-in ${user.lastLoginAt ? formatDate(user.lastLoginAt) : '—'}</small>
@@ -979,6 +1046,8 @@ const adminTabs = {
           ${isSuper ? '<div class="row"><button class="btn primary" type="submit">Save announcement</button></div>' : '<p class="muted">Only the super admin can change site settings.</p>'}
         </form>
       </section>
+      ${adminUpdatesPanel(isSuper)}
+      ${adminGithubAppPanel(isSuper)}
       <section class="panel">
         <div class="panel-head"><h2>Access rules</h2></div>
         <dl class="facts">
@@ -990,6 +1059,399 @@ const adminTabs = {
   },
 };
 
+function adminUpdatesPanel(isSuper) {
+  const data = adminUpdates.data;
+  if (!data) return '';
+  const sending = adminUpdates.sending;
+  const history = data.updates.length
+    ? `<ul class="update-list">${data.updates.map((update) => `
+        <li><b>${esc(update.subject)}</b><span class="muted">${formatDate(update.sentAt)} · ${update.sent} sent${update.failed ? ` · ${update.failed} failed` : ''}</span></li>`).join('')}</ul>`
+    : '<p class="muted">No updates sent yet.</p>';
+  return `
+    <section class="panel">
+      <div class="panel-head"><h2>Email an update</h2><span class="muted">${data.recipients} subscribed</span></div>
+      <p class="muted">Goes to every active account with product updates turned on. Each email has an unsubscribe link.</p>
+      ${data.mailEnabled ? '' : '<p class="form-error">Email sending isn’t set up on the server yet.</p>'}
+      ${isSuper
+        ? `<form data-form="admin-update" class="stack">
+            <label class="field">Subject<input name="subject" maxlength="150" required placeholder="e.g. Edge functions are now in beta"${sending ? ' disabled' : ''} /></label>
+            <label class="field">Message<textarea name="message" rows="6" maxlength="5000" required placeholder="Plain text. Blank lines start new paragraphs; https:// links become clickable."${sending ? ' disabled' : ''}></textarea></label>
+            <div class="row"><button class="btn primary" type="submit"${sending || !data.mailEnabled ? ' disabled' : ''}>${sending ? esc(sending) : `Send to ${data.recipients} account${data.recipients === 1 ? '' : 's'}`}</button></div>
+          </form>`
+        : '<p class="muted">Only the super admin can send updates.</p>'}
+      <h3>Sent</h3>
+      ${history}
+    </section>`;
+}
+
+// ------------------------------------------------------------------ Lyrcloud Projects
+
+// Import any git repository, build it and host it at <name>.lyrcloud.app (the projects API).
+const projects = { data: null, error: '', loading: false, repos: null, reposError: '', detail: null, detailError: '', logs: {}, openLog: null };
+const adminProjects = { list: null, error: '', loading: false };
+const adminGithubApp = { data: null, error: '', loading: false };
+let projectsTimer = null;
+
+const projectsApi = (path, options) => api(path, options, PROJECTS_API_BASE);
+// Projects stays hidden until its API is deployed and PROJECTS_API_BASE (src/auth.js) points at it.
+const PROJECTS_ENABLED = !PROJECTS_API_BASE.endsWith('.invalid');
+
+const DEPLOY_STATUS = {
+  queued: ['pending', '◌ Queued'], building: ['pending', '◌ Building'], live: ['ok', '● Live'], ready: ['', 'Ready'],
+  failed: ['bad', '✕ Failed'], expired: ['', 'Expired'], disabled: ['bad', '✕ Disabled'],
+};
+const deployBadge = (status) => {
+  const [cls, label] = DEPLOY_STATUS[status] || ['', esc(status || '—')];
+  return `<span class="status ${cls}">${label}</span>`;
+};
+const SOURCE_LABELS = { github: 'GitHub', gitlab: 'GitLab', bitbucket: 'Bitbucket', codeberg: 'Codeberg', git: 'Git' };
+const isWorking = (status) => status === 'queued' || status === 'building';
+
+async function loadProjects() {
+  projects.loading = true;
+  try {
+    projects.data = await projectsApi('/projects');
+    projects.error = '';
+  } catch (error) {
+    projects.error = error.message;
+  }
+  projects.loading = false;
+  if (currentRoute?.view.startsWith('project')) render();
+}
+
+async function loadProject(id) {
+  try {
+    projects.detail = await projectsApi(`/projects/${encodeURIComponent(id)}`);
+    projects.detailError = '';
+  } catch (error) {
+    projects.detailError = error.message;
+  }
+  if (currentRoute?.view === 'project' && currentRoute.projectId === id) render();
+}
+
+async function loadRepos() {
+  projects.repos = [];
+  try {
+    projects.repos = (await projectsApi('/projects/github/repos')).repos;
+  } catch (error) {
+    projects.reposError = error.message;
+  }
+  if (currentRoute?.view === 'projects') render();
+}
+
+// Loads what the current projects page needs, and polls while a build is running.
+function projectsAfterRender(route) {
+  clearTimeout(projectsTimer);
+  if (!projects.data && !projects.loading && !projects.error) loadProjects();
+  if (route.view === 'projects' && route.params.get('new') && projects.data?.github.connected && !projects.repos) loadRepos();
+  const github = route.params.get('github');
+  if (github) {
+    toast(github === 'connected' ? 'GitHub connected' : 'GitHub wasn’t connected');
+    history.replaceState(null, '', '#/projects');
+    projects.data = null;
+    loadProjects();
+  }
+  if (route.view === 'project') {
+    if (projects.detail?.project.projectId !== route.projectId && !projects.detailError) {
+      projects.detail = null;
+      loadProject(route.projectId);
+      return;
+    }
+    if (projects.detail?.deployments.some((item) => isWorking(item.status))) {
+      projectsTimer = setTimeout(() => currentRoute?.projectId === route.projectId && loadProject(route.projectId), 4000);
+    }
+  } else if (projects.data?.projects.some((item) => isWorking(item.status))) {
+    projectsTimer = setTimeout(() => currentRoute?.view === 'projects' && loadProjects(), 5000);
+  }
+}
+
+function githubPanel(github) {
+  if (!github.available) return '';
+  return github.connected
+    ? `<section class="panel github-panel">
+        <div><h3>GitHub connected</h3><p class="muted">Signed in as <b>@${esc(github.login)}</b>${github.repositorySelection === 'selected' ? ' · access to selected repositories' : ''}. Pushes to linked repositories deploy automatically.</p></div>
+        <div class="row"><button class="btn" data-action="github-connect">Change access</button><button class="btn" data-action="github-disconnect">Disconnect</button></div>
+      </section>`
+    : `<section class="panel github-panel">
+        <div><h3>Connect GitHub</h3><p class="muted">Import your private repositories, copy or fork projects into your account, and redeploy on every push.</p></div>
+        <button class="btn primary" data-action="github-connect">Connect GitHub</button>
+      </section>`;
+}
+
+function importView() {
+  const { github, domain, limits } = projects.data;
+  const atLimit = limits.used >= limits.projects;
+  const repoOptions = !github.connected ? '' : projects.repos === null || (!projects.repos.length && !projects.reposError)
+    ? '<option value="">Loading your repositories…</option>'
+    : projects.repos.length
+      ? projects.repos.map((repo) => `<option value="${esc(repo.fullName)}" data-branch="${esc(repo.defaultBranch)}">${esc(repo.fullName)}${repo.private ? ' 🔒' : ''}</option>`).join('')
+      : `<option value="">${esc(projects.reposError || 'No repositories shared with Lyrcloud yet')}</option>`;
+  const needsGithub = github.connected ? '' : ' disabled';
+  return `
+    ${pageHead('Import a project', 'From GitHub, GitLab, Bitbucket or any public git URL.', '<a class="btn" href="#/projects">Cancel</a>')}
+    ${atLimit ? `<p class="form-error">You’re using all ${limits.projects} projects on your plan. <a href="#/plans">Upgrade</a> or delete a project first.</p>` : ''}
+    <form class="panel import-form" data-form="project-import" data-kind="url" data-mode="deploy">
+      <fieldset class="choice-row">
+        <legend>Source</legend>
+        <label class="choice"><input type="radio" name="kind" value="url" checked data-action="import-kind" /> <span><b>Git URL</b><small>Any public repository</small></span></label>
+        <label class="choice"><input type="radio" name="kind" value="repo" data-action="import-kind"${needsGithub} /> <span><b>My GitHub</b><small>${github.connected ? `@${esc(github.login)}’s repositories` : 'Connect GitHub first'}</small></span></label>
+      </fieldset>
+
+      <label class="field only-url">Repository URL
+        <input name="url" id="import-url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://github.com/owner/repo" />
+        <small class="muted">GitHub, GitLab, Bitbucket, Codeberg or any https git URL. A “/tree/branch” link picks that branch.</small>
+      </label>
+      <label class="field only-repo">Repository
+        <select name="repo" id="import-repo">${repoOptions}</select>
+      </label>
+
+      <fieldset class="choice-row only-url">
+        <legend>What should Lyrcloud do?</legend>
+        <label class="choice"><input type="radio" name="mode" value="deploy" checked data-action="import-mode" /> <span><b>Deploy it</b><small>Build and host it as it is</small></span></label>
+        <label class="choice"><input type="radio" name="mode" value="copy" data-action="import-mode"${needsGithub} /> <span><b>Copy to my GitHub</b><small>A new repository you own</small></span></label>
+        <label class="choice"><input type="radio" name="mode" value="fork" data-action="import-mode"${needsGithub} /> <span><b>Fork on GitHub</b><small>GitHub sources only</small></span></label>
+      </fieldset>
+      ${github.connected ? '' : github.available ? '<p class="muted only-url">Copy and fork need GitHub. <button class="text-link" type="button" data-action="github-connect">Connect GitHub</button></p>' : ''}
+      <div class="only-copy grid-2">
+        <label class="field">New repository name<input name="copyName" id="import-copy-name" maxlength="100" placeholder="my-site" /></label>
+        <label class="check-row"><input type="checkbox" name="copyPrivate" checked /> Make it private</label>
+      </div>
+
+      <label class="field">Project name
+        <span class="name-field"><input name="name" id="import-name" required maxlength="40" pattern="[a-z0-9][a-z0-9-]{1,38}[a-z0-9]" placeholder="my-site" autocomplete="off" spellcheck="false" /><span class="suffix">.${esc(domain)}</span></span>
+        <small class="muted">Your site’s address. Lower-case letters, numbers and hyphens.</small>
+      </label>
+
+      <details class="advanced">
+        <summary>Build settings</summary>
+        <p class="muted">Leave blank to detect them: Lyrcloud finds npm, pnpm or yarn, runs the build script and publishes dist, build, out or public.</p>
+        <div class="grid-2">
+          <label class="field">Branch<input name="branch" placeholder="default branch" /></label>
+          <label class="field">Root folder<input name="rootDir" placeholder="e.g. apps/web" /></label>
+          <label class="field">Install command<input name="installCommand" placeholder="e.g. npm ci" /></label>
+          <label class="field">Build command<input name="buildCommand" placeholder="e.g. npm run build" /></label>
+          <label class="field">Output folder<input name="outputDir" placeholder="e.g. dist" /></label>
+        </div>
+      </details>
+      <p class="form-error" role="alert" hidden></p>
+      <div class="row"><button class="btn primary" type="submit"${atLimit ? ' disabled' : ''}>Import and deploy</button></div>
+    </form>`;
+}
+
+function projectsView(route) {
+  if (projects.error) return `${pageHead('Projects')}<section class="panel"><p class="form-error">${esc(projects.error)}</p><button class="btn" data-action="projects-retry">Try again</button></section>`;
+  if (!projects.data) return `${pageHead('Projects')}<section class="panel"><p class="muted">Loading projects…</p></section>`;
+  if (route.params.get('new')) return importView();
+  const { projects: list, limits, github } = projects.data;
+  const rows = list.map((item) => `
+    <tr>
+      <td><a class="link" href="#/projects/${item.projectId}">${esc(item.name)}</a><div class="muted mono">${esc(item.url.replace('https://', ''))}</div></td>
+      <td>${item.github ? `GitHub · ${esc(item.github.fullName)}` : item.source ? `${SOURCE_LABELS[item.source.provider] || 'Git'} · ${esc(item.source.url.replace(/^https:\/\/[^/]+\//, ''))}` : '—'}</td>
+      <td>${deployBadge(item.status)}</td>
+      <td>${item.lastDeployAt ? formatDate(item.lastDeployAt) : '<span class="muted">—</span>'}</td>
+    </tr>`).join('');
+  return `
+    ${pageHead('Projects', `Import any git repository and put it live at <span class="mono">name.${esc(projects.data.domain)}</span>.`, '<a class="btn primary" href="#/projects?new=1">+ Import project</a>')}
+    ${githubPanel(github)}
+    ${list.length
+      ? `<section class="panel"><div class="table-scroll"><table class="table">
+          <thead><tr><th>Project</th><th>Source</th><th>Status</th><th>Last deploy</th></tr></thead>
+          <tbody>${rows}</tbody></table></div></section>`
+      : `<section class="panel empty">
+          <span class="empty-icon" aria-hidden="true">⇪</span>
+          <h2>Put your first project live</h2>
+          <p>Paste a link to any git repository. Lyrcloud builds it and gives it an address in about a minute.</p>
+          <div class="row center"><a class="btn primary" href="#/projects?new=1">Import project</a></div>
+        </section>`}
+    <p class="muted">${limits.used} of ${limits.projects} projects on your ${esc(PLAN_INFO[limits.plan]?.name || limits.plan)} plan · ${limits.buildsPerDay} builds a day.</p>`;
+}
+
+const shortCommit = (commit) => (commit ? `<code>${esc(commit.slice(0, 7))}</code>` : '');
+
+function projectView(route) {
+  if (projects.detailError) return `${pageHead('Project')}<section class="panel"><p class="form-error">${esc(projects.detailError)}</p><a class="btn" href="#/projects">All projects</a></section>`;
+  const detail = projects.detail?.project.projectId === route.projectId ? projects.detail : null;
+  if (!detail) return `${pageHead('Project')}<section class="panel"><p class="muted">Loading project…</p></section>`;
+  const { project, deployments } = detail;
+  const settings = project.settings || {};
+  const sourceLink = project.github
+    ? `<a class="link" href="${esc(project.github.url)}" target="_blank" rel="noopener">github.com/${esc(project.github.fullName)}</a>${project.github.mode === 'copy' ? ' <span class="muted">(your copy)</span>' : project.github.mode === 'fork' ? ' <span class="muted">(your fork)</span>' : ''}`
+    : project.source ? `<a class="link" href="${esc(project.source.url)}" target="_blank" rel="noopener">${esc(project.source.url.replace('https://', ''))}</a>` : '—';
+  const rows = deployments.map((item) => {
+    const open = projects.openLog === item.deployId;
+    const actions = [
+      `<button class="btn small" data-action="project-log" data-id="${item.deployId}">${open ? 'Hide log' : 'Log'}</button>`,
+      item.status === 'ready' ? `<button class="btn small" data-action="project-promote" data-id="${item.deployId}">Make live</button>` : '',
+    ].join('');
+    return `
+      <tr>
+        <td>${deployBadge(item.status)}${item.error ? `<div class="form-error small-text">${esc(item.error)}</div>` : ''}</td>
+        <td>${shortCommit(item.commit)} ${esc(item.message || '')}<div class="muted">${esc({ create: 'First deploy', copy: 'Copied and deployed', push: 'Push', manual: 'Redeploy' }[item.trigger] || item.trigger || '')}${item.branch ? ` · ${esc(item.branch)}` : ''}${item.framework ? ` · ${esc(item.framework)}` : ''}</div></td>
+        <td>${formatDate(item.createdAt)}${item.finishedAt ? `<div class="muted">${Math.max(1, Math.round((new Date(item.finishedAt) - new Date(item.createdAt)) / 1000))} s</div>` : ''}</td>
+        <td><div class="row">${actions}</div></td>
+      </tr>
+      ${open ? `<tr class="log-row"><td colspan="4"><pre class="build-log">${esc(projects.logs[item.deployId] ?? 'Loading log…')}</pre></td></tr>` : ''}`;
+  }).join('');
+  return `
+    ${pageHead(esc(project.name), `<a class="link" href="${esc(project.url)}" target="_blank" rel="noopener">${esc(project.url.replace('https://', ''))}</a> ${deployBadge(project.status)}`,
+      `<a class="btn" href="#/projects">All projects</a>${project.liveDeployId ? `<a class="btn" href="${esc(project.url)}" target="_blank" rel="noopener">Visit ↗</a>` : ''}<button class="btn primary" data-action="project-redeploy"${project.disabled ? ' disabled' : ''}>Redeploy</button>`)}
+    ${project.disabled ? '<p class="form-error">Lyrcloud has disabled this project, so it’s offline. Contact hello@lyrcloud.com.</p>' : ''}
+    <section class="panel">
+      <dl class="facts">
+        <dt>Source</dt><dd>${sourceLink}</dd>
+        <dt>Branch</dt><dd>${esc(project.github?.branch || settings.branch || 'default')}</dd>
+        <dt>Deploys</dt><dd>${project.github ? 'Automatically on every push to this branch, or with Redeploy' : 'When you press Redeploy (it fetches the latest commit)'}</dd>
+        <dt>Created</dt><dd>${formatDate(project.createdAt)}</dd>
+      </dl>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Deployments</h2><span class="muted">The last few stay ready, so you can roll back</span></div>
+      ${deployments.length ? `<div class="table-scroll"><table class="table deploy-table"><thead><tr><th>Status</th><th>Commit</th><th>Started</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p class="muted">No deployments yet.</p>'}
+    </section>
+    <form class="panel" data-form="project-settings">
+      <div class="panel-head"><h2>Build settings</h2></div>
+      <p class="muted">Blank fields are detected automatically. Changes apply to the next deploy.</p>
+      <div class="grid-2">
+        ${[['branch', 'Branch', 'default branch'], ['rootDir', 'Root folder', 'e.g. apps/web'], ['installCommand', 'Install command', 'e.g. npm ci'], ['buildCommand', 'Build command', 'e.g. npm run build'], ['outputDir', 'Output folder', 'e.g. dist']]
+          .map(([field, label, hint]) => `<label class="field">${label}<input name="${field}" value="${esc(field === 'branch' ? project.github?.branch || settings.branch || '' : settings[field] || '')}" placeholder="${hint}" /></label>`).join('')}
+      </div>
+      <div class="row"><button class="btn primary" type="submit">Save settings</button></div>
+    </form>
+    <section class="panel">
+      ${settingRow('Delete project', `Takes ${esc(project.url.replace('https://', ''))} offline and frees the name. Your GitHub repository isn’t touched.`, '<button class="btn danger" data-action="project-delete">Delete</button>')}
+    </section>`;
+}
+
+// Fills the project and repository names from the URL while the person hasn't typed their own.
+function suggestImportNames(form) {
+  const url = form.querySelector('#import-url').value.trim();
+  const repo = form.dataset.kind === 'repo' ? form.querySelector('#import-repo').value : '';
+  const source = repo || url;
+  const repoName = source.replace(/\.git$/, '').replace(/\/(-\/)?(tree|src)\/.*$/, '').split(/[/:]/).filter(Boolean).pop() || '';
+  const name = form.querySelector('#import-name');
+  if (!name.dataset.touched) name.value = repoName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+  const copyName = form.querySelector('#import-copy-name');
+  if (copyName && !copyName.dataset.touched) copyName.value = repoName.replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 100);
+}
+
+async function importProject(form, data) {
+  const errorNode = form.querySelector('.form-error');
+  const button = form.querySelector('[type="submit"]');
+  const kind = String(data.get('kind'));
+  const mode = kind === 'repo' ? 'deploy' : String(data.get('mode'));
+  const settings = Object.fromEntries(['branch', 'rootDir', 'installCommand', 'buildCommand', 'outputDir'].map((field) => [field, String(data.get(field) || '').trim()]).filter(([, value]) => value));
+  const body = {
+    name: String(data.get('name')).trim().toLowerCase(),
+    source: kind === 'repo' ? { repo: String(data.get('repo')) } : { url: String(data.get('url')).trim() },
+    mode,
+    settings,
+    ...(mode === 'copy' || mode === 'fork' ? { copy: { name: String(data.get('copyName') || '').trim() || undefined, private: data.get('copyPrivate') === 'on' } } : {}),
+  };
+  if (kind === 'url' && !body.source.url) return showFormError(form, 'Paste a repository URL.');
+  if (kind === 'repo' && !body.source.repo) return showFormError(form, 'Pick a repository.');
+  errorNode.hidden = true;
+  button.disabled = true;
+  button.textContent = mode === 'copy' ? 'Copying…' : mode === 'fork' ? 'Forking…' : 'Importing…';
+  try {
+    const result = await projectsApi('/projects', { method: 'POST', body: JSON.stringify(body) });
+    projects.data = null;
+    projects.detail = { project: result.project, deployments: result.deployment ? [result.deployment] : [] };
+    if (result.warning) toast(result.warning);
+    go(`#/projects/${result.project.projectId}`);
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = 'Import and deploy';
+    showFormError(form, error.message);
+  }
+}
+
+async function openLog(deployId) {
+  projects.openLog = projects.openLog === deployId ? null : deployId;
+  render();
+  if (!projects.openLog) return;
+  try {
+    projects.logs[deployId] = (await projectsApi(`/projects/${projects.detail.project.projectId}/deployments/${deployId}/log`)).log || 'The log is empty.';
+  } catch (error) {
+    projects.logs[deployId] = error.message;
+  }
+  render();
+  const log = app.querySelector('.build-log');
+  if (log) log.scrollTop = log.scrollHeight;
+}
+
+async function connectGithubAccount(target) {
+  target.disabled = true;
+  try {
+    location.href = (await projectsApi('/projects/github/connect', { method: 'POST' })).installUrl;
+  } catch (error) {
+    target.disabled = false;
+    toast(error.message);
+  }
+}
+
+// Admin: every project, with a switch to take one offline.
+async function loadAdminProjects() {
+  adminProjects.loading = true;
+  try {
+    adminProjects.list = (await projectsApi('/admin/projects')).projects;
+    adminProjects.error = '';
+  } catch (error) {
+    adminProjects.error = error.message;
+  }
+  adminProjects.loading = false;
+  if (isAdminView()) render();
+}
+
+async function loadAdminGithubApp() {
+  adminGithubApp.loading = true;
+  try {
+    adminGithubApp.data = await projectsApi('/admin/github-app');
+  } catch (error) {
+    adminGithubApp.error = error.message;
+  }
+  adminGithubApp.loading = false;
+  if (isAdminView()) render();
+}
+
+function adminProjectsTab() {
+  if (adminProjects.error) return `<section class="panel"><p class="form-error">${esc(adminProjects.error)}</p></section>`;
+  if (!adminProjects.list) return '<section class="panel"><p class="muted">Loading projects…</p></section>';
+  const rows = adminProjects.list.map((item) => `
+    <tr>
+      <td><a class="link" href="${esc(item.url)}" target="_blank" rel="noopener">${esc(item.name)}</a><div class="muted">${esc(item.ownerEmail || '—')}</div></td>
+      <td>${esc(item.github?.fullName || item.source?.url.replace('https://', '') || '—')}</td>
+      <td>${deployBadge(item.status)}</td>
+      <td>${formatDate(item.createdAt)}</td>
+      <td><button class="btn small${item.disabled ? '' : ' danger'}" data-action="admin-project-toggle" data-id="${item.projectId}">${item.disabled ? 'Enable' : 'Disable'}</button></td>
+    </tr>`).join('');
+  return `
+    <section class="panel">
+      <div class="panel-head"><h2>Projects</h2><span class="muted">${adminProjects.list.length} total</span></div>
+      <p class="muted">Disabling a project takes its site offline at once and stops new deploys. Use it for phishing, malware or abuse.</p>
+      ${adminProjects.list.length ? `<div class="table-scroll"><table class="table"><thead><tr><th>Project</th><th>Source</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p class="muted">No projects yet.</p>'}
+    </section>`;
+}
+
+function adminGithubAppPanel(isSuper) {
+  const { data, error } = adminGithubApp;
+  if (error) return `<section class="panel"><div class="panel-head"><h2>GitHub App</h2></div><p class="form-error">${esc(error)}</p></section>`;
+  if (!data) return '';
+  return `
+    <section class="panel">
+      <div class="panel-head"><h2>GitHub App</h2>${data.configured ? '<span class="status ok">● Ready</span>' : '<span class="status pending">◌ Not set up</span>'}</div>
+      ${data.configured
+        ? `<p class="muted">Customers connect GitHub through <a class="link" href="${esc(data.url)}" target="_blank" rel="noopener">${esc(data.name)}</a> to import private repositories, copy or fork projects, and deploy on push.</p>`
+        : isSuper
+          ? `<p class="muted">Projects need a GitHub App for private repositories, copies, forks and deploy-on-push. GitHub creates it from Lyrcloud’s settings in one step; you only confirm the name.</p>
+            <form class="row" data-form="github-app">
+              <input name="name" maxlength="34" value="Lyrcloud Deploy" aria-label="GitHub App name" />
+              <button class="btn primary" type="submit">Create GitHub App</button>
+            </form>
+            <p class="muted">GitHub app names are unique across GitHub. If the name is taken, GitHub asks for another.</p>`
+          : '<p class="muted">The super admin hasn’t set up the GitHub App yet.</p>'}
+    </section>`;
+}
+
 // ------------------------------------------------------------------ routing
 
 function parseRoute() {
@@ -998,6 +1460,7 @@ function parseRoute() {
   const params = new URLSearchParams(query);
   if (parts[0] === 'zones' && parts[1]) return { view: 'zone', zone: parts[1], tab: parts[2] || 'overview', params };
   if (parts[0] === 'workers' && parts[1]) return { view: 'worker', worker: parts[1], params };
+  if (parts[0] === 'projects' && parts[1]) return { view: 'project', projectId: parts[1], params };
   if (parts[0] && views[parts[0]]) return { view: parts[0], params };
   return { view: parts.length ? 'missing' : 'home', params };
 }
@@ -1015,9 +1478,12 @@ function render() {
   app.classList.remove('sidebar-open');
   bindCharts();
   if (currentRoute.view === 'settings') showProfile();
+  if (PROJECTS_ENABLED && currentRoute.view.startsWith('project')) projectsAfterRender(currentRoute);
   if (isAdminView() && profile && isStaff(profile.role)) {
     if (!adminUsers.list && !adminUsers.loading && !adminUsers.error) loadUsers();
     if (currentRoute.params.get('tab') === 'settings' && !adminSettings.data && !adminSettings.loading) loadAdminSettings();
+    if (PROJECTS_ENABLED && currentRoute.params.get('tab') === 'settings' && !adminGithubApp.data && !adminGithubApp.loading) loadAdminGithubApp();
+    if (PROJECTS_ENABLED && currentRoute.params.get('tab') === 'projects' && !adminProjects.list && !adminProjects.loading) loadAdminProjects();
     applyAdminSearch();
   }
   document.title = `${document.querySelector('.page-head h1')?.textContent || 'Dashboard'} | Lyrcloud`;
@@ -1054,7 +1520,7 @@ function showProfile() {
     if (node) node.textContent = text;
   };
   if (profile) {
-    set('profile-provider', profile.provider || '—');
+    set('profile-provider', PROVIDER_LABELS[profile.provider] || profile.provider || '—');
     set('profile-role', ROLE_LABELS[profile.role] || profile.role || '—');
     set('profile-created', profile.createdAt ? new Date(profile.createdAt).toLocaleDateString() : '—');
   } else if (profileFailed) {
@@ -1065,15 +1531,16 @@ function showProfile() {
 // Admin console data (GET /admin/users, GET /admin/settings) and the user-list filter.
 const adminUsers = { list: null, error: '', loading: false };
 const adminSettings = { data: null, error: '', loading: false };
+const adminUpdates = { data: null, error: '', sending: null };
 const adminFilter = { q: '', role: 'all' };
 let adminEditing = null;
 const isAdminView = () => currentRoute?.view === 'admin' || currentRoute?.view === 'users';
 
-async function api(path, options = {}) {
+async function api(path, options = {}, base = undefined) {
   const response = await authFetch(path, {
     ...options,
     headers: options.body ? { 'content-type': 'application/json', ...options.headers } : options.headers,
-  });
+  }, base);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
   return data;
@@ -1094,12 +1561,40 @@ async function loadUsers() {
 async function loadAdminSettings() {
   adminSettings.loading = true;
   try {
-    adminSettings.data = await api('/admin/settings');
+    [adminSettings.data, adminUpdates.data] = await Promise.all([api('/admin/settings'), api('/admin/updates')]);
     adminSettings.error = '';
+    adminUpdates.error = '';
   } catch (error) {
     adminSettings.error = error.message;
   }
   adminSettings.loading = false;
+  if (isAdminView()) render();
+}
+
+// Emails an update, calling again with its id while recipients remain (each call runs ~20 seconds).
+async function sendAdminUpdate(button, body, form) {
+  button.disabled = true;
+  adminUpdates.sending = 'Sending…';
+  if (isAdminView()) render();
+  try {
+    let request = body;
+    for (;;) {
+      const { update, remaining } = await api('/admin/updates', { method: 'POST', body: JSON.stringify(request) });
+      const list = (adminUpdates.data?.updates || []).filter((item) => item.id !== update.id);
+      adminUpdates.data = { ...adminUpdates.data, updates: [update, ...list] };
+      if (!remaining) {
+        toast(`Sent to ${update.sent} account${update.sent === 1 ? '' : 's'}${update.failed ? `, ${update.failed} failed` : ''}`);
+        form?.reset();
+        break;
+      }
+      adminUpdates.sending = `Sent ${update.sent}, ${remaining} to go…`;
+      if (isAdminView()) render();
+      request = { updateId: update.id };
+    }
+  } catch (error) {
+    toast(error.message);
+  }
+  adminUpdates.sending = null;
   if (isAdminView()) render();
 }
 
@@ -1312,6 +1807,88 @@ const clickActions = {
   'account-menu': (target) => setAccountMenu(target.getAttribute('aria-expanded') !== 'true'),
   'avatar-provider': () => saveProfile({ avatar: null }, 'Using your sign-in photo'),
   'avatar-initials': () => saveProfile({ avatar: 'initials' }, 'Photo removed'),
+  'github-connect': (target) => connectGithubAccount(target),
+  'github-disconnect': async (target) => {
+    if (!confirmed(target, 'Disconnect GitHub? Linked projects stop deploying on push until you reconnect.')) return;
+    try {
+      await projectsApi('/projects/github', { method: 'DELETE' });
+      projects.data = null;
+      projects.repos = null;
+      loadProjects();
+      toast('GitHub disconnected');
+    } catch (error) {
+      toast(error.message);
+    }
+  },
+  'projects-retry': () => {
+    projects.error = '';
+    loadProjects();
+  },
+  'project-redeploy': async (target) => {
+    target.disabled = true;
+    try {
+      const { deployment } = await projectsApi(`/projects/${projects.detail.project.projectId}/deployments`, { method: 'POST' });
+      projects.detail.deployments.unshift(deployment);
+      toast('Deploying the latest commit');
+    } catch (error) {
+      toast(error.message);
+    }
+    render();
+  },
+  'project-log': (target) => openLog(target.dataset.id),
+  'project-promote': async (target) => {
+    if (!confirmed(target, 'Make this deployment live? Visitors see it at once.')) return;
+    target.disabled = true;
+    try {
+      await projectsApi(`/projects/${projects.detail.project.projectId}/deployments/${target.dataset.id}/promote`, { method: 'POST' });
+      toast('Deployment is live');
+      loadProject(projects.detail.project.projectId);
+    } catch (error) {
+      target.disabled = false;
+      toast(error.message);
+    }
+  },
+  'project-delete': async (target) => {
+    const { project } = projects.detail;
+    if (!confirmed(target, `Delete ${project.name}? The site goes offline and the name is freed.`)) return;
+    target.disabled = true;
+    try {
+      await projectsApi(`/projects/${project.projectId}`, { method: 'DELETE' });
+      projects.data = null;
+      projects.detail = null;
+      toast(`${project.name} deleted`);
+      go('#/projects');
+    } catch (error) {
+      target.disabled = false;
+      toast(error.message);
+    }
+  },
+  'admin-project-toggle': async (target) => {
+    const item = adminProjects.list.find((entry) => entry.projectId === target.dataset.id);
+    if (!item.disabled && !confirmed(target, `Disable ${item.name}? Its site goes offline immediately.`)) return;
+    target.disabled = true;
+    try {
+      const { project } = await projectsApi(`/admin/projects/${item.projectId}`, { method: 'PUT', body: JSON.stringify({ disabled: !item.disabled }) });
+      Object.assign(item, project);
+      toast(`${item.name} ${project.disabled ? 'disabled' : 'enabled'}`);
+    } catch (error) {
+      toast(error.message);
+    }
+    render();
+  },
+  'phone-edit': () => {
+    phoneStep = 'edit';
+    render();
+  },
+  'phone-cancel': () => {
+    phoneStep = null;
+    render();
+  },
+  'phone-remove': (target) => {
+    if (!confirmed(target, 'Remove your mobile number from your account?')) return;
+    phoneStep = null;
+    phoneRequest('/me/phone', { method: 'DELETE' }, 'Mobile number removed');
+  },
   'sign-out': (target) => {
     target.disabled = true;
     target.textContent = 'Signing out…';
@@ -1327,6 +1904,15 @@ const clickActions = {
 };
 
 const changeActions = {
+  'import-kind': (target) => {
+    const form = target.closest('form');
+    form.dataset.kind = target.value;
+    suggestImportNames(form);
+  },
+  'import-mode': (target) => {
+    target.closest('form').dataset.mode = target.value;
+  },
+  'email-updates': (target) => saveProfile({ emailUpdates: target.checked }, target.checked ? 'You’ll get product updates' : 'Product update emails turned off'),
   'avatar-file': async (target) => {
     const [file] = target.files;
     target.value = '';
@@ -1379,6 +1965,63 @@ const RECORD_VALIDATORS = {
 };
 
 const formActions = {
+  'project-import': (form, data) => importProject(form, data),
+  'project-settings': async (form, data) => {
+    const button = form.querySelector('[type="submit"]');
+    button.disabled = true;
+    const settings = Object.fromEntries(['branch', 'rootDir', 'installCommand', 'buildCommand', 'outputDir'].map((field) => [field, String(data.get(field) || '').trim()]));
+    try {
+      const { project } = await projectsApi(`/projects/${projects.detail.project.projectId}`, { method: 'PUT', body: JSON.stringify({ settings }) });
+      projects.detail.project = project;
+      toast('Settings saved. Redeploy to use them.');
+    } catch (error) {
+      toast(error.message);
+    }
+    button.disabled = false;
+    render();
+  },
+  'github-app': async (form, data) => {
+    const button = form.querySelector('[type="submit"]');
+    button.disabled = true;
+    try {
+      const { action, manifest } = await projectsApi('/admin/github-app/manifest', { method: 'POST', body: JSON.stringify({ name: String(data.get('name')) }) });
+      // GitHub's manifest flow needs a real form POST from the browser.
+      const post = document.createElement('form');
+      post.method = 'post';
+      post.action = action;
+      const field = document.createElement('input');
+      field.type = 'hidden';
+      field.name = 'manifest';
+      field.value = manifest;
+      post.append(field);
+      document.body.append(post);
+      post.submit();
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message);
+    }
+  },
+  'phone-send': async (form, data) => {
+    if (await phoneRequest('/me/phone', { method: 'POST', body: JSON.stringify({ phone: String(data.get('phone')) }) }, 'Code sent')) {
+      phoneStep = 'code';
+      render();
+      app.querySelector('[data-form="phone-verify"] input')?.focus();
+    }
+  },
+  'phone-verify': async (form, data) => {
+    if (await phoneRequest('/me/phone/verify', { method: 'POST', body: JSON.stringify({ code: String(data.get('code')).trim() }) }, 'Mobile number verified')) {
+      phoneStep = null;
+      render();
+    }
+  },
+  'admin-update': (form, data) => {
+    const button = form.querySelector('[type="submit"]');
+    const subject = String(data.get('subject')).trim();
+    const message = String(data.get('message')).trim();
+    if (!subject || !message) return toast('Add a subject and a message.');
+    if (!confirmed(button, `Email “${subject}” to ${adminUpdates.data?.recipients ?? 'every'} subscribed account(s)? This can’t be undone.`)) return;
+    sendAdminUpdate(button, { subject, message }, form);
+  },
   'profile-name': (form, data) => {
     const name = String(data.get('name') || '').trim();
     if (!name) return toast('Enter a name.');
@@ -1490,7 +2133,10 @@ app.addEventListener('change', (event) => {
 });
 
 app.addEventListener('input', (event) => {
-  if (event.target.id !== 'admin-search') return;
+  const { id } = event.target;
+  if (id === 'import-name' || id === 'import-copy-name') event.target.dataset.touched = '1';
+  if (id === 'import-url' || id === 'import-repo') suggestImportNames(event.target.closest('form'));
+  if (id !== 'admin-search') return;
   adminFilter.q = event.target.value;
   applyAdminSearch();
 });

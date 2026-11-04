@@ -1423,6 +1423,68 @@ code.inline {
   text-align: center;
 }
 
+.auth-intro {
+  display: grid;
+  gap: 16px;
+}
+
+.auth-intro[hidden],
+.auth-form[hidden],
+.auth-switch[hidden] {
+  display: none;
+}
+
+.auth-form {
+  display: grid;
+  gap: 14px;
+}
+
+.auth-form h2 {
+  margin: 0;
+  font-size: 1.35rem;
+  letter-spacing: -0.02em;
+}
+
+.auth-form .button {
+  width: 100%;
+  justify-content: center;
+}
+
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 0.85rem;
+}
+
+.auth-divider::before,
+.auth-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+.form-card .text-button {
+  justify-self: center;
+  padding: 4px 8px;
+  color: var(--brand);
+  background: none;
+  font-weight: 650;
+}
+
+.form-card .text-button:hover {
+  text-decoration: underline;
+}
+
+.form-card .text-button:disabled {
+  color: var(--ink-soft);
+  text-decoration: none;
+  cursor: default;
+}
+
 .footer {
   display: grid;
   grid-template-columns: minmax(200px, 1fr) minmax(0, 2fr);
