@@ -16,6 +16,13 @@
 //   PUT    /admin/stripe                     { secretKey } connect Stripe and register the webhook (super admin)
 //   DELETE /admin/stripe                     disconnect Stripe (super admin)
 //
+// The .lyr namespace (preview, lyrdns.mjs; not an ICANN TLD and not for sale yet):
+//   GET|POST /dns-query                      Lyrcloud's DNS-over-HTTPS resolver: answers .lyr, forwards the rest
+//   GET    /public/lyr/lookup?name=&type=    a .lyr name's answer as JSON (for the /lyr/ page)
+//   GET    /admin/lyr                        every .lyr name (staff)
+//   PUT    /admin/lyr/{name}                 { owner?, note?, records[] } create or update a name (super admin)
+//   DELETE /admin/lyr/{name}                 release a name (super admin)
+//
 // Money only moves one way: the customer pays Lyrcloud first, and only then does Lyrcloud buy the domain
 // from Route 53. If the registrar refuses, the payment is refunded. Route 53 auto-renew stays off; a
 // scheduled run (every 15 minutes) follows registrar operations and charges the saved card for renewals
@@ -38,6 +45,20 @@ import {
 } from '@aws-sdk/client-route-53-domains';
 import { ChangeResourceRecordSetsCommand, ListHostedZonesByNameCommand, ListResourceRecordSetsCommand, Route53Client } from '@aws-sdk/client-route-53';
 import { isStaff, roleFor } from '../account/roles.mjs';
+import {
+  answerLyr,
+  buildResponse,
+  cleanLyrName,
+  DnsFormatError,
+  fromJsonAnswers,
+  isLyrQuestion,
+  isReservedLyr,
+  lyrRecordsError,
+  parseQuery,
+  RCODE,
+  registeredLyrName,
+  TYPES,
+} from './lyrdns.mjs';
 import {
   checkoutError,
   cleanContact,
@@ -776,10 +797,140 @@ export async function tick() {
   return { checked: items.length };
 }
 
+
+// ---------------------------------------------------------------- .lyr resolver and registry
+
+const lyrKey = (name) => ({ pk: `lyr#${name}`, sk: 'lyr' });
+const UPSTREAM_DOH = env.UPSTREAM_DOH || 'https://cloudflare-dns.com/dns-query';
+const lookupLyr = async (name) => (name ? getItem(lyrKey(name)) : null);
+
+// Resolves a CNAME target outside .lyr through a public resolver's JSON API.
+async function chase(target, type) {
+  try {
+    const res = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(target)}&type=${type}`, { headers: { accept: 'application/dns-json' } });
+    return res.ok ? fromJsonAnswers((await res.json()).Answer) : [];
+  } catch {
+    return [];
+  }
+}
+
+const dnsMessage = (wire, maxAge) => ({
+  statusCode: 200,
+  headers: { 'content-type': 'application/dns-message', 'cache-control': `max-age=${maxAge}` },
+  body: wire.toString('base64'),
+  isBase64Encoded: true,
+});
+
+// RFC 8484: GET ?dns=<base64url message> or POST with an application/dns-message body.
+// Queries aren't logged: this resolver sees every name its users look up.
+async function dnsQuery(event, method) {
+  let wire;
+  if (method === 'GET') {
+    const encoded = event.queryStringParameters?.dns;
+    if (!encoded || encoded.length > 1024) return error(400, 'Send the query as ?dns=<base64url>.');
+    wire = Buffer.from(encoded, 'base64url');
+  } else {
+    const type = String(event.headers?.['content-type'] || '').split(';')[0].trim();
+    if (type !== 'application/dns-message') return error(415, 'Use Content-Type: application/dns-message.');
+    wire = Buffer.from(event.body || '', event.isBase64Encoded ? 'base64' : 'latin1');
+    if (wire.length > 4096) return error(413, 'Query too large.');
+  }
+  let query;
+  try {
+    query = parseQuery(wire);
+  } catch (err) {
+    if (err instanceof DnsFormatError) return error(400, 'Not a DNS query.');
+    throw err;
+  }
+  if (isLyrQuestion(query.qname)) {
+    if (query.opcode !== 0) return dnsMessage(buildResponse(query, { rcode: RCODE.NOTIMP }), 0);
+    const answer = await answerLyr(query, await lookupLyr(registeredLyrName(query.qname)), chase, lookupLyr);
+    return dnsMessage(buildResponse(query, answer), 60);
+  }
+  try {
+    const res = await fetch(UPSTREAM_DOH, { method: 'POST', headers: { 'content-type': 'application/dns-message', accept: 'application/dns-message' }, body: wire });
+    if (!res.ok) throw new Error(`upstream ${res.status}`);
+    return dnsMessage(Buffer.from(await res.arrayBuffer()), 0);
+  } catch {
+    return dnsMessage(buildResponse(query, { rcode: RCODE.SERVFAIL }), 0);
+  }
+}
+
+const RCODE_NAMES = Object.fromEntries(Object.entries(RCODE).map(([name, code]) => [code, name]));
+
+async function lyrLookup(event) {
+  const raw = String(event.queryStringParameters?.name || '').trim().toLowerCase().replace(/\.$/, '');
+  const qname = raw.endsWith('.lyr') ? raw : `${raw}.lyr`;
+  if (raw.includes('.') && !raw.endsWith('.lyr')) return error(400, 'This only looks up .lyr names.');
+  const type = String(event.queryStringParameters?.type || 'A').toUpperCase();
+  if (!TYPES[type] || !/^(?:[a-z0-9_*](?:[a-z0-9_-]{0,61}[a-z0-9])?\.)+lyr$/.test(qname)) return error(400, 'Ask about a name like shop.lyr.');
+  const query = { qname, qtype: TYPES[type] };
+  const answer = await answerLyr(query, await lookupLyr(registeredLyrName(qname)), chase, lookupLyr);
+  return json(200, { name: qname, type, status: RCODE_NAMES[answer.rcode], answers: answer.answers || [] });
+}
+
+const publicLyr = (item) => ({ name: item.name, owner: item.owner || null, note: item.note || null, records: item.records || [], createdAt: item.createdAt, updatedAt: item.updatedAt || null });
+
+// Stored records: full names, trimmed values; one set per name and type, and a CNAME stands alone.
+function normalizeLyrRecords(records, name) {
+  const sets = records.map((record) => ({
+    type: record.type,
+    name: recordName(record.name, name),
+    values: record.values.map((value) => String(value).trim()).filter(Boolean),
+    ttl: record.ttl ?? 300,
+  }));
+  const seen = new Set();
+  for (const set of sets) {
+    const key = `${set.name}|${set.type}`;
+    if (seen.has(key)) return [null, `There are two ${set.type} sets for ${set.name}. Put all values in one.`];
+    seen.add(key);
+  }
+  const clash = sets.find((set) => set.type === 'CNAME' && sets.some((other) => other !== set && other.name === set.name));
+  if (clash) return [null, `${clash.name} has a CNAME, so it can’t have other records.`];
+  return [sets, null];
+}
+
+async function lyrAdminRoutes(event, method, path, who) {
+  if (path === '/admin/lyr' && method === 'GET') {
+    const items = await collect(ScanCommand, { FilterExpression: '#k = :l', ExpressionAttributeNames: { '#k': 'kind' }, ExpressionAttributeValues: { ':l': 'lyr' } });
+    return json(200, { names: items.map(publicLyr).sort((a, b) => a.name.localeCompare(b.name)) });
+  }
+  const match = path.match(/^\/admin\/lyr\/([^/]+)$/);
+  if (!match) return error(404, 'not_found');
+  if (who.role !== 'superadmin') return error(403, 'Only the super admin can manage .lyr names.');
+  const name = cleanLyrName(decodeURIComponent(match[1]));
+  if (!name) return error(400, 'Use a name like shop.lyr: letters, digits and hyphens.');
+  if (method === 'DELETE') {
+    await ddb.send(new DeleteCommand({ TableName: TABLE, Key: lyrKey(name) }));
+    return json(200, { deleted: name });
+  }
+  if (method !== 'PUT') return error(404, 'not_found');
+  if (isReservedLyr(name)) return error(400, `${name} is reserved.`);
+  const body = parseJson(event);
+  if (!body) return error(400, 'Invalid JSON body.');
+  const records = body.records ?? [];
+  const refused = lyrRecordsError(records, name, recordError);
+  if (refused) return error(...refused);
+  const [sets, problem] = normalizeLyrRecords(records, name);
+  if (problem) return error(400, problem);
+  if ('owner' in body && body.owner !== null && (typeof body.owner !== 'string' || body.owner.length > 254)) return error(400, 'Owner must be an email address.');
+  if ('note' in body && body.note !== null && (typeof body.note !== 'string' || body.note.length > 300)) return error(400, 'Notes are at most 300 characters.');
+  const existing = await getItem(lyrKey(name));
+  const item = {
+    ...lyrKey(name), kind: 'lyr', name, records: sets,
+    owner: 'owner' in body ? body.owner?.trim() || null : existing?.owner || null,
+    note: 'note' in body ? body.note?.trim() || null : existing?.note || null,
+    createdAt: existing?.createdAt || now(), updatedAt: now(), updatedBy: who.userId,
+  };
+  await ddb.send(new PutCommand({ TableName: TABLE, Item: item }));
+  return json(200, { name: publicLyr(item) });
+}
+
 // ---------------------------------------------------------------- admin
 
 async function adminRoutes(event, method, path, who) {
   if (!isStaff(who.role)) return error(403, 'Admins only.');
+  if (path === '/admin/lyr' || path.startsWith('/admin/lyr/')) return lyrAdminRoutes(event, method, path, who);
   const isSuper = who.role === 'superadmin';
 
   if (path === '/admin/domains' && method === 'GET') {
@@ -886,6 +1037,8 @@ export const handler = async (event) => {
     if (path === '/public/stripe/webhook' && method === 'POST') return await stripeWebhook(event);
     if (path === '/public/domains/search' && method === 'GET') return await search(event);
     if (path === '/public/domains/prices' && method === 'GET') return await priceList();
+    if (path === '/dns-query' && (method === 'GET' || method === 'POST')) return await dnsQuery(event, method);
+    if (path === '/public/lyr/lookup' && method === 'GET') return await lyrLookup(event);
 
     const who = await caller(event);
     if (!who) return error(401, 'unauthorized');

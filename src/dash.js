@@ -1478,7 +1478,7 @@ const domains = {
   detail: null, detailError: '', detailFor: null, loadingDetail: false,
   refreshTimer: null,
 };
-const adminDomains = { data: null, pricing: null, error: '', loading: false };
+const adminDomains = { data: null, pricing: null, lyr: null, error: '', loading: false };
 
 const money = (cents) => (Number.isFinite(cents) ? `$${(cents / 100).toFixed(2)}` : '—');
 const DOMAIN_STATUS = {
@@ -1837,8 +1837,8 @@ function domainView(route) {
 async function loadAdminDomains() {
   adminDomains.loading = true;
   try {
-    const [data, pricing] = await Promise.all([domainsApi('/admin/domains'), domainsApi('/admin/domain-pricing')]);
-    Object.assign(adminDomains, { data, pricing, error: '' });
+    const [data, pricing, lyr] = await Promise.all([domainsApi('/admin/domains'), domainsApi('/admin/domain-pricing'), domainsApi('/admin/lyr')]);
+    Object.assign(adminDomains, { data, pricing, lyr: lyr.names, error: '' });
   } catch (error) {
     adminDomains.error = error.message;
   }
@@ -1912,6 +1912,7 @@ function adminDomainsTab(isSuper) {
         </tr>`).join('')}</tbody>
       </table></div>
     </section>
+    ${adminLyrPanel(isSuper)}
     <section class="panel">
       <div class="panel-head"><h2>All domains</h2><span class="muted">${data.domains.length}</span></div>
       ${data.domains.length ? `<div class="table-scroll"><table class="table">
@@ -1932,7 +1933,84 @@ function adminDomainsTab(isSuper) {
 
 const recordFor = (type, label) => domains.detail?.records?.find((record) => record.type === type && record.label === label);
 
+// ---- .lyr registry (preview): names Lyrcloud answers for itself through its own DNS resolver.
+
+// Records as editable lines: "@ A 203.0.113.10", "www CNAME target.example.net ttl=60".
+function lyrRecordLines(entry) {
+  return (entry.records || []).flatMap((record) => {
+    const label = record.name === entry.name ? '@' : record.name.slice(0, -(entry.name.length + 1));
+    return record.values.map((value) => `${label} ${record.type} ${record.type === 'TXT' ? `"${value}"` : value}${record.ttl && record.ttl !== 300 ? ` ttl=${record.ttl}` : ''}`);
+  }).join('\n');
+}
+
+function parseLyrRecords(text) {
+  const sets = new Map();
+  for (const raw of String(text).split('\n').map((line) => line.trim()).filter((line) => line && !line.startsWith('#'))) {
+    const match = raw.match(/^(\S+)\s+(A|AAAA|CNAME|MX|TXT)\s+(.+?)(?:\s+ttl=(\d+))?$/i);
+    if (!match) throw new Error(`Couldn’t read “${raw}”. Use lines like “@ A 203.0.113.10”.`);
+    const [, name, type, value, ttl] = match;
+    const key = `${name.toLowerCase()}|${type.toUpperCase()}`;
+    const set = sets.get(key) || { name: name.toLowerCase(), type: type.toUpperCase(), values: [], ttl: ttl ? Number(ttl) : 300 };
+    set.values.push(type.toUpperCase() === 'TXT' ? value.replace(/^"([\s\S]*)"$/, '$1') : value);
+    if (ttl) set.ttl = Number(ttl);
+    sets.set(key, set);
+  }
+  return [...sets.values()];
+}
+
+function adminLyrPanel(isSuper) {
+  const names = adminDomains.lyr || [];
+  return `
+    <section class="panel">
+      <div class="panel-head"><h2>.lyr names</h2><span class="status pending">◌ Preview · not for sale</span></div>
+      <p class="muted small">.lyr is Lyrcloud’s own extension. It isn’t an ICANN TLD, so these names only open on devices using Lyrcloud DNS (see <a href="/lyr/" target="_blank" rel="noopener">lyrcloud.com/lyr</a>). Changes are live within a minute.</p>
+      ${names.length ? `<div class="table-scroll"><table class="table">
+        <thead><tr><th>Name</th><th>Records</th><th>Owner</th><th></th></tr></thead>
+        <tbody>${names.map((entry) => `<tr>
+          <td class="mono"><b>${esc(entry.name)}</b>${entry.note ? `<div class="muted small">${esc(entry.note)}</div>` : ''}</td>
+          <td class="mono wrap small">${esc(lyrRecordLines(entry)).replace(/\n/g, '<br>') || '<span class="muted">none</span>'}</td>
+          <td>${esc(entry.owner || '—')}</td>
+          <td class="row tight">${isSuper ? `<button class="btn small" data-action="lyr-edit" data-name="${esc(entry.name)}">Edit</button><button class="btn small danger" data-action="lyr-delete" data-name="${esc(entry.name)}">Delete</button>` : ''}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>` : '<p class="muted">No .lyr names yet.</p>'}
+      ${isSuper ? `
+        <form class="stack" data-form="admin-lyr-save" id="lyr-form">
+          <div class="field-grid">
+            <label class="field">Name<input name="name" class="mono" placeholder="hello.lyr" required autocomplete="off" /></label>
+            <label class="field">Owner email (optional)<input name="owner" type="email" autocomplete="off" /></label>
+            <label class="field">Note (optional)<input name="note" maxlength="300" /></label>
+          </div>
+          <label class="field">Records, one per line<textarea name="records" rows="4" class="mono" placeholder="@ A 203.0.113.10&#10;www CNAME mysite.lyrcloud.app&#10;@ TXT &quot;hello from .lyr&quot;"></textarea></label>
+          <div class="row"><button class="btn primary" type="submit">Save .lyr name</button><span class="muted small">Saving an existing name replaces its records.</span></div>
+        </form>` : '<p class="muted">Only the super admin can add .lyr names.</p>'}
+    </section>`;
+}
+
 const domainClickActions = {
+  'lyr-edit': (target) => {
+    const entry = adminDomains.lyr?.find((item) => item.name === target.dataset.name);
+    const form = document.getElementById('lyr-form');
+    if (!entry || !form) return;
+    form.elements.name.value = entry.name;
+    form.elements.owner.value = entry.owner || '';
+    form.elements.note.value = entry.note || '';
+    form.elements.records.value = lyrRecordLines(entry);
+    form.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    form.elements.records.focus();
+  },
+  'lyr-delete': async (target) => {
+    if (!confirmed(target, `Delete ${target.dataset.name}? It stops resolving right away.`)) return;
+    target.disabled = true;
+    try {
+      await domainsApi(`/admin/lyr/${encodeURIComponent(target.dataset.name)}`, { method: 'DELETE' });
+      adminDomains.lyr = adminDomains.lyr.filter((item) => item.name !== target.dataset.name);
+      render();
+      toast(`${target.dataset.name} deleted`);
+    } catch (error) {
+      target.disabled = false;
+      toast(error.message);
+    }
+  },
   'domains-retry': () => {
     domains.error = '';
     domains.data = null;
@@ -1999,6 +2077,29 @@ const domainChangeActions = {
 };
 
 const domainFormActions = {
+  'admin-lyr-save': async (form, data) => {
+    const button = form.querySelector('[type="submit"]');
+    const name = String(data.get('name') || '').trim().toLowerCase().replace(/\.lyr$/, '');
+    let records;
+    try {
+      records = parseLyrRecords(data.get('records'));
+    } catch (error) {
+      return toast(error.message);
+    }
+    button.disabled = true;
+    try {
+      const { name: saved } = await domainsApi(`/admin/lyr/${encodeURIComponent(name)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ records, owner: String(data.get('owner') || '').trim() || null, note: String(data.get('note') || '').trim() || null }),
+      });
+      adminDomains.lyr = [...(adminDomains.lyr || []).filter((item) => item.name !== saved.name), saved].sort((a, b) => a.name.localeCompare(b.name));
+      render();
+      toast(`${saved.name} saved`);
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message);
+    }
+  },
   'domain-search': (form, data) => {
     const q = String(data.get('q') || '').trim();
     if (q) searchDomains(q);

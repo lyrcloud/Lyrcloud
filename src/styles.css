@@ -1938,3 +1938,88 @@ code.inline {
     grid-row: 2;
   }
 }
+
+/* .lyr preview page (lyr.js). */
+.lyr-callout {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 22px 26px;
+}
+
+.lyr-callout h2 {
+  margin: 0 0 10px;
+  font-size: 1.15rem;
+}
+
+.lyr-callout ul {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding-left: 1.2em;
+  color: var(--muted);
+}
+
+.lyr-callout b {
+  color: var(--text);
+}
+
+#lyr-lookup select {
+  min-height: 48px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--text);
+  background: var(--surface-solid);
+  font: inherit;
+}
+
+.lyr-result {
+  max-width: 760px;
+  margin: 12px auto 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.92rem;
+  overflow-wrap: anywhere;
+}
+
+.lyr-result p {
+  margin: 4px 0;
+}
+
+.lyr-result[data-state="none"] {
+  color: var(--muted);
+}
+
+.lyr-resolver {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 14px;
+  max-width: 760px;
+  margin: 0 auto 18px;
+  padding: 14px 18px;
+}
+
+.lyr-resolver span {
+  color: var(--muted);
+  font-weight: 650;
+}
+
+.lyr-resolver code {
+  flex: 1 1 260px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.lyr-teaser {
+  display: grid;
+  gap: 4px;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 18px 22px;
+  color: inherit;
+  text-decoration: none;
+}
+
+.lyr-teaser span:last-child {
+  color: var(--muted);
+}

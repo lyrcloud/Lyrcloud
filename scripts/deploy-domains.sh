@@ -8,7 +8,7 @@ set -euo pipefail
 STACK="${STACK:-lyrcloud-domains}"
 ARTIFACTS_BUCKET="${ARTIFACTS_BUCKET:-lyrcloud-deploy-artifacts}"
 
-node --test api/domains/rules.test.mjs api/domains/handler.test.mjs
+node --test api/domains/rules.test.mjs api/domains/lyrdns.test.mjs api/domains/handler.test.mjs
 
 param() {
   aws cloudformation describe-stacks --stack-name lyrcloud-account-api \
@@ -23,7 +23,7 @@ trap 'rm -rf "$work"' EXIT
 python3 - "$work/code.zip" <<'PY'
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED) as z:
-    for name in ['index', 'rules']:
+    for name in ['index', 'rules', 'lyrdns']:
         z.write(f'api/domains/{name}.mjs', f'domains/{name}.mjs')
     for name in ['roles', 'phone']:
         z.write(f'api/account/{name}.mjs', f'account/{name}.mjs')

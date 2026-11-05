@@ -7,6 +7,7 @@ import { Route53DomainsClient } from '@aws-sdk/client-route-53-domains';
 import { Route53Client } from '@aws-sdk/client-route-53';
 import { SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { readResponse, wireQuery } from './dns-test-helpers.mjs';
 
 process.env.TABLE_NAME = 'domains';
 process.env.USERS_TABLE_NAME = 'users';
@@ -191,7 +192,16 @@ Route53Client.prototype.send = async function send(command) {
 
 let stripeCalls;
 let stripeState;
-globalThis.fetch = async (url, { method, body, headers }) => {
+let upstreamQueries;
+globalThis.fetch = async (url, { method, body, headers } = {}) => {
+  const host = new URL(url).hostname;
+  if (host === 'cloudflare-dns.com') {
+    upstreamQueries.push(Buffer.from(body));
+    const reply = Buffer.from(body);
+    reply[2] |= 0x80; // echo the query back as an empty answer
+    return new Response(reply, { status: 200, headers: { 'content-type': 'application/dns-message' } });
+  }
+  if (host === 'dns.google') return new Response(JSON.stringify({ Answer: [{ name: 'target.example.net.', type: 1, TTL: 30, data: '198.51.100.7' }] }), { status: 200 });
   const path = new URL(url).pathname.replace('/v1', '');
   const params = Object.fromEntries(new URLSearchParams(body || new URL(url).search));
   stripeCalls.push({ method, path, params, key: headers.authorization });
@@ -262,6 +272,7 @@ beforeEach(() => {
   zone = [{ Name: 'wonder.com.', Type: 'NS', TTL: 172800, ResourceRecords: [{ Value: 'ns-1.awsdns-01.org.' }] }];
   stripeCalls = [];
   stripeState = { decline: false };
+  upstreamQueries = [];
 });
 
 // ---------------------------------------------------------------- tests
@@ -507,4 +518,67 @@ test('pricing is the super admin’s to change; admins see it and the sales tota
   assert.equal(admin.body.domains[0].ownerEmail, ALICE.email);
   assert.equal(admin.body.totals.revenue, 1800);
   assert.equal(admin.body.totals.cost, 1600);
+});
+
+// ---------------------------------------------------------------- .lyr
+
+function doh(wire, method = 'POST') {
+  return handler({
+    requestContext: { http: { method, path: '/dns-query' } },
+    headers: method === 'POST' ? { 'content-type': 'application/dns-message' } : {},
+    queryStringParameters: method === 'GET' ? { dns: wire.toString('base64url') } : undefined,
+    body: method === 'POST' ? wire.toString('base64') : undefined,
+    isBase64Encoded: method === 'POST',
+  });
+}
+const dohAnswer = async (name, type, method) => {
+  const res = await doh(wireQuery(name, type), method);
+  assert.equal(res.headers['content-type'], 'application/dns-message');
+  return readResponse(Buffer.from(res.body, 'base64'));
+};
+
+test('the super admin creates .lyr names; nobody else can', async () => {
+  const records = [{ type: 'A', name: '@', values: ['203.0.113.10'] }, { type: 'CNAME', name: 'www', values: ['target.example.net'] }];
+  tables.users.get(BOB.userId).role = 'admin';
+  assert.equal((await call(BOB, 'PUT', '/admin/lyr/shop', { records })).status, 403);
+  assert.equal((await call(ALICE, 'GET', '/admin/lyr')).status, 403);
+  assert.equal((await call(SUPER, 'PUT', '/admin/lyr/nic', { records })).status, 400, 'reserved');
+  assert.equal((await call(SUPER, 'PUT', '/admin/lyr/a.b', { records })).status, 400);
+  assert.equal((await call(SUPER, 'PUT', '/admin/lyr/shop', { records: [{ type: 'A', name: '@', values: ['nope'] }] })).status, 400);
+  assert.match((await call(SUPER, 'PUT', '/admin/lyr/shop', { records: [...records, { type: 'TXT', name: 'www', values: ['x'] }] })).body.error, /CNAME/);
+  const saved = await call(SUPER, 'PUT', '/admin/lyr/Shop', { records, owner: 'alice@example.com', note: 'First .lyr name' });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(saved.body.name.records.map((r) => r.name), ['shop.lyr', 'www.shop.lyr']);
+  const list = await call(BOB, 'GET', '/admin/lyr');
+  assert.deepEqual(list.body.names.map((n) => [n.name, n.owner]), [['shop.lyr', 'alice@example.com']]);
+  assert.equal((await call(SUPER, 'DELETE', '/admin/lyr/shop')).status, 200);
+  assert.equal((await call(BOB, 'GET', '/admin/lyr')).body.names.length, 0);
+});
+
+test('the DoH resolver answers .lyr from the registry and forwards everything else', async () => {
+  await call(SUPER, 'PUT', '/admin/lyr/shop', { records: [{ type: 'A', name: '@', values: ['203.0.113.10'] }, { type: 'CNAME', name: 'www', values: ['target.example.net'] }] });
+  for (const method of ['POST', 'GET']) {
+    const a = await dohAnswer('shop.lyr', 'A', method);
+    assert.deepEqual([a.rcode, a.aa, a.answers.map((r) => r.value)], [0, true, ['203.0.113.10']]);
+  }
+  const www = await dohAnswer('www.shop.lyr', 'A');
+  assert.deepEqual(www.answers.map((r) => r.value), ['target.example.net', '198.51.100.7']);
+  assert.equal((await dohAnswer('nobody.lyr', 'A')).rcode, 3);
+  assert.equal(upstreamQueries.length, 0, '.lyr never leaves Lyrcloud');
+
+  const google = await dohAnswer('www.google.com', 'A');
+  assert.equal(google.qr, true);
+  assert.equal(upstreamQueries.length, 1);
+  assert.equal(upstreamQueries[0].toString('hex'), wireQuery('www.google.com', 'A').toString('hex'), 'other names are forwarded unchanged');
+
+  assert.equal((await handler({ requestContext: { http: { method: 'POST', path: '/dns-query' } }, headers: { 'content-type': 'text/plain' }, body: 'hi' })).statusCode, 415);
+  assert.equal((await doh(Buffer.from([1, 2, 3]))).statusCode, 400);
+});
+
+test('the public lookup explains what a .lyr name resolves to', async () => {
+  await call(SUPER, 'PUT', '/admin/lyr/shop', { records: [{ type: 'TXT', name: '@', values: ['hello'] }] });
+  const txt = await call(null, 'GET', '/public/lyr/lookup', undefined, { name: 'shop.lyr', type: 'TXT' });
+  assert.deepEqual([txt.body.status, txt.body.answers[0].value], ['NOERROR', 'hello']);
+  assert.equal((await call(null, 'GET', '/public/lyr/lookup', undefined, { name: 'nobody' })).body.status, 'NXDOMAIN');
+  assert.equal((await call(null, 'GET', '/public/lyr/lookup', undefined, { name: 'google.com' })).status, 400);
 });
