@@ -448,6 +448,55 @@ const faqs = [
   ['Do you offer annual billing?', 'Yes — annual billing on Scale saves two months. Enterprise contracts are annual.'],
 ];
 
+const domainFaqs = [
+  ['What’s included with every domain?', 'Free WHOIS privacy, Lyrcloud DNS with a simple record editor, and one-click setup as a Lyrcloud website with CDN, TLS and DDoS protection.'],
+  ['How does renewal work?', 'Auto-renew is on by default: we charge the card you paid with 30 days before the domain expires, then renew it. Turn it off any time in the dashboard, or renew early for up to five years.'],
+  ['Can I move a domain I already own?', 'Yes. Unlock it at your current registrar, get its transfer (EPP) code and start a transfer in the dashboard. A transfer adds a year to the registration and usually takes 5–7 days. Your site keeps its current DNS while it moves.'],
+  ['What if the registry rejects my order?', 'You’re refunded in full, automatically. You only pay for a domain we actually register or transfer for you.'],
+  ['Why do you need my address?', 'Registries require the owner’s real contact details. They’re kept private by WHOIS privacy. Look out for a verification email after you buy and click it within 15 days, or the registry suspends the domain.'],
+];
+
+const domainsPage = {
+  route: '/domains/',
+  title: 'Domains',
+  description: 'Search, register and transfer domains with free WHOIS privacy and Lyrcloud DNS. Honest prices that stay the same at renewal.',
+  scripts: ['/src/domains.js'],
+  body: `
+    <main>
+${pageHero({
+  eyebrow: 'Domains',
+  title: 'Find the right name for what you’re building.',
+  lede: 'Register or transfer a domain with free WHOIS privacy and Lyrcloud DNS. What you pay at renewal is what you see today.',
+})}
+      <section class="section tight">
+        <form class="domain-search glass-card" id="domain-search" role="search">
+          <input name="q" id="domain-query" placeholder="Search for a domain, like mybrand.com" aria-label="Domain name" autocomplete="off" required />
+          <button class="button primary" type="submit">Search</button>
+        </form>
+        <p class="domain-status" id="domain-status" role="status" aria-live="polite"></p>
+        <div id="domain-results"></div>
+      </section>
+
+      <section class="section">
+        <div class="section-heading compact"><h2>Prices</h2><p>Per year, in US dollars. WHOIS privacy and DNS included.</p></div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr><th>Domain</th><th>Register</th><th>Renew</th><th>Transfer in</th></tr></thead>
+            <tbody id="domain-prices"><tr><td colspan="4">Loading prices…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-heading compact"><h2>Questions</h2></div>
+        <div class="faq">
+          ${domainFaqs.map(([question, answer]) => `<details><summary>${question}</summary><p>${answer}</p></details>`).join('\n          ')}
+        </div>
+      </section>
+${ctaBand('Already have a domain?', 'Put it on Lyrcloud for a global CDN, free TLS and DDoS protection, wherever it’s registered.')}
+    </main>`,
+};
+
 const pricingPage = {
   route: '/pricing/',
   title: 'Pricing',
@@ -731,6 +780,7 @@ export const pages = [
   solutionsPage,
   developersPage,
   networkPage,
+  domainsPage,
   pricingPage,
   aboutPage,
   contactPage,

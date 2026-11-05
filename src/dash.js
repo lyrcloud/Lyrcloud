@@ -2,7 +2,7 @@
 // Sign-in is real (Cognito, see src/auth.js). Websites, DNS, and settings are not backed by
 // a server yet: they live in localStorage, and analytics are generated sample data (clearly
 // labeled in the UI). DNS lookups and nameserver checks are real, using public DNS-over-HTTPS.
-import { authFetch, PROJECTS_API_BASE, redirectToLogin, SITES_DOMAIN } from './auth.js';
+import { authFetch, DOMAINS_API_BASE, PROJECTS_API_BASE, redirectToLogin, SITES_DOMAIN } from './auth.js';
 import { avatarHtml, cacheProfile, imageFileToAvatar } from './avatar.js';
 import { logo } from './logo.js';
 import { endSession, getSession } from './session.js';
@@ -278,7 +278,7 @@ function bindCharts() {
 
 const icons = {
   home: '⌂', sites: '◎', workers: '{}', projects: '⇪', settings: '⚙', overview: '▤', analytics: '📈',
-  dns: '☍', ssl: '🔒', security: '🛡', caching: '⚡', add: '+', users: '👥', plans: '★',
+  dns: '☍', ssl: '🔒', security: '🛡', caching: '⚡', add: '+', users: '👥', plans: '★', domains: '🌐',
 };
 
 const ROLE_LABELS = { superadmin: 'Super admin', admin: 'Admin', user: 'User' };
@@ -301,6 +301,7 @@ function sidebar(route) {
   const accountLinks = [
     ['#/', 'Account home', icons.home, route.view === 'home'],
     ['#/add-site', 'Add a site', icons.add, route.view === 'add-site'],
+    ...(DOMAINS_ENABLED ? [['#/domains', 'Domains', icons.domains, route.view.startsWith('domain')]] : []),
     ...(PROJECTS_ENABLED ? [['#/projects', 'Projects', icons.projects, route.view.startsWith('project')]] : []),
     ['#/workers', 'Edge Functions', icons.workers, route.view.startsWith('worker')],
     ['#/settings', 'Account settings', icons.settings, route.view === 'settings'],
@@ -704,19 +705,22 @@ const views = {
 
   projects: (route) => (PROJECTS_ENABLED ? projectsView(route) : views.missing()),
   project: (route) => (PROJECTS_ENABLED ? projectView(route) : views.missing()),
+  domains: () => domainsView(),
+  'domain-buy': (route) => domainBuyView(route),
+  domain: (route) => domainView(route),
 
   admin(route) {
     if (profileFailed) return `<section class="panel"><p class="form-error">Couldn’t load your account. Reload the page to try again.</p></section>`;
     if (!profile) return '<section class="panel"><p class="muted">Loading…</p></section>';
     if (!isStaff(profile.role)) return views.missing();
     const isSuper = profile.role === 'superadmin';
-    const tab = ['overview', 'users', ...(PROJECTS_ENABLED ? ['projects'] : []), 'settings'].includes(route.params.get('tab')) ? route.params.get('tab') : 'overview';
-    const tabs = [['overview', 'Overview'], ['users', `Users${adminUsers.list ? ` (${adminUsers.list.length})` : ''}`], ...(PROJECTS_ENABLED ? [['projects', 'Projects']] : []), ['settings', 'Site settings']]
+    const tab = ['overview', 'users', ...(PROJECTS_ENABLED ? ['projects'] : []), ...(DOMAINS_ENABLED ? ['domains'] : []), 'settings'].includes(route.params.get('tab')) ? route.params.get('tab') : 'overview';
+    const tabs = [['overview', 'Overview'], ['users', `Users${adminUsers.list ? ` (${adminUsers.list.length})` : ''}`], ...(PROJECTS_ENABLED ? [['projects', 'Projects']] : []), ...(DOMAINS_ENABLED ? [['domains', 'Domains']] : []), ['settings', 'Site settings']]
       .map(([id, label]) => `<a class="admin-tab" href="#/admin?tab=${id}"${id === tab ? ' aria-current="page"' : ''}>${label}</a>`)
       .join('');
     const body = adminUsers.error
       ? `<section class="panel"><p class="form-error">${esc(adminUsers.error)}</p><button class="btn" data-action="admin-refresh">Try again</button></section>`
-      : !adminUsers.list && tab !== 'settings' && tab !== 'projects'
+      : !adminUsers.list && tab !== 'settings' && tab !== 'projects' && tab !== 'domains'
         ? '<section class="panel"><p class="muted">Loading accounts…</p></section>'
         : adminTabs[tab](isSuper);
     return `
@@ -798,6 +802,12 @@ const zoneViews = {
 
   dns(zone) {
     const types = ['A', 'AAAA', 'CNAME', 'MX', 'TXT'];
+    // Domains bought through Lyrcloud have real DNS; send people to the records that actually resolve.
+    if (zone.registered && zone.lyrcloudDns) {
+      return `
+        ${pageHead('DNS records', `<b>${esc(zone.name)}</b> is registered with Lyrcloud and uses live Lyrcloud DNS.`)}
+        <section class="panel callout"><p>Records for this domain are live, not preview data.</p><a class="btn primary" href="#/domains/${encodeURIComponent(zone.name)}">Manage DNS records</a></section>`;
+    }
     return `
       ${pageHead('DNS records', `Manage records for <b>${esc(zone.name)}</b>. Proxied records get CDN and security; DNS-only records resolve straight to your server.`)}
       <section class="panel">
@@ -1452,6 +1462,650 @@ function adminGithubAppPanel(isSuper) {
     </section>`;
 }
 
+// ------------------------------------------------------------------ Lyrcloud Domains
+
+// Real: domains are bought from the registrar (Route 53 Domains) through the domains API once the
+// customer has paid with Stripe. Registered domains get Lyrcloud DNS, edited here with real records.
+const domainsApi = (path, options) => api(path, options, DOMAINS_API_BASE);
+const DOMAINS_ENABLED = !DOMAINS_API_BASE.endsWith('.invalid');
+
+const domains = {
+  data: null, error: '', loading: false,
+  prices: null, pricesTried: false,
+  checked: new Set(), // names the buy page already looked up, so a failed check isn't retried in a loop
+  search: null, searchError: '', searching: false, query: '',
+  check: {}, // domain -> search result for the buy page
+  detail: null, detailError: '', detailFor: null, loadingDetail: false,
+  refreshTimer: null,
+};
+const adminDomains = { data: null, pricing: null, error: '', loading: false };
+
+const money = (cents) => (Number.isFinite(cents) ? `$${(cents / 100).toFixed(2)}` : '—');
+const DOMAIN_STATUS = {
+  awaiting_payment: ['pending', 'Awaiting payment'],
+  registering: ['pending', 'Registering…'],
+  transferring: ['pending', 'Transferring…'],
+  active: ['ok', 'Active'],
+  failed: ['bad', 'Failed · refunded'],
+  expired: ['bad', 'Expired'],
+  cancelled: ['bad', 'Cancelled'],
+};
+const domainStatus = (status) => {
+  const [cls, label] = DOMAIN_STATUS[status] || ['pending', status];
+  return `<span class="status ${cls}">${cls === 'ok' ? '●' : cls === 'bad' ? '✕' : '◌'} ${esc(label)}</span>`;
+};
+const shortDate = (iso) => (iso ? new Date(iso).toLocaleDateString(undefined, { dateStyle: 'medium' }) : '—');
+
+// Countries the registrar accepts (ISO 3166-1), named in the visitor's language.
+const COUNTRY_CODES = ('AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IS IT JE JM JO JP KE KG KH KI KM KN KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW').split(' ');
+let countryOptionsCache;
+function countryOptions(selected) {
+  if (!countryOptionsCache) {
+    let names;
+    try {
+      names = new Intl.DisplayNames(undefined, { type: 'region' });
+    } catch {}
+    countryOptionsCache = COUNTRY_CODES.map((code) => [code, names?.of(code) || code]).sort((a, b) => a[1].localeCompare(b[1]));
+  }
+  return countryOptionsCache.map(([code, name]) => `<option value="${code}"${code === selected ? ' selected' : ''}>${esc(name)}</option>`).join('');
+}
+
+async function loadDomains() {
+  domains.loading = true;
+  try {
+    domains.data = await domainsApi('/domains');
+    domains.error = '';
+    syncDomainSites();
+  } catch (error) {
+    domains.error = error.message;
+  }
+  domains.loading = false;
+  if (currentRoute?.view.startsWith('domain')) render();
+}
+
+async function loadDomainPrices() {
+  if (domains.prices || domains.pricesTried) return;
+  domains.pricesTried = true;
+  try {
+    const response = await fetch(`${DOMAINS_API_BASE}/public/domains/prices`);
+    const data = await response.json();
+    if (response.ok) domains.prices = Object.fromEntries(data.tlds.map((item) => [item.tld, item]));
+  } catch {}
+  if (currentRoute?.view === 'domain-buy') render();
+}
+
+async function loadDomainDetail(name) {
+  domains.loadingDetail = true;
+  domains.detailFor = name;
+  try {
+    domains.detail = await domainsApi(`/domains/${encodeURIComponent(name)}`);
+    domains.detailError = '';
+    if (domains.detail.domain.status === 'active') syncDomainSites([domains.detail.domain]);
+  } catch (error) {
+    domains.detail = null;
+    domains.detailError = error.message;
+  }
+  domains.loadingDetail = false;
+  if (currentRoute?.view === 'domain' && currentRoute.domain === name) render();
+}
+
+async function searchDomains(query) {
+  domains.query = query;
+  domains.searching = true;
+  domains.searchError = '';
+  render();
+  try {
+    const response = await fetch(`${DOMAINS_API_BASE}/public/domains/search?q=${encodeURIComponent(query)}`);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `Search failed (${response.status})`);
+    domains.search = data;
+    for (const item of [...data.results, ...data.suggestions]) domains.check[item.domain] = item;
+  } catch (error) {
+    domains.searchError = error.message;
+  }
+  domains.searching = false;
+  render();
+}
+
+// Registered domains show up as active websites, with the registrar's real nameservers.
+function syncDomainSites(list = domains.data?.domains || []) {
+  let changed = false;
+  for (const item of list) {
+    if (item.status !== 'active') continue;
+    let zone = findZone(item.domain);
+    if (!zone) {
+      zone = createZone(item.domain, state.plan, []);
+      state.zones.push(zone);
+      changed = true;
+    }
+    if (zone.status !== 'active' || !zone.registered || String(zone.nameservers) !== String(item.nameservers)) {
+      Object.assign(zone, { status: 'active', registered: true, lyrcloudDns: item.lyrcloudDns, nameservers: item.nameservers.length ? item.nameservers : zone.nameservers });
+      changed = true;
+    }
+  }
+  if (changed) save();
+}
+
+function domainsAfterRender(route) {
+  if (!DOMAINS_ENABLED) return;
+  clearTimeout(domains.refreshTimer);
+  if (!domains.data && !domains.loading && !domains.error) loadDomains();
+  if (route.view === 'domain-buy') {
+    loadDomainPrices();
+    const name = route.params.get('domain');
+    if (name && route.params.get('action') !== 'transfer' && !domains.check[name] && !domains.checked.has(name) && !domains.searching) {
+      domains.checked.add(name);
+      searchDomains(name);
+    }
+  }
+  if (route.view === 'domain' && (domains.detailFor !== route.domain || (!domains.detail && !domains.detailError)) && !domains.loadingDetail) loadDomainDetail(route.domain);
+  // Registrations finish within minutes; keep the page fresh while one is under way.
+  const status = domains.detail?.domain?.status;
+  const confirming = status === 'awaiting_payment' && route.params.get('paid');
+  if (route.view === 'domain' && (status === 'registering' || status === 'transferring' || confirming || domains.detail?.domain?.renewing)) {
+    domains.refreshTimer = setTimeout(() => {
+      if (currentRoute.view === 'domain') loadDomainDetail(currentRoute.domain);
+    }, 20_000);
+  }
+}
+
+function domainResult(item) {
+  const buy = `#/domains/buy?domain=${encodeURIComponent(item.domain)}`;
+  const action = item.available
+    ? `<a class="btn primary small" href="${buy}">Buy</a>`
+    : item.status === 'UNAVAILABLE'
+      ? `<a class="btn small" href="${buy}&action=transfer">Transfer in</a>`
+      : item.status === 'NOT_SOLD' ? '' : `<button class="btn small" data-action="domain-search-again" data-q="${esc(item.domain)}">Check again</button>`;
+  const note = item.available
+    ? `<b>${money(item.price)}</b><small>first year · renews at ${money(item.renew)}/yr</small>`
+    : `<span class="muted">${item.status === 'UNAVAILABLE' ? 'Taken' : item.status === 'NOT_SOLD' ? `We don’t sell .${esc(item.tld)} yet` : item.status === 'DONT_KNOW' ? 'Couldn’t check right now' : 'Not available'}</span>`;
+  return `<li class="domain-result${item.available ? ' is-available' : ''}"><span class="domain-name mono">${esc(item.domain)}</span><span class="domain-price">${note}</span>${action}</li>`;
+}
+
+function domainSearchPanel() {
+  const result = domains.search;
+  return `
+    <section class="panel">
+      <form class="domain-search" data-form="domain-search" role="search">
+        <input name="q" placeholder="Find your domain, like mybrand.com" aria-label="Domain name" autocomplete="off" value="${esc(domains.query)}" required />
+        <button class="btn primary" type="submit"${domains.searching ? ' disabled' : ''}>${domains.searching ? 'Searching…' : 'Search'}</button>
+      </form>
+      ${domains.searchError ? `<p class="form-error">${esc(domains.searchError)}</p>` : ''}
+      ${result ? `
+        <ul class="domain-results">${result.results.map(domainResult).join('')}</ul>
+        ${result.suggestions.length ? `<h3 class="domain-subhead">More ideas</h3><ul class="domain-results">${result.suggestions.map(domainResult).join('')}</ul>` : ''}` : ''}
+    </section>`;
+}
+
+function domainsView() {
+  if (!DOMAINS_ENABLED) return views.missing();
+  const list = domains.data?.domains || [];
+  const table = domains.error
+    ? `<p class="form-error">${esc(domains.error)}</p><button class="btn" data-action="domains-retry">Try again</button>`
+    : !domains.data
+      ? '<p class="muted">Loading your domains…</p>'
+      : list.length
+        ? `<div class="table-scroll"><table class="table">
+            <thead><tr><th>Domain</th><th>Status</th><th>Expires</th><th>Auto-renew</th><th>Renews at</th></tr></thead>
+            <tbody>${list.map((item) => `<tr>
+              <td><a class="link mono" href="#/domains/${encodeURIComponent(item.domain)}">${esc(item.domain)}</a></td>
+              <td>${domainStatus(item.status)}</td>
+              <td>${shortDate(item.expiresAt)}</td>
+              <td>${item.status === 'active' || item.status === 'registering' || item.status === 'transferring' ? (item.autoRenew ? 'On' : 'Off') : '—'}</td>
+              <td>${item.renewPrice ? `${money(item.renewPrice)}/yr` : '—'}</td>
+            </tr>`).join('')}</tbody></table></div>`
+        : '<p class="muted">No domains yet. Search above to register one, or transfer one you already own.</p>';
+  return `
+    ${pageHead('Domains', 'Register a new domain or bring one you own. Free WHOIS privacy and Lyrcloud DNS included.')}
+    ${domains.data && !domains.data.paymentsReady ? '<p class="notice">Domain checkout opens soon — you can search and see prices now.</p>' : ''}
+    ${domainSearchPanel()}
+    <section class="panel">
+      <div class="panel-head"><h2>Your domains</h2>${list.length ? `<span class="muted">${list.length} total</span>` : ''}</div>
+      ${table}
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Transfer a domain to Lyrcloud</h2></div>
+      <p class="muted">Moving a domain adds a year to its registration. Unlock it at your current registrar and get its transfer (EPP) code first.</p>
+      <form class="row" data-form="domain-transfer-start">
+        <input class="grow" name="domain" placeholder="example.com" aria-label="Domain to transfer" required autocomplete="off" />
+        <button class="btn" type="submit">Start transfer</button>
+      </form>
+    </section>`;
+}
+
+const contactField = (name, label, value, attrs = '') =>
+  `<label class="field">${label}<input name="${name}" value="${esc(value || '')}"${attrs} /></label>`;
+
+function domainBuyView(route) {
+  if (!DOMAINS_ENABLED) return views.missing();
+  const domain = String(route.params.get('domain') || '').trim().toLowerCase();
+  const action = route.params.get('action') === 'transfer' ? 'transfer' : 'register';
+  if (!/^[a-z0-9-]+\.[a-z]{2,63}$/.test(domain)) return `${pageHead('Buy a domain')}<section class="panel"><p class="form-error">Pick a domain first.</p><a class="btn" href="#/domains">Search domains</a></section>`;
+  const tld = domain.slice(domain.indexOf('.') + 1);
+  const price = domains.prices?.[tld];
+  const check = domains.check[domain];
+  const saved = domains.data?.contact || {};
+  const person = me();
+  const [first = '', ...rest] = String(person.name || '').split(' ');
+  const contact = { firstName: first, lastName: rest.join(' '), email: person.email || '', phoneCountry: '+1', country: 'US', ...saved };
+  const paymentsReady = domains.data?.paymentsReady;
+  const cancelled = route.params.get('cancelled');
+
+  let status = '';
+  if (action === 'register') {
+    if (domains.searching && !check) status = '<p class="muted">Checking availability…</p>';
+    else if (check && !check.available) {
+      status = `<p class="form-error">${esc(domain)} isn’t available to register. ${check.status === 'UNAVAILABLE' ? `If it’s yours, <a href="#/domains/buy?domain=${encodeURIComponent(domain)}&action=transfer">transfer it in</a>.` : ''}</p>`;
+    } else if (check) status = `<p class="status ok">● ${esc(domain)} is available</p>`;
+  }
+  const years = [1, 2, 3, 4, 5]
+    .map((n) => `<option value="${n}">${n} year${n === 1 ? '' : 's'}${price ? ` · ${money(price.register + price.renew * (n - 1))}` : ''}</option>`).join('');
+  const total = price ? (action === 'transfer' ? price.transfer : price.register) : null;
+  const blocked = !paymentsReady || (action === 'register' && check && !check.available);
+
+  return `
+    ${pageHead(action === 'transfer' ? `Transfer ${esc(domain)}` : `Register ${esc(domain)}`,
+      price ? `${action === 'transfer' ? `${money(price.transfer)} including one more year` : `${money(price.register)} for the first year`} · renews at ${money(price.renew)}/yr` : domains.prices ? `Lyrcloud doesn’t sell .${esc(tld)} domains yet` : 'Loading price…',
+      '<a class="btn" href="#/domains">Back to domains</a>')}
+    ${cancelled ? '<p class="notice">Payment was cancelled. Nothing was charged — you can try again below.</p>' : ''}
+    ${domains.data && !paymentsReady ? '<p class="notice">Domain checkout opens soon. You can fill this in, but payment isn’t switched on yet.</p>' : ''}
+    <form class="panel stack domain-checkout" data-form="domain-checkout">
+      <input type="hidden" name="domain" value="${esc(domain)}" />
+      <input type="hidden" name="action" value="${action}" />
+      ${status}
+      ${action === 'register'
+        ? `<label class="field">Registration length<select name="years" data-action="domain-years">${years}</select></label>`
+        : `<label class="field">Transfer (EPP) code<input name="authCode" required autocomplete="off" placeholder="From your current registrar" /></label>
+           <p class="muted small">Before you start: unlock the domain at your current registrar and turn off its WHOIS privacy if they require it. Domains registered or transferred in the last 60 days can’t move yet. Transfers take 5–7 days; your site keeps working on its current DNS.</p>`}
+      <label class="check-row"><input type="checkbox" name="autoRenew" checked /> Renew automatically every year with the card I pay with now</label>
+
+      <fieldset class="contact-fields">
+        <legend>Registrant contact</legend>
+        <p class="muted small">Registries require the owner’s real details. They stay private: WHOIS privacy is on for free. Watch for a verification email to this address and click it within 15 days, or the registry suspends the domain.</p>
+        <div class="field-grid">
+          ${contactField('firstName', 'First name', contact.firstName, ' required autocomplete="given-name"')}
+          ${contactField('lastName', 'Last name', contact.lastName, ' required autocomplete="family-name"')}
+          ${contactField('organization', 'Company (optional)', contact.organization, ' autocomplete="organization"')}
+          ${contactField('email', 'Email', contact.email, ' type="email" required autocomplete="email"')}
+          <div class="field phone-field"><span>Phone</span><div class="row tight">
+            <input name="phoneCountry" value="${esc(contact.phoneCountry || '+1')}" aria-label="Country calling code" size="4" required />
+            <input name="phone" value="${esc(contact.phone || '')}" aria-label="Phone number" required autocomplete="tel-national" inputmode="tel" class="grow" />
+          </div></div>
+          ${contactField('address1', 'Address', contact.address1, ' required autocomplete="address-line1"')}
+          ${contactField('address2', 'Address line 2 (optional)', contact.address2, ' autocomplete="address-line2"')}
+          ${contactField('city', 'City', contact.city, ' required autocomplete="address-level2"')}
+          ${contactField('state', 'State / region', contact.state, ' autocomplete="address-level1"')}
+          ${contactField('zip', 'Postal code', contact.zip, ' required autocomplete="postal-code"')}
+          <label class="field">Country<select name="country" required autocomplete="country">${countryOptions(contact.country)}</select></label>
+        </div>
+      </fieldset>
+      <p class="form-error" hidden></p>
+      <div class="row">
+        <button class="btn primary" type="submit"${blocked ? ' disabled' : ''}>Continue to payment<span id="domain-total">${total ? ` · ${money(total)}` : ''}</span></button>
+        <span class="muted small">Secure card payment with Stripe. If the registry refuses the domain, you’re refunded in full.</span>
+      </div>
+    </form>`;
+}
+
+function recordRows(records) {
+  if (!records.length) return '<p class="muted">No records yet. Add an A record to point the domain at your server.</p>';
+  return `<div class="table-scroll"><table class="table">
+    <thead><tr><th>Type</th><th>Name</th><th>Value</th><th>TTL</th><th></th></tr></thead>
+    <tbody>${records.map((record) => `<tr>
+      <td><span class="type-tag">${record.type}</span></td>
+      <td class="mono">${esc(record.label)}</td>
+      <td class="mono wrap">${record.values.map(esc).join('<br>')}</td>
+      <td>${record.ttl ?? '—'}</td>
+      <td class="row tight">
+        <button class="btn small" data-action="record-edit" data-type="${record.type}" data-name="${esc(record.label)}">Edit</button>
+        <button class="btn small danger" data-action="record-delete" data-type="${record.type}" data-name="${esc(record.label)}">Delete</button>
+      </td>
+    </tr>`).join('')}</tbody></table></div>`;
+}
+
+function domainView(route) {
+  if (!DOMAINS_ENABLED) return views.missing();
+  const name = route.domain;
+  if (domains.detailError && domains.detailFor === name) {
+    return `${pageHead(esc(name))}<section class="panel"><p class="form-error">${esc(domains.detailError)}</p><a class="btn" href="#/domains">All domains</a></section>`;
+  }
+  const detail = domains.detailFor === name ? domains.detail : null;
+  if (!detail) return `${pageHead(esc(name))}<section class="panel"><p class="muted">Loading domain…</p></section>`;
+  const item = detail.domain;
+  const live = item.status === 'active';
+  const paid = route.params.get('paid');
+  const progress = item.status === 'registering'
+    ? 'Payment received. Registration usually finishes within 15 minutes — this page updates by itself.'
+    : item.status === 'transferring'
+      ? `Payment received. Transfers take 5–7 days. Your current registrar may email the owner to approve it; approving it there makes it faster.${item.operationMessage ? ` <span class="muted">(${esc(item.operationMessage)})</span>` : ''}`
+      : item.status === 'awaiting_payment' && paid
+        ? 'Confirming your payment with Stripe… this page updates by itself.'
+        : item.status === 'awaiting_payment'
+        ? `This domain is held for you until ${formatDate(item.holdUntil)}.${item.checkoutUrl ? ` <a href="${esc(item.checkoutUrl)}">Finish paying</a>` : ''}`
+        : '';
+  const years = [1, 2, 3].map((n) => `<option value="${n}">${n} year${n === 1 ? '' : 's'} · ${money(item.renewPrice * n)}</option>`).join('');
+  return `
+    ${pageHead(`<span class="mono">${esc(item.domain)}</span>`, `${domainStatus(item.status)}${item.expiresAt ? ` · expires ${shortDate(item.expiresAt)}` : ''}${detail.owner ? ` · owner ${esc(detail.owner)}` : ''}`,
+      `${live ? `<a class="btn" href="https://${esc(item.domain)}" target="_blank" rel="noopener">Visit ↗</a>` : ''}<a class="btn" href="#/domains">All domains</a>`)}
+    ${paid && item.status !== 'active' ? '<p class="notice">Thanks — your payment went through.</p>' : ''}
+    ${progress ? `<section class="panel callout"><p>${progress}</p></section>` : ''}
+    ${item.failureReason ? `<section class="panel"><p class="form-error">The registry didn’t accept this ${item.action === 'transfer' ? 'transfer' : 'registration'}: ${esc(item.failureReason)}. Your payment was refunded in full.</p></section>` : ''}
+    ${item.lastRenewalError ? `<section class="panel"><p class="form-error">${esc(item.lastRenewalError)}</p></section>` : ''}
+    ${live ? `
+      <div class="grid-2">
+        <section class="panel">
+          <div class="panel-head"><h2>Renewal</h2></div>
+          ${settingRow('Auto-renew', `Charges ${money(item.renewPrice)} to your saved card 30 days before the domain expires.`, toggle('domain-autorenew', item.autoRenew, 'Auto-renew'))}
+          <form class="row" data-form="domain-renew">
+            <select name="years" aria-label="Renew for">${years}</select>
+            <button class="btn" type="submit"${item.renewing ? ' disabled' : ''}>${item.renewing ? 'Renewing…' : 'Renew now'}</button>
+          </form>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><h2>Nameservers</h2>${item.lyrcloudDns ? '<span class="status ok">● Lyrcloud DNS</span>' : ''}</div>
+          <ul class="ns-list">${item.nameservers.map((ns) => `<li><code>${esc(ns)}</code></li>`).join('') || '<li class="muted">—</li>'}</ul>
+          ${findZone(item.domain) ? `<a class="link" href="#/zones/${encodeURIComponent(item.domain)}/overview">Open as a website →</a>` : ''}
+        </section>
+      </div>
+      ${item.lyrcloudDns ? `
+        <section class="panel">
+          <div class="panel-head"><h2>DNS records</h2><span class="muted">Live on Lyrcloud DNS</span></div>
+          <form class="dns-form" data-form="record-save" id="record-form">
+            <select name="type" aria-label="Type">${['A', 'AAAA', 'CNAME', 'MX', 'TXT'].map((type) => `<option>${type}</option>`).join('')}</select>
+            <input name="name" placeholder="Name (@ for root)" value="@" required aria-label="Name" />
+            <textarea name="values" rows="1" placeholder="Value (one per line)" required aria-label="Values"></textarea>
+            <select name="ttl" aria-label="TTL">${[[300, '5 min'], [3600, '1 hour'], [86400, '1 day'], [60, '1 min']].map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select>
+            <button class="btn primary" type="submit">Save record</button>
+          </form>
+          <p class="form-error" hidden></p>
+          <p class="muted small">Saving a type and name that already exist replaces them. Changes reach resolvers within the TTL.</p>
+          ${recordRows(detail.records || [])}
+        </section>`
+        : '<section class="panel"><p class="muted">This domain uses the DNS it had before the transfer. Manage records with your DNS provider.</p></section>'}` : ''}
+    ${detail.orders.length ? `
+      <section class="panel">
+        <div class="panel-head"><h2>Payments</h2></div>
+        <div class="table-scroll"><table class="table">
+          <thead><tr><th>Date</th><th>What</th><th>Amount</th><th>Status</th></tr></thead>
+          <tbody>${detail.orders.map((order) => `<tr><td>${shortDate(order.createdAt)}</td><td>${esc(order.action)}${order.auto ? ' (auto)' : ''} · ${order.years} yr</td><td>${money(order.amount)}</td><td>${esc(order.status)}${order.failureReason ? ` <span class="muted">${esc(order.failureReason)}</span>` : ''}</td></tr>`).join('')}</tbody>
+        </table></div>
+      </section>` : ''}`;
+}
+
+// ---- admin
+
+async function loadAdminDomains() {
+  adminDomains.loading = true;
+  try {
+    const [data, pricing] = await Promise.all([domainsApi('/admin/domains'), domainsApi('/admin/domain-pricing')]);
+    Object.assign(adminDomains, { data, pricing, error: '' });
+  } catch (error) {
+    adminDomains.error = error.message;
+  }
+  adminDomains.loading = false;
+  if (isAdminView()) render();
+}
+
+const overridesText = (overrides) => Object.entries(overrides || {})
+  .map(([tld, rule]) => `${tld} ${rule.percent ?? ''}${rule.percent !== undefined ? '%' : ''}${rule.flatCents !== undefined ? ` +${(rule.flatCents / 100).toFixed(2)}` : ''}`.trim()).join('\n');
+
+function parseOverrides(text) {
+  const overrides = {};
+  for (const line of String(text).split('\n').map((value) => value.trim()).filter(Boolean)) {
+    const match = line.match(/^\.?([a-z]{2,63})\s+(?:(\d+(?:\.\d+)?)%)?\s*(?:\+\s*\$?(\d+(?:\.\d+)?))?$/i);
+    if (!match || (match[2] === undefined && match[3] === undefined)) throw new Error(`Couldn’t read “${line}”. Use lines like “io 5% +2.00”.`);
+    overrides[match[1].toLowerCase()] = {
+      ...(match[2] !== undefined ? { percent: Number(match[2]) } : {}),
+      ...(match[3] !== undefined ? { flatCents: Math.round(Number(match[3]) * 100) } : {}),
+    };
+  }
+  return overrides;
+}
+
+function adminDomainsTab(isSuper) {
+  if (adminDomains.error) return `<section class="panel"><p class="form-error">${esc(adminDomains.error)}</p><button class="btn" data-action="admin-refresh">Try again</button></section>`;
+  if (!adminDomains.data) return '<section class="panel"><p class="muted">Loading domains…</p></section>';
+  const { data, pricing } = adminDomains;
+  const { config, stripe } = pricing;
+  const lock = isSuper ? '' : ' disabled';
+  const stat = (label, value) => `<div class="stat"><span>${label}</span><strong>${value}</strong></div>`;
+  return `
+    <div class="stat-grid">
+      ${stat('Domain sales', money(data.totals.revenue))}
+      ${stat('Registrar cost', money(data.totals.cost))}
+      ${stat('Card fees (est.)', money(data.totals.fees))}
+      ${stat('Profit (est.)', money(data.totals.profit))}
+    </div>
+    <section class="panel">
+      <div class="panel-head"><h2>Payments</h2>${stripe.connected ? `<span class="status ok">● Stripe ${esc(stripe.mode)} mode</span>` : '<span class="status pending">◌ Not connected</span>'}</div>
+      ${stripe.connected
+        ? `<p class="muted">Connected${stripe.account ? ` to <b>${esc(stripe.account)}</b>` : ''} on ${formatDate(stripe.connectedAt)}. ${stripe.mode === 'test' ? 'Test mode: pay with card 4242 4242 4242 4242 to try the whole checkout. Test orders are refunded automatically and never buy a real domain.' : 'Live mode: customers are charged for real and domains are registered.'}</p>`
+        : '<p class="muted">Customers can search and see prices, but checkout stays closed until Stripe is connected.</p>'}
+      ${isSuper ? `
+        <form class="row" data-form="admin-stripe">
+          <input class="grow mono" name="secretKey" type="password" autocomplete="off" placeholder="${stripe.connected ? 'Paste a new key to replace it' : 'Stripe secret key (sk_live_… or sk_test_…)'}" aria-label="Stripe secret key" required />
+          <button class="btn primary" type="submit">${stripe.connected ? 'Replace key' : 'Connect Stripe'}</button>
+          ${stripe.connected ? '<button class="btn danger" type="button" data-action="admin-stripe-disconnect">Disconnect</button>' : ''}
+        </form>
+        <p class="muted small">Find it in Stripe → Developers → API keys. Lyrcloud stores it in AWS Secrets Manager and registers its own webhook.</p>` : ''}
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Commission</h2></div>
+      <form class="stack" data-form="admin-domain-pricing">
+        <div class="field-grid">
+          <label class="field">Commission (%)<input name="percent" type="number" min="0" max="500" step="0.1" value="${config.percent}"${lock} /></label>
+          <label class="field">Plus flat fee ($ per year)<input name="flat" type="number" min="0" step="0.01" value="${(config.flatCents / 100).toFixed(2)}"${lock} /></label>
+          <label class="field">DNS hosting cost ($ per year)<input name="dns" type="number" min="0" step="0.01" value="${(config.dnsCentsPerYear / 100).toFixed(2)}"${lock} /></label>
+          <label class="check-row"><input type="checkbox" name="round99"${config.round99 ? ' checked' : ''}${lock} /> Round prices up to .99</label>
+        </div>
+        <label class="field">TLDs for sale (comma separated)<input name="tlds" class="mono" value="${esc(config.tlds.join(', '))}"${lock} /></label>
+        <label class="field">Per-TLD commission (one per line, e.g. “io 5% +2.00”)<textarea name="overrides" rows="3" class="mono"${lock}>${esc(overridesText(config.overrides))}</textarea></label>
+        ${isSuper ? '<div class="row"><button class="btn primary" type="submit">Save prices</button></div>' : '<p class="muted">Only the super admin can change prices.</p>'}
+      </form>
+      <p class="muted small">Price = (registrar cost + DNS hosting) × (1 + commission) + flat fee. Route 53 makes a DNS zone for every registration at $0.50/month; transfers keep their own DNS, so they don’t include it.</p>
+      <div class="table-scroll"><table class="table">
+        <thead><tr><th>TLD</th><th>Your cost</th><th>Register</th><th>Renew</th><th>Transfer</th><th>Card fee</th><th>Margin / yr</th></tr></thead>
+        <tbody>${pricing.tlds.map((row) => `<tr${row.sold ? '' : ' class="muted"'}>
+          <td class="mono">.${esc(row.tld)}${row.sold ? '' : ' <small>(no registrar price)</small>'}</td>
+          <td>${money(row.cost.register)}</td><td><b>${money(row.register)}</b></td><td>${money(row.renew)}</td><td>${money(row.transfer)}</td>
+          <td>${money(row.fee)}</td><td>${Number.isFinite(row.register) ? money(row.register - row.cost.register - row.fee) : '—'}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>All domains</h2><span class="muted">${data.domains.length}</span></div>
+      ${data.domains.length ? `<div class="table-scroll"><table class="table">
+        <thead><tr><th>Domain</th><th>Owner</th><th>Status</th><th>Expires</th><th>Auto-renew</th></tr></thead>
+        <tbody>${data.domains.map((item) => `<tr><td><a class="link mono" href="#/domains/${encodeURIComponent(item.domain)}">${esc(item.domain)}</a></td><td>${esc(item.ownerEmail || '—')}</td><td>${domainStatus(item.status)}</td><td>${shortDate(item.expiresAt)}</td><td>${item.autoRenew ? 'On' : 'Off'}</td></tr>`).join('')}</tbody>
+      </table></div>` : '<p class="muted">No domains sold yet.</p>'}
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Recent payments</h2></div>
+      ${data.orders.length ? `<div class="table-scroll"><table class="table">
+        <thead><tr><th>Date</th><th>Domain</th><th>What</th><th>Paid</th><th>Cost</th><th>Status</th></tr></thead>
+        <tbody>${data.orders.map((order) => `<tr><td>${shortDate(order.createdAt)}</td><td class="mono">${esc(order.domain)}</td><td>${esc(order.action)}${order.auto ? ' (auto)' : ''} · ${order.years} yr</td><td>${money(order.amount)}</td><td>${money(order.cost)}</td><td>${esc(order.status)}</td></tr>`).join('')}</tbody>
+      </table></div>` : '<p class="muted">No payments yet.</p>'}
+    </section>`;
+}
+
+// ---- actions
+
+const recordFor = (type, label) => domains.detail?.records?.find((record) => record.type === type && record.label === label);
+
+const domainClickActions = {
+  'domains-retry': () => {
+    domains.error = '';
+    domains.data = null;
+    render();
+  },
+  'domain-search-again': (target) => searchDomains(target.dataset.q),
+  'record-edit': (target) => {
+    const record = recordFor(target.dataset.type, target.dataset.name);
+    const form = document.getElementById('record-form');
+    if (!record || !form) return;
+    form.elements.type.value = record.type;
+    form.elements.name.value = record.label;
+    form.elements.values.value = record.values.join('\n');
+    form.elements.values.rows = Math.min(6, record.values.length);
+    if ([...form.elements.ttl.options].some((option) => Number(option.value) === record.ttl)) form.elements.ttl.value = String(record.ttl);
+    form.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    form.elements.values.focus();
+  },
+  'record-delete': async (target) => {
+    if (!confirmed(target, `Delete the ${target.dataset.type} record for ${target.dataset.name}?`)) return;
+    target.disabled = true;
+    try {
+      await domainsApi(`/domains/${encodeURIComponent(currentRoute.domain)}/records?type=${encodeURIComponent(target.dataset.type)}&name=${encodeURIComponent(target.dataset.name)}`, { method: 'DELETE' });
+      toast('Record deleted');
+      loadDomainDetail(currentRoute.domain);
+    } catch (error) {
+      target.disabled = false;
+      toast(error.message);
+    }
+  },
+  'admin-stripe-disconnect': async (target) => {
+    if (!confirmed(target, 'Disconnect Stripe? Checkout closes and auto-renewals stop charging until you connect again.')) return;
+    target.disabled = true;
+    try {
+      await domainsApi('/admin/stripe', { method: 'DELETE' });
+      toast('Stripe disconnected');
+      loadAdminDomains();
+    } catch (error) {
+      target.disabled = false;
+      toast(error.message);
+    }
+  },
+};
+
+const domainChangeActions = {
+  'domain-autorenew': async (target) => {
+    target.disabled = true;
+    try {
+      const { domain } = await domainsApi(`/domains/${encodeURIComponent(currentRoute.domain)}`, { method: 'PUT', body: JSON.stringify({ autoRenew: target.checked }) });
+      domains.detail.domain = { ...domains.detail.domain, ...domain };
+      toast(`Auto-renew ${target.checked ? 'on' : 'off'}`);
+    } catch (error) {
+      target.checked = !target.checked;
+      toast(error.message);
+    }
+    target.disabled = false;
+  },
+  'domain-years': (target) => {
+    const tld = target.form.elements.domain.value.split('.').slice(1).join('.');
+    const price = domains.prices?.[tld];
+    const node = document.getElementById('domain-total');
+    if (price && node) node.textContent = ` · ${money(price.register + price.renew * (Number(target.value) - 1))}`;
+  },
+};
+
+const domainFormActions = {
+  'domain-search': (form, data) => {
+    const q = String(data.get('q') || '').trim();
+    if (q) searchDomains(q);
+  },
+  'domain-transfer-start': (form, data) => {
+    const domain = String(data.get('domain') || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, '');
+    if (!/^[a-z0-9-]+\.[a-z]{2,63}$/.test(domain)) return toast('Enter a domain like example.com');
+    go(`#/domains/buy?domain=${encodeURIComponent(domain)}&action=transfer`);
+  },
+  'domain-checkout': async (form, data) => {
+    const button = form.querySelector('[type="submit"]');
+    const action = String(data.get('action'));
+    const contact = Object.fromEntries(['firstName', 'lastName', 'organization', 'email', 'phoneCountry', 'phone', 'address1', 'address2', 'city', 'state', 'zip', 'country']
+      .map((key) => [key, String(data.get(key) || '').trim()]).filter(([, value]) => value));
+    const body = {
+      action,
+      domain: String(data.get('domain')),
+      years: action === 'register' ? Number(data.get('years')) : 1,
+      autoRenew: data.get('autoRenew') === 'on',
+      contact,
+      ...(action === 'transfer' ? { authCode: String(data.get('authCode') || '').trim() } : {}),
+    };
+    button.disabled = true;
+    const label = button.innerHTML;
+    button.textContent = 'Opening secure payment…';
+    try {
+      const { url } = await domainsApi('/domains/checkout', { method: 'POST', body: JSON.stringify(body) });
+      domains.data = null; // the hold and saved contact show up when they come back
+      location.href = url;
+    } catch (error) {
+      button.disabled = false;
+      button.innerHTML = label;
+      showFormError(form, error.message);
+    }
+  },
+  'domain-renew': async (form, data) => {
+    const button = form.querySelector('[type="submit"]');
+    button.disabled = true;
+    try {
+      const { url } = await domainsApi('/domains/checkout', { method: 'POST', body: JSON.stringify({ action: 'renew', domain: currentRoute.domain, years: Number(data.get('years')) }) });
+      location.href = url;
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message);
+    }
+  },
+  'record-save': async (form, data) => {
+    const button = form.querySelector('[type="submit"]');
+    const record = {
+      type: String(data.get('type')),
+      name: String(data.get('name') || '@').trim(),
+      values: String(data.get('values') || '').split('\n').map((value) => value.trim()).filter(Boolean),
+      ttl: Number(data.get('ttl')),
+    };
+    button.disabled = true;
+    try {
+      await domainsApi(`/domains/${encodeURIComponent(currentRoute.domain)}/records`, { method: 'PUT', body: JSON.stringify(record) });
+      toast(`${record.type} record saved`);
+      loadDomainDetail(currentRoute.domain);
+    } catch (error) {
+      button.disabled = false;
+      showFormError(form, error.message);
+    }
+  },
+  'admin-stripe': async (form, data) => {
+    const button = form.querySelector('[type="submit"]');
+    button.disabled = true;
+    try {
+      const result = await domainsApi('/admin/stripe', { method: 'PUT', body: JSON.stringify({ secretKey: String(data.get('secretKey')).trim() }) });
+      toast(`Stripe connected in ${result.mode} mode`);
+      loadAdminDomains();
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message);
+    }
+  },
+  'admin-domain-pricing': async (form, data) => {
+    const button = form.querySelector('[type="submit"]');
+    let body;
+    try {
+      body = {
+        percent: Number(data.get('percent')),
+        flatCents: Math.round(Number(data.get('flat')) * 100),
+        dnsCentsPerYear: Math.round(Number(data.get('dns')) * 100),
+        round99: data.get('round99') === 'on',
+        tlds: String(data.get('tlds')).split(/[\s,]+/).map((tld) => tld.replace(/^\./, '').toLowerCase()).filter(Boolean),
+        overrides: parseOverrides(data.get('overrides')),
+      };
+    } catch (error) {
+      return toast(error.message);
+    }
+    button.disabled = true;
+    try {
+      adminDomains.pricing = await domainsApi('/admin/domain-pricing', { method: 'PUT', body: JSON.stringify(body) });
+      domains.prices = null;
+      domains.pricesTried = false;
+      render();
+      toast('Domain prices saved');
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message);
+    }
+  },
+};
+
+adminTabs.domains = adminDomainsTab;
+
 // ------------------------------------------------------------------ routing
 
 function parseRoute() {
@@ -1461,6 +2115,8 @@ function parseRoute() {
   if (parts[0] === 'zones' && parts[1]) return { view: 'zone', zone: parts[1], tab: parts[2] || 'overview', params };
   if (parts[0] === 'workers' && parts[1]) return { view: 'worker', worker: parts[1], params };
   if (parts[0] === 'projects' && parts[1]) return { view: 'project', projectId: parts[1], params };
+  if (parts[0] === 'domains' && parts[1] === 'buy') return { view: 'domain-buy', params };
+  if (parts[0] === 'domains' && parts[1]) return { view: 'domain', domain: parts[1].toLowerCase(), params };
   if (parts[0] && views[parts[0]]) return { view: parts[0], params };
   return { view: parts.length ? 'missing' : 'home', params };
 }
@@ -1479,11 +2135,13 @@ function render() {
   bindCharts();
   if (currentRoute.view === 'settings') showProfile();
   if (PROJECTS_ENABLED && currentRoute.view.startsWith('project')) projectsAfterRender(currentRoute);
+  if (currentRoute.view.startsWith('domain')) domainsAfterRender(currentRoute);
   if (isAdminView() && profile && isStaff(profile.role)) {
     if (!adminUsers.list && !adminUsers.loading && !adminUsers.error) loadUsers();
     if (currentRoute.params.get('tab') === 'settings' && !adminSettings.data && !adminSettings.loading) loadAdminSettings();
     if (PROJECTS_ENABLED && currentRoute.params.get('tab') === 'settings' && !adminGithubApp.data && !adminGithubApp.loading) loadAdminGithubApp();
     if (PROJECTS_ENABLED && currentRoute.params.get('tab') === 'projects' && !adminProjects.list && !adminProjects.loading) loadAdminProjects();
+    if (DOMAINS_ENABLED && currentRoute.params.get('tab') === 'domains' && !adminDomains.data && !adminDomains.loading && !adminDomains.error) loadAdminDomains();
     applyAdminSearch();
   }
   document.title = `${document.querySelector('.page-head h1')?.textContent || 'Dashboard'} | Lyrcloud`;
@@ -1766,6 +2424,8 @@ const clickActions = {
   },
   'zone-upgrade': () => updateZone((zone) => { zone.plan = 'scale'; zone.security.managedWaf = true; }, 'Upgraded this site to Scale: managed WAF rules are on'),
   'admin-refresh': () => {
+    adminDomains.data = null;
+    adminDomains.error = '';
     adminUsers.list = null;
     adminUsers.error = '';
     adminSettings.data = null;
@@ -2118,6 +2778,10 @@ const formActions = {
   },
   'preview-worker': (form, data) => runPreview(String(data.get('method')), String(data.get('path'))),
 };
+
+Object.assign(clickActions, domainClickActions);
+Object.assign(changeActions, domainChangeActions);
+Object.assign(formActions, domainFormActions);
 
 app.addEventListener('click', (event) => {
   // Any click outside the account menu closes it.

@@ -45,6 +45,17 @@ The dashboard itself is not backed by a server yet:
 - **Real:** adding a site scans its existing DNS records over public DNS-over-HTTPS (dns.google), and “Check nameservers” looks up the domain’s live NS records. The Edge Functions preview runs code in an isolated Web Worker in the browser.
 - **Preview only:** websites, DNS records, functions, and settings are stored in the visitor’s browser (localStorage). Analytics and security events are generated sample data and labeled as such.
 
+## Domains
+
+Lyrcloud resells domains through Route 53 Domains, with its own commission on top, paid with Stripe. The public search and price list are at `/domains/` (`src/domains.js`); buying, transfers, renewals and DNS records are in the dashboard (`/dash/#/domains`), and prices, payments and sales are in the admin console's Domains tab.
+
+- **Backend:** `api/domains/` in the `lyrcloud-domains` stack (`infra/aws/domains.yml`, table `lyrcloud-domains`). Deploy with `bash scripts/deploy-domains.sh`; `DOMAINS_API_BASE` in `src/auth.js` points at its API.
+- **Money first:** checkout holds the name for 35 minutes and opens Stripe Checkout. Only when Stripe's webhook confirms the payment does the API call `RegisterDomain`/`TransferDomain`; if the registrar refuses (straight away or later), the payment is refunded automatically. In Stripe **test mode** paid orders are always refunded and never reach the registrar, so the flow can be tried without buying real domains.
+- **Renewals:** Route 53 auto-renew is off. A scheduled run every 15 minutes follows registrar operations and, 30 days before expiry, charges the saved card off-session for auto-renewing domains, then calls `RenewDomain`. Failed charges are retried daily and shown on the domain.
+- **Prices:** customer price = (Route 53 price + DNS hosting) × (1 + commission %) + flat fee, optionally rounded up to .99, never below cost. DNS hosting (default $6/yr, a Route 53 hosted zone) applies to registrations and their renewals; transfers keep their own DNS. The super admin sets the commission, TLD list and per-TLD overrides in the admin console.
+- **Stripe:** the super admin pastes a secret key in the admin console; the API checks it, registers its own webhook (`/public/stripe/webhook`) and keeps both in the `lyrcloud/stripe` secret.
+- **DNS:** registered domains get a Route 53 hosted zone; owners edit A, AAAA, CNAME, MX and TXT records in the dashboard, and the domain shows up as an active website.
+
 ## Theme
 
 Light by default; dark when the visitor’s OS prefers dark. Colors are tokens on `:root` in `src/styles.css`.

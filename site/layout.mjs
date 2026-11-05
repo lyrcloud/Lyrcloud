@@ -46,6 +46,7 @@ function header(active) {
         ${navLink('/solutions/', 'Solutions', active)}
         ${navLink('/developers/', 'Developers', active)}
         ${navLink('/network/', 'Network', active)}
+        ${navLink('/domains/', 'Domains', active)}
         ${navLink('/pricing/', 'Pricing', active)}
       </nav>
       <div class="header-actions">

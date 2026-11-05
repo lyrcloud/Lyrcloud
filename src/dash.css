@@ -1699,3 +1699,128 @@ a.stat:hover {
     width: 100%;
   }
 }
+
+/* ---------------------------------------------------------------- domains */
+
+.notice {
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--brand) 35%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--brand) 9%, transparent);
+}
+
+.domain-search {
+  display: flex;
+  gap: 10px;
+}
+
+.domain-search input {
+  flex: 1;
+  min-width: 0;
+  font-size: 1rem;
+}
+
+.domain-results {
+  display: grid;
+  gap: 8px;
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.domain-result {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.domain-result.is-available {
+  border-color: color-mix(in srgb, var(--success) 45%, var(--line));
+}
+
+.domain-result .domain-name {
+  overflow-wrap: anywhere;
+  font-weight: 700;
+}
+
+.domain-price {
+  display: grid;
+  justify-items: end;
+  text-align: right;
+}
+
+.domain-price small,
+.small {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.domain-subhead {
+  margin: 20px 0 0;
+  font-size: 0.95rem;
+}
+
+.contact-fields {
+  margin: 0;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+
+.contact-fields legend {
+  padding: 0 6px;
+  font-weight: 700;
+}
+
+.field-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0 14px;
+}
+
+.field-grid .field {
+  max-width: none;
+}
+
+.phone-field {
+  font-weight: 650;
+}
+
+.row.tight {
+  gap: 6px;
+  flex-wrap: nowrap;
+}
+
+.phone-field input[name="phoneCountry"] {
+  width: 4.5em;
+}
+
+.domain-checkout .field {
+  margin-bottom: 0;
+}
+
+.dns-form textarea {
+  min-height: 38px;
+  resize: vertical;
+}
+
+@media (max-width: 560px) {
+  .domain-search {
+    flex-direction: column;
+  }
+
+  .domain-result {
+    grid-template-columns: 1fr auto;
+  }
+
+  .domain-result .domain-price {
+    justify-items: start;
+    text-align: left;
+    grid-row: 2;
+  }
+}

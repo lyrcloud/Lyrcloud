@@ -17,6 +17,8 @@ export const ACCOUNT_API_BASE = 'https://wcqz7ix4t7.execute-api.us-east-1.amazon
 // Lyrcloud Projects (import, build and host git repositories); the lyrcloud-projects stack's API.
 export const PROJECTS_API_BASE = 'https://projects-api.invalid';
 export const SITES_DOMAIN = 'lyrcloud.app';
+// Lyrcloud Domains (search, register, transfer and renew domains); the lyrcloud-domains stack's API.
+export const DOMAINS_API_BASE = 'https://uqp5mc2gq0.execute-api.us-east-1.amazonaws.com';
 
 const REDIRECT_URI = `${location.origin}/callback.html`;
 const LOGOUT_URI = `${location.origin}/index.html`;
