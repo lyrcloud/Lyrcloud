@@ -1,3 +1,5 @@
+import { worldMapSvg } from '../src/cloud-map.js';
+import { CATALOG_DATE, CONTINENT_NAMES, continentOf, PROVIDERS, REGIONS } from '../src/clouds.js';
 import { logo } from '../src/logo.js';
 import { escape } from './layout.mjs';
 import { products } from './products.mjs';
@@ -390,10 +392,32 @@ const regions = [
   ['North America', 54], ['Latin America', 23], ['Europe', 48], ['Middle East & Africa', 21], ['Asia Pacific', 38],
 ];
 
+// Cloud regions directory: one row per city, with each provider's region codes there.
+function regionDirectory() {
+  return CONTINENT_NAMES.map((continent) => {
+    const here = REGIONS.filter((region) => continentOf(region.country) === continent);
+    const cities = new Map();
+    for (const region of here) {
+      const key = `${region.city}|${region.country}`;
+      if (!cities.has(key)) cities.set(key, { city: region.city, country: region.country, regions: [] });
+      cities.get(key).regions.push(region);
+    }
+    const rows = [...cities.values()].sort((a, b) => a.country.localeCompare(b.country) || a.city.localeCompare(b.city));
+    return `
+          <details class="region-group"${continent === 'North America' ? ' open' : ''}>
+            <summary><b>${continent}</b><span>${here.length} regions</span></summary>
+            <ul class="region-rows">
+              ${rows.map((row) => `<li data-providers="${[...new Set(row.regions.map((r) => r.provider))].join(' ')}"><span class="region-city">${escape(row.city)} <small>${row.country}</small></span><span class="region-codes">${row.regions.map((r) => `<code class="provider-${r.provider}" title="${escape(PROVIDERS.find((p) => p.id === r.provider).fullName)}${r.optIn ? ' (opt-in region)' : ''}">${escape(r.code)}</code>`).join('')}</span></li>`).join('\n              ')}
+            </ul>
+          </details>`;
+  }).join('');
+}
+
 const networkPage = {
   route: '/network/',
   title: 'Global network',
-  description: 'Lyrcloud runs every product in 180+ cities across six continents.',
+  description: 'Lyrcloud runs every product in 180+ cities across six continents, and builds clusters in any cloud region you choose.',
+  scripts: ['/src/regions.js'],
   body: `
     <main>
 ${pageHero({
@@ -419,6 +443,22 @@ ${pageHero({
         <ul class="city-list">
           ${cities.map(([name]) => `<li>${name}</li>`).join('')}
         </ul>
+      </section>
+
+      <section class="section" id="cloud-regions">
+        <div class="section-heading compact">
+          <h2>Every major cloud, on one map</h2>
+          <p>${REGIONS.length} data center regions from ${PROVIDERS.length} providers. Connect your own cloud account and Lyrcloud builds Kubernetes or serverless container clusters in the region you pick — AWS today, the others next.</p>
+        </div>
+        <div class="provider-filter" role="group" aria-label="Show providers">
+          ${PROVIDERS.map((provider) => `<label class="provider-chip"><input type="checkbox" value="${provider.id}" checked /><i style="background:${provider.color}"></i>${provider.name} <small>${provider.regions.length}${provider.provisioning ? ' · clusters' : ''}</small></label>`).join('\n          ')}
+        </div>
+        <div class="network-map glass-card cloud-map">
+          ${worldMapSvg(REGIONS)}
+        </div>
+        <div class="region-directory">${regionDirectory()}
+        </div>
+        <p class="region-note">Region lists as of ${CATALOG_DATE}. Some AWS regions are opt-in and must be enabled in your AWS account first.</p>
       </section>
 ${ctaBand()}
     </main>`,

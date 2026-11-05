@@ -2,7 +2,10 @@
 // Sign-in is real (Cognito, see src/auth.js). Websites, DNS, and settings are not backed by
 // a server yet: they live in localStorage, and analytics are generated sample data (clearly
 // labeled in the UI). DNS lookups and nameserver checks are real, using public DNS-over-HTTPS.
-import { authFetch, DOMAINS_API_BASE, PROJECTS_API_BASE, redirectToLogin, SITES_DOMAIN } from './auth.js';
+import { authFetch, CLOUD_API_BASE, DOMAINS_API_BASE, PROJECTS_API_BASE, redirectToLogin, SITES_DOMAIN } from './auth.js';
+import { worldMapSvg } from './cloud-map.js';
+import { clusterEstimate, NODE_TYPES, serviceEstimate, SERVICE_SIZES } from './cloud-pricing.js';
+import { CATALOG_DATE, CONTINENT_NAMES, continentOf, findRegion, PROVIDERS, REGIONS } from './clouds.js';
 import { avatarHtml, cacheProfile, imageFileToAvatar } from './avatar.js';
 import { logo } from './logo.js';
 import { endSession, getSession } from './session.js';
@@ -278,7 +281,7 @@ function bindCharts() {
 
 const icons = {
   home: '⌂', sites: '◎', workers: '{}', projects: '⇪', settings: '⚙', overview: '▤', analytics: '📈',
-  dns: '☍', ssl: '🔒', security: '🛡', caching: '⚡', add: '+', users: '👥', plans: '★', domains: '🌐',
+  dns: '☍', ssl: '🔒', security: '🛡', caching: '⚡', add: '+', users: '👥', plans: '★', domains: '🌐', cloud: '☁',
 };
 
 const ROLE_LABELS = { superadmin: 'Super admin', admin: 'Admin', user: 'User' };
@@ -302,6 +305,7 @@ function sidebar(route) {
     ['#/', 'Account home', icons.home, route.view === 'home'],
     ['#/add-site', 'Add a site', icons.add, route.view === 'add-site'],
     ...(DOMAINS_ENABLED ? [['#/domains', 'Domains', icons.domains, isDomainView(route.view)]] : []),
+    ...(CLOUD_ENABLED ? [['#/cloud', 'Cloud', icons.cloud, isCloudView(route.view)]] : []),
     ...(PROJECTS_ENABLED ? [['#/projects', 'Projects', icons.projects, route.view.startsWith('project')]] : []),
     ['#/workers', 'Edge Functions', icons.workers, route.view.startsWith('worker')],
     ['#/settings', 'Account settings', icons.settings, route.view === 'settings'],
@@ -709,19 +713,21 @@ const views = {
   'domain-buy': (route) => domainBuyView(route),
   domain: (route) => domainView(route),
   subdomain: (route) => subdomainView(route),
+  cloud: () => cloudView(),
+  'cloud-cluster': (route) => cloudClusterView(route),
 
   admin(route) {
     if (profileFailed) return `<section class="panel"><p class="form-error">Couldn’t load your account. Reload the page to try again.</p></section>`;
     if (!profile) return '<section class="panel"><p class="muted">Loading…</p></section>';
     if (!isStaff(profile.role)) return views.missing();
     const isSuper = profile.role === 'superadmin';
-    const tab = ['overview', 'users', ...(PROJECTS_ENABLED ? ['projects'] : []), ...(DOMAINS_ENABLED ? ['domains'] : []), 'settings'].includes(route.params.get('tab')) ? route.params.get('tab') : 'overview';
-    const tabs = [['overview', 'Overview'], ['users', `Users${adminUsers.list ? ` (${adminUsers.list.length})` : ''}`], ...(PROJECTS_ENABLED ? [['projects', 'Projects']] : []), ...(DOMAINS_ENABLED ? [['domains', 'Domains']] : []), ['settings', 'Site settings']]
+    const tab = ['overview', 'users', ...(PROJECTS_ENABLED ? ['projects'] : []), ...(DOMAINS_ENABLED ? ['domains'] : []), ...(CLOUD_ENABLED ? ['cloud'] : []), 'settings'].includes(route.params.get('tab')) ? route.params.get('tab') : 'overview';
+    const tabs = [['overview', 'Overview'], ['users', `Users${adminUsers.list ? ` (${adminUsers.list.length})` : ''}`], ...(PROJECTS_ENABLED ? [['projects', 'Projects']] : []), ...(DOMAINS_ENABLED ? [['domains', 'Domains']] : []), ...(CLOUD_ENABLED ? [['cloud', 'Cloud']] : []), ['settings', 'Site settings']]
       .map(([id, label]) => `<a class="admin-tab" href="#/admin?tab=${id}"${id === tab ? ' aria-current="page"' : ''}>${label}</a>`)
       .join('');
     const body = adminUsers.error
       ? `<section class="panel"><p class="form-error">${esc(adminUsers.error)}</p><button class="btn" data-action="admin-refresh">Try again</button></section>`
-      : !adminUsers.list && tab !== 'settings' && tab !== 'projects' && tab !== 'domains'
+      : !adminUsers.list && tab !== 'settings' && tab !== 'projects' && tab !== 'domains' && tab !== 'cloud'
         ? '<section class="panel"><p class="muted">Loading accounts…</p></section>'
         : adminTabs[tab](isSuper);
     return `
@@ -2410,6 +2416,432 @@ const domainFormActions = {
 
 adminTabs.domains = adminDomainsTab;
 
+// ------------------------------------------------------------------ Lyrcloud Cloud
+
+// Real: clusters and services are built with CloudFormation in the customer's own AWS account, through
+// the LyrcloudAccess role they create. The region map covers every major provider (src/clouds.js).
+const cloudApi = (path, options) => api(path, options, CLOUD_API_BASE);
+const CLOUD_ENABLED = !CLOUD_API_BASE.endsWith('.invalid');
+const isCloudView = (view) => view === 'cloud' || view === 'cloud-cluster';
+
+const cloud = { data: null, error: '', loading: false, detail: null, detailError: '', detailFor: null, loadingDetail: false, editing: null, timer: null };
+const adminCloud = { data: null, error: '', loading: false };
+
+const usd = (value) => (Number.isFinite(value) ? `$${value.toFixed(2)}` : '—');
+const CLOUD_BUSY = ['creating', 'updating', 'deleting'];
+const CLOUD_STATUS = {
+  creating: ['pending', 'Creating…'], updating: ['pending', 'Updating…'], deleting: ['pending', 'Deleting…'],
+  ready: ['ok', 'Ready'], failed: ['bad', 'Failed'], delete_failed: ['bad', 'Couldn’t delete'], deleted: ['bad', 'Deleted'],
+};
+const cloudStatus = (status) => {
+  const [cls, label] = CLOUD_STATUS[status] || ['pending', status];
+  return `<span class="status ${cls}">${cls === 'ok' ? '●' : cls === 'bad' ? '✕' : '◌'} ${esc(label)}</span>`;
+};
+const regionLabel = (provider, code) => {
+  const region = findRegion(provider, code);
+  return region ? `${region.city} · <span class="mono">${esc(code)}</span>` : `<span class="mono">${esc(code)}</span>`;
+};
+const estimateLines = (estimate) => `
+  <ul class="estimate-lines">${estimate.lines.map(([label, value]) => `<li><span>${esc(label)}</span><b>${usd(value)}</b></li>`).join('')}
+    <li class="estimate-total"><span>About per month</span><b>${usd(estimate.monthly)}</b></li></ul>`;
+
+async function loadCloud() {
+  cloud.loading = true;
+  try {
+    cloud.data = await cloudApi('/cloud');
+    cloud.error = '';
+  } catch (error) {
+    cloud.error = error.message;
+  }
+  cloud.loading = false;
+  if (isCloudView(currentRoute?.view)) render();
+}
+
+async function loadCloudCluster(id) {
+  cloud.loadingDetail = true;
+  cloud.detailFor = id;
+  try {
+    cloud.detail = await cloudApi(`/cloud/clusters/${encodeURIComponent(id)}`);
+    cloud.detailError = '';
+  } catch (error) {
+    cloud.detail = null;
+    cloud.detailError = error.message;
+  }
+  cloud.loadingDetail = false;
+  if (currentRoute?.view === 'cloud-cluster' && currentRoute.clusterId === id) render();
+}
+
+function cloudAfterRender(route) {
+  if (!CLOUD_ENABLED) return;
+  clearTimeout(cloud.timer);
+  if (!cloud.data && !cloud.loading && !cloud.error) loadCloud();
+  if (route.view === 'cloud-cluster' && (cloud.detailFor !== route.clusterId || (!cloud.detail && !cloud.detailError)) && !cloud.loadingDetail) loadCloudCluster(route.clusterId);
+  // CloudFormation takes minutes; refresh while anything is changing.
+  const busy = route.view === 'cloud-cluster'
+    ? cloud.detail && (CLOUD_BUSY.includes(cloud.detail.cluster.status) || cloud.detail.services.some((s) => CLOUD_BUSY.includes(s.status)))
+    : cloud.data?.clusters.some((c) => CLOUD_BUSY.includes(c.status));
+  if (busy) {
+    cloud.timer = setTimeout(() => {
+      if (currentRoute.view === 'cloud-cluster') loadCloudCluster(currentRoute.clusterId);
+      else if (currentRoute.view === 'cloud') loadCloud();
+    }, 15_000);
+  }
+  updateClusterEstimate();
+}
+
+function regionOptions() {
+  const aws = REGIONS.filter((region) => region.provider === 'aws');
+  return CONTINENT_NAMES.map((continent) => {
+    const here = aws.filter((region) => continentOf(region.country) === continent);
+    return here.length ? `<optgroup label="${esc(continent)}">${here.map((region) => `<option value="${region.code}"${region.code === 'us-east-1' ? ' selected' : ''}>${esc(region.city)} (${region.code})${region.optIn ? ' · opt-in' : ''}</option>`).join('')}</optgroup>` : '';
+  }).join('');
+}
+
+function connectionPanel(connection) {
+  if (!connection) {
+    return `
+      <section class="panel">
+        <div class="panel-head"><h2>Connect your AWS account</h2></div>
+        <p class="muted">Lyrcloud builds clusters in <b>your</b> AWS account, so you own them and AWS bills you directly. You create one role that lets Lyrcloud in; delete it any time to cut access.</p>
+        <button class="btn primary" data-action="cloud-connect">Connect AWS</button>
+      </section>`;
+  }
+  if (connection.status === 'connected') {
+    return `
+      <section class="panel">
+        <div class="panel-head"><h2>AWS account</h2><span class="status ok">● Connected</span></div>
+        ${settingRow('Account', `Lyrcloud signs in through the <span class="mono">LyrcloudAccess</span> role with your connection ID.`, `<span class="mono">${esc(connection.accountId)}</span>`)}
+        ${settingRow('Disconnect', 'Delete your clusters first. To cut access completely, also delete the lyrcloud-access stack in your AWS account.', '<button class="btn" data-action="cloud-disconnect">Disconnect</button>')}
+      </section>`;
+  }
+  return `
+    <section class="panel">
+      <div class="panel-head"><h2>Connect your AWS account</h2><span class="status pending">◌ Waiting for you</span></div>
+      <ol class="steps-list">
+        <li><b>Create the access role.</b> <a class="btn small primary" href="${esc(connection.launchUrl)}" target="_blank" rel="noopener">Open AWS setup ↗</a><br>
+          <span class="muted small">Sign in to your AWS account, tick “I acknowledge that AWS CloudFormation might create IAM resources with custom names”, and click <b>Create stack</b>. Your connection ID <code>${esc(connection.externalId)}</code> is already filled in.</span></li>
+        <li><b>Paste the role here</b> once the stack says CREATE_COMPLETE: its <b>Outputs</b> tab shows <span class="mono">RoleArn</span>, or just enter your 12-digit account ID.
+          <form class="row" data-form="cloud-connect-finish">
+            <input class="grow mono" name="roleArn" placeholder="arn:aws:iam::123456789012:role/LyrcloudAccess" required autocomplete="off" />
+            <button class="btn primary" type="submit">Connect</button>
+          </form>
+        </li>
+      </ol>
+      <p class="muted small">What the role can do: create and manage EKS, ECS, VPC, load balancer and log resources, and IAM roles named <span class="mono">lyrcloud-*</span> only. It trusts Lyrcloud’s AWS account, and only with your connection ID.</p>
+    </section>`;
+}
+
+function clusterForm() {
+  return `
+    <section class="panel">
+      <div class="panel-head"><h2>Create a cluster</h2></div>
+      <form class="stack" data-form="cloud-create-cluster" id="cluster-form">
+        <div class="field-grid">
+          <label class="field">Name<input name="name" placeholder="prod" required pattern="[a-z][a-z0-9-]{1,30}[a-z0-9]" maxlength="32" autocomplete="off" /></label>
+          <label class="field">Provider<select name="provider">${PROVIDERS.map((provider) => `<option value="${provider.id}"${provider.provisioning ? '' : ' disabled'}>${esc(provider.name)}${provider.provisioning ? '' : ' (coming soon)'}</option>`).join('')}</select></label>
+          <label class="field">Region<select name="region">${regionOptions()}</select></label>
+        </div>
+        <div class="plan-options cluster-kinds">
+          <label class="plan-option"><input type="radio" name="kind" value="serverless" checked data-action="cloud-estimate" /><span><b>Serverless containers</b><small>ECS on Fargate. Pay only for running containers; Lyrcloud deploys your images with a load balancer.</small></span></label>
+          <label class="plan-option"><input type="radio" name="kind" value="kubernetes" data-action="cloud-estimate" /><span><b>Kubernetes</b><small>Amazon EKS with worker nodes. Full Kubernetes; you deploy with kubectl or Helm.</small></span></label>
+        </div>
+        <fieldset class="contact-fields kube-only" hidden>
+          <legend>Kubernetes</legend>
+          <div class="field-grid">
+            <label class="field">Worker size<select name="nodeType" data-action="cloud-estimate">${Object.entries(NODE_TYPES).map(([type, spec]) => `<option value="${type}"${type === 't3.medium' ? ' selected' : ''}>${type} · ${spec.vcpu} vCPU · ${spec.memory} GB</option>`).join('')}</select></label>
+            <label class="field">Workers<input name="nodes" type="number" min="1" max="20" value="2" data-action="cloud-estimate" /></label>
+          </div>
+          <label class="field">Cluster admin (your IAM user or role ARN)<input name="adminArn" class="mono" placeholder="arn:aws:iam::123456789012:user/you" autocomplete="off" /></label>
+          <p class="muted small">Find it with <code>aws sts get-caller-identity</code>. This identity gets kubectl admin access.</p>
+        </fieldset>
+        <div class="estimate" id="cluster-estimate"></div>
+        <p class="form-error" hidden></p>
+        <div class="row"><button class="btn primary" type="submit">Create cluster</button><span class="muted small">Takes 1 minute for serverless, about 15 for Kubernetes. AWS bills your account.</span></div>
+      </form>
+    </section>`;
+}
+
+function updateClusterEstimate() {
+  const form = document.getElementById('cluster-form');
+  const box = document.getElementById('cluster-estimate');
+  if (!form || !box) return;
+  const kind = form.elements.kind.value;
+  form.querySelector('.kube-only').hidden = kind !== 'kubernetes';
+  const estimate = clusterEstimate({ kind, nodeType: form.elements.nodeType.value, nodes: Math.max(1, Math.min(20, Number(form.elements.nodes.value) || 1)) });
+  box.innerHTML = kind === 'serverless'
+    ? `<p class="muted small">The cluster itself is free. Each service costs about ${usd(serviceEstimate({ size: 'small', count: 1 }).monthly)}/month at the smallest size (one container plus its load balancer).</p>`
+    : `${estimateLines(estimate)}<p class="muted small">Estimate for us-east-1; other regions cost up to about 40% more. Data transfer is extra.</p>`;
+}
+
+function cloudView() {
+  if (!CLOUD_ENABLED) return views.missing();
+  const data = cloud.data;
+  const clusters = data?.clusters || [];
+  const highlight = new Set(clusters.map((c) => `${c.provider}:${c.region}`));
+  return `
+    ${pageHead('Cloud', `Container clusters in ${REGIONS.length} regions of ${PROVIDERS.length} clouds, run in your own account.`)}
+    ${cloud.error ? `<section class="panel"><p class="form-error">${esc(cloud.error)}</p><button class="btn" data-action="cloud-retry">Try again</button></section>` : ''}
+    <section class="panel">
+      <div class="panel-head"><h2>Data centers</h2><span class="muted">${clusters.length ? 'Rings show your clusters' : `Regions as of ${CATALOG_DATE}`}</span></div>
+      <div class="cloud-map dash-map">${worldMapSvg(REGIONS, { highlight })}</div>
+      <div class="provider-legend">${PROVIDERS.map((p) => `<span><i style="background:${p.color}"></i>${esc(p.name)} <small>${p.regions.length}${p.provisioning ? '' : ' · soon'}</small></span>`).join('')}</div>
+    </section>
+    ${!data ? '<section class="panel"><p class="muted">Loading…</p></section>' : `
+      ${connectionPanel(data.connection)}
+      <section class="panel">
+        <div class="panel-head"><h2>Your clusters</h2>${clusters.length ? `<span class="muted">${clusters.length}</span>` : ''}</div>
+        ${clusters.length ? `<div class="table-scroll"><table class="table">
+          <thead><tr><th>Name</th><th>Region</th><th>Type</th><th>Status</th><th>About / month</th></tr></thead>
+          <tbody>${clusters.map((c) => `<tr>
+            <td><a class="link mono" href="#/cloud/clusters/${c.id}">${esc(c.name)}</a></td>
+            <td>${regionLabel(c.provider, c.region)}</td>
+            <td>${c.kind === 'kubernetes' ? `Kubernetes · ${c.nodes} × ${esc(c.nodeType)}` : 'Serverless'}</td>
+            <td>${cloudStatus(c.status)}</td>
+            <td>${usd(c.estimate.monthly)}${c.kind === 'serverless' ? ' + services' : ''}</td>
+          </tr>`).join('')}</tbody></table></div>` : '<p class="muted">No clusters yet.</p>'}
+      </section>
+      ${data.connection?.status === 'connected' ? clusterForm() : ''}
+      <section class="panel">
+        <div class="panel-head"><h2>Other clouds</h2></div>
+        <p class="muted">Their regions are on the map now. Connecting an account and building clusters there is next.</p>
+        <div class="provider-legend">${PROVIDERS.filter((p) => !p.provisioning).map((p) => `<span><i style="background:${p.color}"></i>${esc(p.fullName)} <small>coming soon</small></span>`).join('')}</div>
+      </section>`}`;
+}
+
+function serviceRow(service) {
+  const editing = cloud.editing === service.id;
+  return `
+    <li class="service-card">
+      <div class="service-main">
+        <div><b class="mono">${esc(service.name)}</b> ${cloudStatus(service.status)}<div class="muted small mono">${esc(service.image)} · port ${service.port} · ${service.count} × ${esc(SERVICE_SIZES[service.size]?.label || service.size)}</div>
+          ${service.url ? `<a class="link" href="${esc(service.url)}" target="_blank" rel="noopener">${esc(service.url)} ↗</a>` : ''}
+          ${service.failureReason ? `<p class="form-error">${esc(service.failureReason)}</p>` : ''}</div>
+        <div class="row tight"><span class="muted small">≈ ${usd(service.estimate.monthly)}/mo</span>
+          <button class="btn small" data-action="cloud-edit-service" data-id="${service.id}"${CLOUD_BUSY.includes(service.status) ? ' disabled' : ''}>${editing ? 'Close' : 'Change'}</button>
+          <button class="btn small danger" data-action="cloud-delete-service" data-id="${service.id}"${service.status === 'deleting' ? ' disabled' : ''}>Remove</button></div>
+      </div>
+      ${editing ? serviceForm(service) : ''}
+    </li>`;
+}
+
+const envText = (env) => Object.entries(env || {}).map(([key, value]) => `${key}=${value}`).join('\n');
+
+function serviceForm(service) {
+  const edit = Boolean(service);
+  return `
+    <form class="stack service-form" data-form="${edit ? 'cloud-update-service' : 'cloud-create-service'}"${edit ? ` data-id="${service.id}"` : ''}>
+      <div class="field-grid">
+        ${edit ? '' : '<label class="field">Name<input name="name" placeholder="web" required pattern="[a-z][a-z0-9-]{1,30}[a-z0-9]" maxlength="32" autocomplete="off" /></label>'}
+        <label class="field">Container image<input name="image" class="mono" placeholder="nginx:latest or ghcr.io/you/app:1.0" value="${esc(service?.image || '')}" required autocomplete="off" /></label>
+        <label class="field">Port<input name="port" type="number" min="1" max="65535" value="${service?.port ?? 80}" /></label>
+        <label class="field">Size<select name="size">${Object.entries(SERVICE_SIZES).map(([id, size]) => `<option value="${id}"${id === (service?.size || 'small') ? ' selected' : ''}>${size.label}</option>`).join('')}</select></label>
+        <label class="field">Copies<input name="count" type="number" min="0" max="20" value="${service?.count ?? 1}" /></label>
+        <label class="field">Health check path<input name="healthPath" value="${esc(service?.healthPath || '/')}" /></label>
+      </div>
+      <label class="field">Environment variables (NAME=value, one per line)<textarea name="env" rows="3" class="mono">${esc(envText(service?.env))}</textarea></label>
+      <div class="row"><button class="btn primary" type="submit">${edit ? 'Redeploy' : 'Deploy'}</button><span class="muted small">Public images (Docker Hub, GHCR, ECR Public) and private ECR images in your account work.</span></div>
+    </form>`;
+}
+
+function cloudClusterView(route) {
+  if (!CLOUD_ENABLED) return views.missing();
+  const id = route.clusterId;
+  if (cloud.detailError && cloud.detailFor === id) return `${pageHead('Cluster')}<section class="panel"><p class="form-error">${esc(cloud.detailError)}</p><a class="btn" href="#/cloud">All clusters</a></section>`;
+  const detail = cloud.detailFor === id ? cloud.detail : null;
+  if (!detail) return `${pageHead('Cluster')}<section class="panel"><p class="muted">Loading…</p></section>`;
+  const { cluster, services } = detail;
+  const ready = cluster.status === 'ready';
+  const kube = cluster.kind === 'kubernetes';
+  return `
+    ${pageHead(`<span class="mono">${esc(cluster.name)}</span>`, `${cloudStatus(cluster.status)} · ${kube ? 'Kubernetes (EKS)' : 'Serverless (ECS Fargate)'} · ${regionLabel(cluster.provider, cluster.region)}`, '<a class="btn" href="#/cloud">All clusters</a>')}
+    ${cluster.status === 'creating' ? `<section class="panel callout"><p>Building in your AWS account… ${kube ? 'Kubernetes clusters take about 15 minutes.' : 'This takes about a minute.'} This page updates by itself.</p></section>` : ''}
+    ${cluster.failureReason ? `<section class="panel"><p class="form-error">${esc(cluster.failureReason)}</p>${cluster.status === 'failed' ? '<p class="muted small">Nothing keeps running from a failed cluster; delete it to try again with the same name.</p>' : ''}</section>` : ''}
+    <div class="grid-2">
+      <section class="panel">
+        <div class="panel-head"><h2>Cost estimate</h2></div>
+        ${estimateLines(cluster.estimate)}
+        ${services.length ? `<p class="muted small">Plus services: about ${usd(services.reduce((sum, s) => sum + s.estimate.monthly, 0))}/month.</p>` : ''}
+        <p class="muted small">AWS bills your account directly. us-east-1 prices; data transfer extra.</p>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>Details</h2></div>
+        <dl class="facts">
+          <dt>Stack</dt><dd class="mono">${esc(cluster.stackName)}</dd>
+          ${cluster.outputs.ClusterName ? `<dt>Cluster</dt><dd class="mono">${esc(cluster.outputs.ClusterName)}</dd>` : ''}
+          ${cluster.outputs.VpcId ? `<dt>VPC</dt><dd class="mono">${esc(cluster.outputs.VpcId)}</dd>` : ''}
+          ${kube ? `<dt>Admin</dt><dd class="mono wrap">${esc(cluster.adminArn)}</dd>` : ''}
+          <dt>Created</dt><dd>${formatDate(cluster.createdAt)}</dd>
+        </dl>
+      </section>
+    </div>
+    ${kube && ready ? `
+      <section class="panel">
+        <div class="panel-head"><h2>Use it with kubectl</h2></div>
+        <pre class="preview-output">aws eks update-kubeconfig --region ${esc(cluster.region)} --name ${esc(cluster.outputs.ClusterName || `lyrcloud-${cluster.name}`)}
+kubectl get nodes</pre>
+        <p class="muted small">Run these as <span class="mono">${esc(cluster.adminArn)}</span>. Services of type LoadBalancer get a public AWS load balancer.</p>
+        <form class="row" data-form="cloud-resize"><label class="inline-check">Workers <input name="nodes" type="number" min="1" max="20" value="${cluster.nodes}" /></label><button class="btn" type="submit">Resize</button></form>
+      </section>` : ''}
+    ${!kube && ready ? `
+      <section class="panel">
+        <div class="panel-head"><h2>Services</h2><span class="muted">${services.length}</span></div>
+        ${services.length ? `<ul class="service-list">${services.map(serviceRow).join('')}</ul>` : '<p class="muted">No services yet. Deploy a container image below.</p>'}
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>Deploy a container</h2><span class="muted small">≈ ${usd(serviceEstimate({ size: 'small', count: 1 }).monthly)}/month at the smallest size</span></div>
+        ${serviceForm(null)}
+      </section>` : ''}
+    <section class="panel">
+      ${settingRow('Delete this cluster', services.length ? 'Remove its services first.' : 'Takes down everything Lyrcloud built for it in your account.', `<button class="btn danger" data-action="cloud-delete-cluster"${services.length || cluster.status === 'deleting' ? ' disabled' : ''}>Delete cluster</button>`)}
+    </section>`;
+}
+
+// ---- admin
+
+async function loadAdminCloud() {
+  adminCloud.loading = true;
+  try {
+    adminCloud.data = await cloudApi('/admin/cloud');
+    adminCloud.error = '';
+  } catch (error) {
+    adminCloud.error = error.message;
+  }
+  adminCloud.loading = false;
+  if (isAdminView()) render();
+}
+
+function adminCloudTab() {
+  if (adminCloud.error) return `<section class="panel"><p class="form-error">${esc(adminCloud.error)}</p></section>`;
+  if (!adminCloud.data) return '<section class="panel"><p class="muted">Loading…</p></section>';
+  const { connections, clusters, services } = adminCloud.data;
+  const stat = (label, value) => `<div class="stat"><span>${label}</span><strong>${value}</strong></div>`;
+  return `
+    <div class="stat-grid">
+      ${stat('Connected accounts', connections.filter((c) => c.status === 'connected').length)}
+      ${stat('Clusters', clusters.length)}
+      ${stat('Services', services.length)}
+      ${stat('Customer spend (est. / mo)', usd(clusters.reduce((s, c) => s + c.estimate.monthly, 0) + services.reduce((s, v) => s + v.estimate.monthly, 0)))}
+    </div>
+    <section class="panel">
+      <div class="panel-head"><h2>Clusters</h2></div>
+      ${clusters.length ? `<div class="table-scroll"><table class="table"><thead><tr><th>Name</th><th>Owner</th><th>Region</th><th>Type</th><th>Status</th></tr></thead>
+        <tbody>${clusters.map((c) => `<tr><td><a class="link mono" href="#/cloud/clusters/${c.id}">${esc(c.name)}</a></td><td>${esc(c.ownerEmail || '—')}</td><td>${regionLabel(c.provider, c.region)}</td><td>${esc(c.kind)}</td><td>${cloudStatus(c.status)}</td></tr>`).join('')}</tbody></table></div>`
+        : '<p class="muted">No clusters yet.</p>'}
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Connections</h2></div>
+      ${connections.length ? `<ul class="recent-list">${connections.map((c) => `<li><b>${esc(c.ownerEmail || '—')}</b> <span class="muted">${c.status}${c.accountId ? ` · ${esc(c.accountId)}` : ''}</span></li>`).join('')}</ul>` : '<p class="muted">Nobody has connected a cloud account yet.</p>'}
+    </section>`;
+}
+adminTabs.cloud = adminCloudTab;
+
+// ---- actions
+
+const parseEnv = (text) => {
+  const env = {};
+  for (const line of String(text || '').split('\n').map((value) => value.trim()).filter(Boolean)) {
+    const at = line.indexOf('=');
+    if (at < 1) throw new Error(`Write “${line}” as NAME=value.`);
+    env[line.slice(0, at).trim()] = line.slice(at + 1);
+  }
+  return env;
+};
+const serviceBody = (data) => ({
+  image: String(data.get('image') || '').trim(),
+  port: Number(data.get('port')),
+  size: String(data.get('size')),
+  count: Number(data.get('count')),
+  healthPath: String(data.get('healthPath') || '/').trim() || '/',
+  env: parseEnv(data.get('env')),
+});
+const findCloudService = (id) => cloud.detail?.services.find((s) => s.id === id);
+
+async function cloudRun(target, request, message, after) {
+  if (target) target.disabled = true;
+  try {
+    const result = await request();
+    if (message) toast(message);
+    await after?.(result);
+  } catch (error) {
+    if (target) target.disabled = false;
+    toast(error.message);
+  }
+}
+
+const cloudClickActions = {
+  'cloud-retry': () => {
+    cloud.error = '';
+    cloud.data = null;
+    render();
+  },
+  'cloud-connect': (target) => cloudRun(target, () => cloudApi('/cloud/connections/aws', { method: 'POST' }), '', loadCloud),
+  'cloud-disconnect': (target) => {
+    if (!confirmed(target, 'Disconnect your AWS account from Lyrcloud?')) return;
+    cloudRun(target, () => cloudApi('/cloud/connections/aws', { method: 'DELETE' }), 'Disconnected. Delete the lyrcloud-access stack in AWS to remove the role.', loadCloud);
+  },
+  'cloud-delete-cluster': (target) => {
+    if (!confirmed(target, `Delete ${cloud.detail.cluster.name}? Everything Lyrcloud built for it in your AWS account is removed.`)) return;
+    cloudRun(target, () => cloudApi(`/cloud/clusters/${currentRoute.clusterId}`, { method: 'DELETE' }), 'Deleting the cluster…', () => { cloud.data = null; return loadCloudCluster(currentRoute.clusterId); });
+  },
+  'cloud-edit-service': (target) => {
+    cloud.editing = cloud.editing === target.dataset.id ? null : target.dataset.id;
+    render();
+  },
+  'cloud-delete-service': (target) => {
+    const service = findCloudService(target.dataset.id);
+    if (!confirmed(target, `Remove ${service.name}? Its containers and load balancer are deleted.`)) return;
+    cloudRun(target, () => cloudApi(`/cloud/services/${service.id}`, { method: 'DELETE' }), `Removing ${service.name}…`, () => loadCloudCluster(currentRoute.clusterId));
+  },
+};
+
+const cloudChangeActions = {
+  'cloud-estimate': () => updateClusterEstimate(),
+};
+
+const cloudFormActions = {
+  'cloud-connect-finish': (form, data) => cloudRun(form.querySelector('[type="submit"]'),
+    () => cloudApi('/cloud/connections/aws', { method: 'PUT', body: JSON.stringify({ roleArn: String(data.get('roleArn')).trim() }) }), 'AWS account connected', loadCloud),
+  'cloud-create-cluster': (form, data) => {
+    const kind = String(data.get('kind'));
+    const body = {
+      name: String(data.get('name')).trim().toLowerCase(), provider: String(data.get('provider')), region: String(data.get('region')), kind,
+      ...(kind === 'kubernetes' ? { nodeType: String(data.get('nodeType')), nodes: Number(data.get('nodes')), adminArn: String(data.get('adminArn') || '').trim() } : {}),
+    };
+    const button = form.querySelector('[type="submit"]');
+    button.disabled = true;
+    cloudApi('/cloud/clusters', { method: 'POST', body: JSON.stringify(body) }).then(({ cluster }) => {
+      cloud.data = null;
+      toast(`Building ${cluster.name}…`);
+      go(`#/cloud/clusters/${cluster.id}`);
+    }, (error) => {
+      button.disabled = false;
+      showFormError(form, error.message);
+    });
+  },
+  'cloud-resize': (form, data) => cloudRun(form.querySelector('[type="submit"]'),
+    () => cloudApi(`/cloud/clusters/${currentRoute.clusterId}`, { method: 'PUT', body: JSON.stringify({ nodes: Number(data.get('nodes')) }) }), 'Resizing…', () => loadCloudCluster(currentRoute.clusterId)),
+  'cloud-create-service': (form, data) => {
+    let body;
+    try {
+      body = { name: String(data.get('name')).trim().toLowerCase(), ...serviceBody(data) };
+    } catch (error) {
+      return toast(error.message);
+    }
+    cloudRun(form.querySelector('[type="submit"]'), () => cloudApi(`/cloud/clusters/${currentRoute.clusterId}/services`, { method: 'POST', body: JSON.stringify(body) }),
+      `Deploying ${body.name}… load balancers take about 5 minutes`, () => loadCloudCluster(currentRoute.clusterId));
+  },
+  'cloud-update-service': (form, data) => {
+    let body;
+    try {
+      body = serviceBody(data);
+    } catch (error) {
+      return toast(error.message);
+    }
+    cloudRun(form.querySelector('[type="submit"]'), () => cloudApi(`/cloud/services/${form.dataset.id}`, { method: 'PUT', body: JSON.stringify(body) }),
+      'Redeploying…', () => { cloud.editing = null; return loadCloudCluster(currentRoute.clusterId); });
+  },
+};
+
 // ------------------------------------------------------------------ routing
 
 function parseRoute() {
@@ -2420,6 +2852,7 @@ function parseRoute() {
   if (parts[0] === 'workers' && parts[1]) return { view: 'worker', worker: parts[1], params };
   if (parts[0] === 'projects' && parts[1]) return { view: 'project', projectId: parts[1], params };
   if (parts[0] === 'domains' && parts[1] === 'buy') return { view: 'domain-buy', params };
+  if (parts[0] === 'cloud' && parts[1] === 'clusters' && /^[a-f0-9]{8}$/.test(parts[2] || '')) return { view: 'cloud-cluster', clusterId: parts[2], params };
   if (parts[0] === 'domains' && parts[1] === 'sub' && parts[2]) return { view: 'subdomain', label: parts[2].toLowerCase(), params };
   if (parts[0] === 'domains' && parts[1]) return { view: 'domain', domain: parts[1].toLowerCase(), params };
   if (parts[0] && views[parts[0]]) return { view: parts[0], params };
@@ -2441,12 +2874,14 @@ function render() {
   if (currentRoute.view === 'settings') showProfile();
   if (PROJECTS_ENABLED && currentRoute.view.startsWith('project')) projectsAfterRender(currentRoute);
   if (isDomainView(currentRoute.view)) domainsAfterRender(currentRoute);
+  if (isCloudView(currentRoute.view)) cloudAfterRender(currentRoute);
   if (isAdminView() && profile && isStaff(profile.role)) {
     if (!adminUsers.list && !adminUsers.loading && !adminUsers.error) loadUsers();
     if (currentRoute.params.get('tab') === 'settings' && !adminSettings.data && !adminSettings.loading) loadAdminSettings();
     if (PROJECTS_ENABLED && currentRoute.params.get('tab') === 'settings' && !adminGithubApp.data && !adminGithubApp.loading) loadAdminGithubApp();
     if (PROJECTS_ENABLED && currentRoute.params.get('tab') === 'projects' && !adminProjects.list && !adminProjects.loading) loadAdminProjects();
     if (DOMAINS_ENABLED && currentRoute.params.get('tab') === 'domains' && !adminDomains.data && !adminDomains.loading && !adminDomains.error) loadAdminDomains();
+    if (CLOUD_ENABLED && currentRoute.params.get('tab') === 'cloud' && !adminCloud.data && !adminCloud.loading && !adminCloud.error) loadAdminCloud();
     applyAdminSearch();
   }
   document.title = `${document.querySelector('.page-head h1')?.textContent || 'Dashboard'} | Lyrcloud`;
@@ -2729,6 +3164,8 @@ const clickActions = {
   },
   'zone-upgrade': () => updateZone((zone) => { zone.plan = 'scale'; zone.security.managedWaf = true; }, 'Upgraded this site to Scale: managed WAF rules are on'),
   'admin-refresh': () => {
+    adminCloud.data = null;
+    adminCloud.error = '';
     adminDomains.data = null;
     adminDomains.error = '';
     adminUsers.list = null;
@@ -3087,6 +3524,9 @@ const formActions = {
 Object.assign(clickActions, domainClickActions);
 Object.assign(changeActions, domainChangeActions);
 Object.assign(formActions, domainFormActions);
+Object.assign(clickActions, cloudClickActions);
+Object.assign(changeActions, cloudChangeActions);
+Object.assign(formActions, cloudFormActions);
 
 app.addEventListener('click', (event) => {
   // Any click outside the account menu closes it.
@@ -3102,6 +3542,7 @@ app.addEventListener('change', (event) => {
 });
 
 app.addEventListener('input', (event) => {
+  if (event.target.dataset?.action === 'cloud-estimate') return updateClusterEstimate();
   const { id } = event.target;
   if (id === 'import-name' || id === 'import-copy-name') event.target.dataset.touched = '1';
   if (id === 'import-url' || id === 'import-repo') suggestImportNames(event.target.closest('form'));
