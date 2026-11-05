@@ -1824,3 +1824,34 @@ a.stat:hover {
     grid-row: 2;
   }
 }
+
+/* A name field with its fixed ending (".lyr.cloud", ".lyr") shown inside the box. */
+.suffix-input {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-input);
+}
+
+.suffix-input:focus-within {
+  outline: 2px solid rgba(50, 211, 255, 0.45);
+  outline-offset: 1px;
+}
+
+.dash-app .suffix-input input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  outline: none;
+}
+
+.suffix-input span {
+  padding: 0 12px 0 2px;
+  color: var(--muted);
+  font-weight: 650;
+  white-space: nowrap;
+}

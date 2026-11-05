@@ -301,7 +301,7 @@ function sidebar(route) {
   const accountLinks = [
     ['#/', 'Account home', icons.home, route.view === 'home'],
     ['#/add-site', 'Add a site', icons.add, route.view === 'add-site'],
-    ...(DOMAINS_ENABLED ? [['#/domains', 'Domains', icons.domains, route.view.startsWith('domain')]] : []),
+    ...(DOMAINS_ENABLED ? [['#/domains', 'Domains', icons.domains, isDomainView(route.view)]] : []),
     ...(PROJECTS_ENABLED ? [['#/projects', 'Projects', icons.projects, route.view.startsWith('project')]] : []),
     ['#/workers', 'Edge Functions', icons.workers, route.view.startsWith('worker')],
     ['#/settings', 'Account settings', icons.settings, route.view === 'settings'],
@@ -705,9 +705,10 @@ const views = {
 
   projects: (route) => (PROJECTS_ENABLED ? projectsView(route) : views.missing()),
   project: (route) => (PROJECTS_ENABLED ? projectView(route) : views.missing()),
-  domains: () => domainsView(),
+  domains: (route) => domainsView(route),
   'domain-buy': (route) => domainBuyView(route),
   domain: (route) => domainView(route),
+  subdomain: (route) => subdomainView(route),
 
   admin(route) {
     if (profileFailed) return `<section class="panel"><p class="form-error">Couldn’t load your account. Reload the page to try again.</p></section>`;
@@ -1468,6 +1469,7 @@ function adminGithubAppPanel(isSuper) {
 // customer has paid with Stripe. Registered domains get Lyrcloud DNS, edited here with real records.
 const domainsApi = (path, options) => api(path, options, DOMAINS_API_BASE);
 const DOMAINS_ENABLED = !DOMAINS_API_BASE.endsWith('.invalid');
+const isDomainView = (view) => Boolean(view) && (view.startsWith('domain') || view === 'subdomain');
 
 const domains = {
   data: null, error: '', loading: false,
@@ -1476,6 +1478,7 @@ const domains = {
   search: null, searchError: '', searching: false, query: '',
   check: {}, // domain -> search result for the buy page
   detail: null, detailError: '', detailFor: null, loadingDetail: false,
+  sub: null, subError: '', subFor: null, loadingSub: false, // one name.lyr.cloud subdomain
   refreshTimer: null,
 };
 const adminDomains = { data: null, pricing: null, lyr: null, error: '', loading: false };
@@ -1520,7 +1523,7 @@ async function loadDomains() {
     domains.error = error.message;
   }
   domains.loading = false;
-  if (currentRoute?.view.startsWith('domain')) render();
+  if (isDomainView(currentRoute?.view)) render();
 }
 
 async function loadDomainPrices() {
@@ -1590,6 +1593,10 @@ function domainsAfterRender(route) {
   if (!DOMAINS_ENABLED) return;
   clearTimeout(domains.refreshTimer);
   if (!domains.data && !domains.loading && !domains.error) loadDomains();
+  if (route.view === 'subdomain' && (domains.subFor !== route.label || (!domains.sub && !domains.subError)) && !domains.loadingSub) loadSubdomain(route.label);
+  if (route.view === 'subdomain' && domains.sub?.subdomain?.status === 'awaiting_payment' && route.params.get('paid')) {
+    domains.refreshTimer = setTimeout(() => currentRoute.view === 'subdomain' && loadSubdomain(currentRoute.label), 5000);
+  }
   if (route.view === 'domain-buy') {
     loadDomainPrices();
     const name = route.params.get('domain');
@@ -1637,7 +1644,7 @@ function domainSearchPanel() {
     </section>`;
 }
 
-function domainsView() {
+function domainsView(route) {
   if (!DOMAINS_ENABLED) return views.missing();
   const list = domains.data?.domains || [];
   const table = domains.error
@@ -1663,6 +1670,7 @@ function domainsView() {
       <div class="panel-head"><h2>Your domains</h2>${list.length ? `<span class="muted">${list.length} total</span>` : ''}</div>
       ${table}
     </section>
+    ${subdomainsPanel(route)}
     <section class="panel">
       <div class="panel-head"><h2>Transfer a domain to Lyrcloud</h2></div>
       <p class="muted">Moving a domain adds a year to its registration. Unlock it at your current registrar and get its transfer (EPP) code first.</p>
@@ -1670,7 +1678,8 @@ function domainsView() {
         <input class="grow" name="domain" placeholder="example.com" aria-label="Domain to transfer" required autocomplete="off" />
         <button class="btn" type="submit">Start transfer</button>
       </form>
-    </section>`;
+    </section>
+    ${lyrWaitlistPanel(route)}`;
 }
 
 const contactField = (name, label, value, attrs = '') =>
@@ -1810,16 +1819,7 @@ function domainView(route) {
       ${item.lyrcloudDns ? `
         <section class="panel">
           <div class="panel-head"><h2>DNS records</h2><span class="muted">Live on Lyrcloud DNS</span></div>
-          <form class="dns-form" data-form="record-save" id="record-form">
-            <select name="type" aria-label="Type">${['A', 'AAAA', 'CNAME', 'MX', 'TXT'].map((type) => `<option>${type}</option>`).join('')}</select>
-            <input name="name" placeholder="Name (@ for root)" value="@" required aria-label="Name" />
-            <textarea name="values" rows="1" placeholder="Value (one per line)" required aria-label="Values"></textarea>
-            <select name="ttl" aria-label="TTL">${[[300, '5 min'], [3600, '1 hour'], [86400, '1 day'], [60, '1 min']].map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select>
-            <button class="btn primary" type="submit">Save record</button>
-          </form>
-          <p class="form-error" hidden></p>
-          <p class="muted small">Saving a type and name that already exist replaces them. Changes reach resolvers within the TTL.</p>
-          ${recordRows(detail.records || [])}
+          ${recordEditor(detail.records || [])}
         </section>`
         : '<section class="panel"><p class="muted">This domain uses the DNS it had before the transfer. Manage records with your DNS provider.</p></section>'}` : ''}
     ${detail.orders.length ? `
@@ -1832,13 +1832,112 @@ function domainView(route) {
       </section>` : ''}`;
 }
 
+// The record form and table, shared by domains and subdomains.
+function recordEditor(records, { apexHint = 'Name (@ for root)' } = {}) {
+  return `
+    <form class="dns-form" data-form="record-save" id="record-form">
+      <select name="type" aria-label="Type">${['A', 'AAAA', 'CNAME', 'MX', 'TXT'].map((type) => `<option>${type}</option>`).join('')}</select>
+      <input name="name" placeholder="${apexHint}" value="@" required aria-label="Name" />
+      <textarea name="values" rows="1" placeholder="Value (one per line)" required aria-label="Values"></textarea>
+      <select name="ttl" aria-label="TTL">${[[300, '5 min'], [3600, '1 hour'], [86400, '1 day'], [60, '1 min']].map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select>
+      <button class="btn primary" type="submit">Save record</button>
+    </form>
+    <p class="form-error" hidden></p>
+    <p class="muted small">Saving a type and name that already exist replaces them. Changes reach resolvers within the TTL.</p>
+    ${recordRows(records)}`;
+}
+
+// ---- name.lyr.cloud subdomains (switched on once lyr.cloud is registered)
+
+async function loadSubdomain(label) {
+  domains.loadingSub = true;
+  domains.subFor = label;
+  try {
+    domains.sub = await domainsApi(`/domains/subdomains/${encodeURIComponent(label)}`);
+    domains.subError = '';
+  } catch (error) {
+    domains.sub = null;
+    domains.subError = error.message;
+  }
+  domains.loadingSub = false;
+  if (currentRoute?.view === 'subdomain' && currentRoute.label === label) render();
+}
+
+function subdomainsPanel(route) {
+  const info = domains.data?.subdomains;
+  if (!info?.enabled) return '';
+  const price = info.freeWithPlan ? `Included with your ${esc(planName(state.plan))} plan` : `${money(info.price)}/year · free on ${info.freePlans.map(planName).join(' and ')}`;
+  const cancelled = route.params.get('cancelled');
+  return `
+    <section class="panel">
+      <div class="panel-head"><h2>Your name.${esc(info.zone)}</h2><span class="muted">${price}</span></div>
+      <p class="muted">A free-to-remember address that works everywhere, with HTTPS-ready DNS. Point it at a Lyrcloud project, your server, or any site.</p>
+      ${cancelled ? `<p class="notice">Payment for ${esc(cancelled)}.${esc(info.zone)} was cancelled. Nothing was charged.</p>` : ''}
+      <form class="domain-search" data-form="subdomain-claim">
+        <div class="suffix-input"><input name="label" placeholder="my-shop" aria-label="Name" autocomplete="off" required maxlength="63" /><span>.${esc(info.zone)}</span></div>
+        <button class="btn primary" type="submit">${info.freeWithPlan ? 'Claim it' : `Claim for ${money(info.price)}/yr`}</button>
+      </form>
+      ${info.items.length ? `<ul class="domain-results">${info.items.map((item) => `
+        <li class="domain-result is-available">
+          <a class="domain-name mono link" href="#/domains/sub/${encodeURIComponent(item.label)}">${esc(item.name)}</a>
+          <span class="domain-price">${domainStatus(item.status)}<small>${item.free ? 'Included with your plan' : item.expiresAt ? `Renews ${shortDate(item.expiresAt)}` : ''}</small></span>
+          <a class="btn small" href="#/domains/sub/${encodeURIComponent(item.label)}">DNS</a>
+        </li>`).join('')}</ul>` : ''}
+    </section>`;
+}
+
+function subdomainView(route) {
+  if (!DOMAINS_ENABLED) return views.missing();
+  const label = route.label;
+  if (domains.subError && domains.subFor === label) return `${pageHead(esc(label))}<section class="panel"><p class="form-error">${esc(domains.subError)}</p><a class="btn" href="#/domains">All domains</a></section>`;
+  const detail = domains.subFor === label ? domains.sub : null;
+  if (!detail) return `${pageHead(esc(label))}<section class="panel"><p class="muted">Loading…</p></section>`;
+  const item = detail.subdomain;
+  const active = item.status === 'active';
+  return `
+    ${pageHead(`<span class="mono">${esc(item.name)}</span>`, `${domainStatus(item.status)}${item.free ? ' · included with your plan' : item.expiresAt ? ` · renews ${shortDate(item.expiresAt)} at ${money(item.renewPrice)}` : ''}`,
+      `${active ? `<a class="btn" href="https://${esc(item.name)}" target="_blank" rel="noopener">Visit ↗</a>` : ''}<a class="btn" href="#/domains">All domains</a>`)}
+    ${item.status === 'awaiting_payment' ? `<section class="panel callout"><p>${route.params.get('paid') ? 'Confirming your payment… this page updates by itself.' : `Held for you until ${formatDate(item.holdUntil)}.${item.checkoutUrl ? ` <a href="${esc(item.checkoutUrl)}">Finish paying</a>` : ''}`}</p></section>` : ''}
+    ${item.failureReason ? `<section class="panel"><p class="form-error">${esc(item.failureReason)} Your payment was refunded.</p></section>` : ''}
+    ${item.lastRenewalError ? `<section class="panel"><p class="form-error">${esc(item.lastRenewalError)}</p></section>` : ''}
+    ${active ? `
+      <section class="panel">
+        <div class="panel-head"><h2>DNS records</h2><span class="muted">Live everywhere</span></div>
+        <p class="muted small">Tip: to use it for a Lyrcloud project or another site, add a CNAME for @ pointing at that site’s address.</p>
+        ${recordEditor(detail.records || [], { apexHint: `Name (@ for ${esc(item.name)})` })}
+      </section>
+      <section class="panel">
+        ${item.free ? '' : settingRow('Auto-renew', `Charges ${money(item.renewPrice)} to your saved card 30 days before it renews.`, toggle('subdomain-autorenew', item.autoRenew, 'Auto-renew'))}
+        ${settingRow('Release this name', 'Deletes its DNS records and lets someone else claim it.', `<button class="btn danger" data-action="subdomain-release">Release ${esc(item.name)}</button>`)}
+      </section>` : ''}`;
+}
+
+// ---- .lyr waitlist: free reservations for when .lyr becomes official
+
+function lyrWaitlistPanel(route) {
+  const list = domains.data?.lyrReservations || [];
+  const prefill = route.params.get('reserve') || '';
+  return `
+    <section class="panel" id="lyr-waitlist">
+      <div class="panel-head"><h2>Reserve a .lyr name</h2><span class="status pending">◌ Free · preview</span></div>
+      <p class="muted">.lyr is Lyrcloud’s own extension, <a href="/lyr/" target="_blank" rel="noopener">in preview</a>. Reserve up to three names for free; you’ll get first claim on them when .lyr opens. Nothing is charged.</p>
+      <form class="domain-search" data-form="lyr-reserve">
+        <div class="suffix-input"><input name="name" placeholder="mybrand" value="${esc(prefill.replace(/\.lyr$/, ''))}" aria-label=".lyr name" autocomplete="off" required maxlength="63" /><span>.lyr</span></div>
+        <button class="btn primary" type="submit"${list.length >= 3 ? ' disabled' : ''}>Reserve</button>
+      </form>
+      ${list.length ? `<ul class="domain-results">${list.map((item) => `
+        <li class="domain-result"><span class="domain-name mono">${esc(item.name)}</span><span class="domain-price"><small>Reserved ${shortDate(item.createdAt)}</small></span>
+          <button class="btn small" data-action="lyr-unreserve" data-name="${esc(item.name)}">Give up</button></li>`).join('')}</ul>` : ''}
+    </section>`;
+}
+
 // ---- admin
 
 async function loadAdminDomains() {
   adminDomains.loading = true;
   try {
     const [data, pricing, lyr] = await Promise.all([domainsApi('/admin/domains'), domainsApi('/admin/domain-pricing'), domainsApi('/admin/lyr')]);
-    Object.assign(adminDomains, { data, pricing, lyr: lyr.names, error: '' });
+    Object.assign(adminDomains, { data, pricing, lyr: lyr.names, lyrReservations: lyr.reservations || [], error: '' });
   } catch (error) {
     adminDomains.error = error.message;
   }
@@ -1896,6 +1995,8 @@ function adminDomainsTab(isSuper) {
           <label class="field">Commission (%)<input name="percent" type="number" min="0" max="500" step="0.1" value="${config.percent}"${lock} /></label>
           <label class="field">Plus flat fee ($ per year)<input name="flat" type="number" min="0" step="0.01" value="${(config.flatCents / 100).toFixed(2)}"${lock} /></label>
           <label class="field">DNS hosting cost ($ per year)<input name="dns" type="number" min="0" step="0.01" value="${(config.dnsCentsPerYear / 100).toFixed(2)}"${lock} /></label>
+          <label class="field">name.${esc(pricing.subdomains?.zone || 'lyr.cloud')} price ($ per year)${pricing.subdomains?.enabled ? '' : ' · <span class="muted">off until registered</span>'}<input name="subdomain" type="number" min="0.5" step="0.01" value="${((config.subdomainCents ?? 499) / 100).toFixed(2)}"${lock} /></label>
+          <label class="field">…free on plans (comma separated)<input name="subdomainFree" value="${esc((config.subdomainFreePlans || []).join(', '))}"${lock} /></label>
           <label class="check-row"><input type="checkbox" name="round99"${config.round99 ? ' checked' : ''}${lock} /> Round prices up to .99</label>
         </div>
         <label class="field">TLDs for sale (comma separated)<input name="tlds" class="mono" value="${esc(config.tlds.join(', '))}"${lock} /></label>
@@ -1931,7 +2032,11 @@ function adminDomainsTab(isSuper) {
 
 // ---- actions
 
-const recordFor = (type, label) => domains.detail?.records?.find((record) => record.type === type && record.label === label);
+// The DNS editor serves both registered domains and name.lyr.cloud subdomains.
+const recordTarget = () => (currentRoute.view === 'subdomain'
+  ? { base: `/domains/subdomains/${encodeURIComponent(currentRoute.label)}`, records: domains.sub?.records, reload: () => loadSubdomain(currentRoute.label) }
+  : { base: `/domains/${encodeURIComponent(currentRoute.domain)}`, records: domains.detail?.records, reload: () => loadDomainDetail(currentRoute.domain) });
+const recordFor = (type, label) => recordTarget().records?.find((record) => record.type === type && record.label === label);
 
 // ---- .lyr registry (preview): names Lyrcloud answers for itself through its own DNS resolver.
 
@@ -1973,6 +2078,8 @@ function adminLyrPanel(isSuper) {
           <td class="row tight">${isSuper ? `<button class="btn small" data-action="lyr-edit" data-name="${esc(entry.name)}">Edit</button><button class="btn small danger" data-action="lyr-delete" data-name="${esc(entry.name)}">Delete</button>` : ''}</td>
         </tr>`).join('')}</tbody>
       </table></div>` : '<p class="muted">No .lyr names yet.</p>'}
+      <h3 class="domain-subhead">Waitlist${adminDomains.lyrReservations?.length ? ` (${adminDomains.lyrReservations.length})` : ''}</h3>
+      ${adminDomains.lyrReservations?.length ? `<div class="table-scroll"><table class="table"><thead><tr><th>Name</th><th>Reserved by</th><th>Since</th></tr></thead><tbody>${adminDomains.lyrReservations.map((item) => `<tr><td class="mono">${esc(item.name)}</td><td>${esc(item.ownerEmail || '—')}</td><td>${shortDate(item.createdAt)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="muted small">Nobody has reserved a .lyr name yet.</p>'}
       ${isSuper ? `
         <form class="stack" data-form="admin-lyr-save" id="lyr-form">
           <div class="field-grid">
@@ -1987,6 +2094,32 @@ function adminLyrPanel(isSuper) {
 }
 
 const domainClickActions = {
+  'subdomain-release': async (target) => {
+    if (!confirmed(target, `Release ${domains.sub.subdomain.name}? Its DNS records are deleted and anyone can claim it.`)) return;
+    target.disabled = true;
+    try {
+      await domainsApi(`/domains/subdomains/${encodeURIComponent(currentRoute.label)}`, { method: 'DELETE' });
+      toast(`${domains.sub.subdomain.name} released`);
+      domains.data = null;
+      go('#/domains');
+    } catch (error) {
+      target.disabled = false;
+      toast(error.message);
+    }
+  },
+  'lyr-unreserve': async (target) => {
+    if (!confirmed(target, `Give up ${target.dataset.name}? Someone else can reserve it.`)) return;
+    target.disabled = true;
+    try {
+      await domainsApi(`/domains/lyr-waitlist/${encodeURIComponent(target.dataset.name)}`, { method: 'DELETE' });
+      domains.data.lyrReservations = domains.data.lyrReservations.filter((item) => item.name !== target.dataset.name);
+      render();
+      toast(`${target.dataset.name} released`);
+    } catch (error) {
+      target.disabled = false;
+      toast(error.message);
+    }
+  },
   'lyr-edit': (target) => {
     const entry = adminDomains.lyr?.find((item) => item.name === target.dataset.name);
     const form = document.getElementById('lyr-form');
@@ -2033,9 +2166,10 @@ const domainClickActions = {
     if (!confirmed(target, `Delete the ${target.dataset.type} record for ${target.dataset.name}?`)) return;
     target.disabled = true;
     try {
-      await domainsApi(`/domains/${encodeURIComponent(currentRoute.domain)}/records?type=${encodeURIComponent(target.dataset.type)}&name=${encodeURIComponent(target.dataset.name)}`, { method: 'DELETE' });
+      const where = recordTarget();
+      await domainsApi(`${where.base}/records?type=${encodeURIComponent(target.dataset.type)}&name=${encodeURIComponent(target.dataset.name)}`, { method: 'DELETE' });
       toast('Record deleted');
-      loadDomainDetail(currentRoute.domain);
+      where.reload();
     } catch (error) {
       target.disabled = false;
       toast(error.message);
@@ -2056,6 +2190,18 @@ const domainClickActions = {
 };
 
 const domainChangeActions = {
+  'subdomain-autorenew': async (target) => {
+    target.disabled = true;
+    try {
+      const { subdomain } = await domainsApi(`/domains/subdomains/${encodeURIComponent(currentRoute.label)}`, { method: 'PUT', body: JSON.stringify({ autoRenew: target.checked }) });
+      domains.sub.subdomain = subdomain;
+      toast(`Auto-renew ${target.checked ? 'on' : 'off'}`);
+    } catch (error) {
+      target.checked = !target.checked;
+      toast(error.message);
+    }
+    target.disabled = false;
+  },
   'domain-autorenew': async (target) => {
     target.disabled = true;
     try {
@@ -2077,6 +2223,39 @@ const domainChangeActions = {
 };
 
 const domainFormActions = {
+  'subdomain-claim': async (form, data) => {
+    const button = form.querySelector('[type="submit"]');
+    const label = String(data.get('label') || '').trim().toLowerCase();
+    button.disabled = true;
+    try {
+      const result = await domainsApi('/domains/subdomains', { method: 'POST', body: JSON.stringify({ label }) });
+      if (result.url) {
+        location.href = result.url;
+        return;
+      }
+      domains.data = null;
+      toast(`${result.subdomain.name} is yours`);
+      go(`#/domains/sub/${encodeURIComponent(result.subdomain.label)}`);
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message);
+    }
+  },
+  'lyr-reserve': async (form, data) => {
+    const button = form.querySelector('[type="submit"]');
+    const name = String(data.get('name') || '').trim().toLowerCase();
+    button.disabled = true;
+    try {
+      const { reservation } = await domainsApi('/domains/lyr-waitlist', { method: 'POST', body: JSON.stringify({ name }) });
+      const list = domains.data.lyrReservations.filter((item) => item.name !== reservation.name);
+      domains.data.lyrReservations = [...list, { createdAt: new Date().toISOString(), ...reservation }];
+      render();
+      toast(`${reservation.name} is reserved for you`);
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message);
+    }
+  },
   'admin-lyr-save': async (form, data) => {
     const button = form.querySelector('[type="submit"]');
     const name = String(data.get('name') || '').trim().toLowerCase().replace(/\.lyr$/, '');
@@ -2156,9 +2335,10 @@ const domainFormActions = {
     };
     button.disabled = true;
     try {
-      await domainsApi(`/domains/${encodeURIComponent(currentRoute.domain)}/records`, { method: 'PUT', body: JSON.stringify(record) });
+      const where = recordTarget();
+      await domainsApi(`${where.base}/records`, { method: 'PUT', body: JSON.stringify(record) });
       toast(`${record.type} record saved`);
-      loadDomainDetail(currentRoute.domain);
+      where.reload();
     } catch (error) {
       button.disabled = false;
       showFormError(form, error.message);
@@ -2187,6 +2367,8 @@ const domainFormActions = {
         round99: data.get('round99') === 'on',
         tlds: String(data.get('tlds')).split(/[\s,]+/).map((tld) => tld.replace(/^\./, '').toLowerCase()).filter(Boolean),
         overrides: parseOverrides(data.get('overrides')),
+        subdomainCents: Math.round(Number(data.get('subdomain')) * 100),
+        subdomainFreePlans: String(data.get('subdomainFree') || '').split(/[\s,]+/).map((plan) => plan.toLowerCase()).filter(Boolean),
       };
     } catch (error) {
       return toast(error.message);
@@ -2217,6 +2399,7 @@ function parseRoute() {
   if (parts[0] === 'workers' && parts[1]) return { view: 'worker', worker: parts[1], params };
   if (parts[0] === 'projects' && parts[1]) return { view: 'project', projectId: parts[1], params };
   if (parts[0] === 'domains' && parts[1] === 'buy') return { view: 'domain-buy', params };
+  if (parts[0] === 'domains' && parts[1] === 'sub' && parts[2]) return { view: 'subdomain', label: parts[2].toLowerCase(), params };
   if (parts[0] === 'domains' && parts[1]) return { view: 'domain', domain: parts[1].toLowerCase(), params };
   if (parts[0] && views[parts[0]]) return { view: parts[0], params };
   return { view: parts.length ? 'missing' : 'home', params };
@@ -2236,7 +2419,7 @@ function render() {
   bindCharts();
   if (currentRoute.view === 'settings') showProfile();
   if (PROJECTS_ENABLED && currentRoute.view.startsWith('project')) projectsAfterRender(currentRoute);
-  if (currentRoute.view.startsWith('domain')) domainsAfterRender(currentRoute);
+  if (isDomainView(currentRoute.view)) domainsAfterRender(currentRoute);
   if (isAdminView() && profile && isStaff(profile.role)) {
     if (!adminUsers.list && !adminUsers.loading && !adminUsers.error) loadUsers();
     if (currentRoute.params.get('tab') === 'settings' && !adminSettings.data && !adminSettings.loading) loadAdminSettings();

@@ -13,6 +13,8 @@ process.env.TABLE_NAME = 'domains';
 process.env.USERS_TABLE_NAME = 'users';
 process.env.STRIPE_SECRET_NAME = 'stripe';
 process.env.ALLOW_TEST_REGISTRATIONS = '1';
+process.env.SUBDOMAIN_ZONE = 'lyr.cloud';
+process.env.SUBDOMAIN_ZONE_ID = 'ZLYR';
 const { handler, resetCaches, tick, TEST_MODE_REASON } = await import('./index.mjs');
 
 const SUPER = { userId: 'sub-super', email: 'lyrclouds@gmail.com', provider: 'GoogleOIDC' };
@@ -171,18 +173,35 @@ Route53DomainsClient.prototype.send = async function send(command) {
 };
 
 let dnsCalls;
-let zone;
+let zone; // the registered domain's hosted zone (Z123)
+let subZone; // the lyr.cloud zone (ZLYR)
+// Route 53 lists record sets in DNS order: by labels from the right.
+const labels = (name) => String(name).replace(/\.$/, '').split('.').reverse();
+function dnsCompare(a, b) {
+  const [x, y] = [labels(a), labels(b)];
+  for (let i = 0; i < Math.min(x.length, y.length); i += 1) if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
+  return x.length - y.length;
+}
 Route53Client.prototype.send = async function send(command) {
   const name = command.constructor.name;
-  dnsCalls.push([name, command.input]);
-  if (name === 'ListHostedZonesByNameCommand') return { HostedZones: [{ Id: '/hostedzone/Z123', Name: `${command.input.DNSName}.`, Config: { PrivateZone: false } }] };
-  if (name === 'ListResourceRecordSetsCommand') return { ResourceRecordSets: structuredClone(zone), IsTruncated: false };
+  const input = command.input;
+  dnsCalls.push([name, input]);
+  const sets = () => (input.HostedZoneId === 'ZLYR' ? subZone : zone);
+  if (name === 'ListHostedZonesByNameCommand') return { HostedZones: [{ Id: '/hostedzone/Z123', Name: `${input.DNSName}.`, Config: { PrivateZone: false } }] };
+  if (name === 'ListResourceRecordSetsCommand') {
+    const sorted = structuredClone(sets()).sort((a, b) => dnsCompare(a.Name, b.Name) || (a.Type < b.Type ? -1 : 1));
+    const from = input.StartRecordName ? sorted.filter((set) => dnsCompare(set.Name, input.StartRecordName) >= 0) : sorted;
+    return { ResourceRecordSets: from, IsTruncated: false };
+  }
   if (name === 'ChangeResourceRecordSetsCommand') {
-    for (const change of command.input.ChangeBatch.Changes) {
+    let list = sets();
+    for (const change of input.ChangeBatch.Changes) {
       const set = { ...change.ResourceRecordSet, Name: change.ResourceRecordSet.Name.replace(/\.?$/, '.') };
-      zone = zone.filter((item) => !(item.Name === set.Name && item.Type === set.Type));
-      if (change.Action === 'UPSERT') zone.push(set);
+      list = list.filter((item) => !(item.Name === set.Name && item.Type === set.Type));
+      if (change.Action === 'UPSERT') list.push(set);
     }
+    if (input.HostedZoneId === 'ZLYR') subZone = list;
+    else zone = list;
     return {};
   }
   throw new Error(`unexpected ${name}`);
@@ -270,6 +289,10 @@ beforeEach(() => {
   registrarState = { taken: ['taken.com'], refuse: false, operation: 'IN_PROGRESS', expiresAt: '2027-11-04T00:00:00Z' };
   dnsCalls = [];
   zone = [{ Name: 'wonder.com.', Type: 'NS', TTL: 172800, ResourceRecords: [{ Value: 'ns-1.awsdns-01.org.' }] }];
+  subZone = [
+    { Name: 'lyr.cloud.', Type: 'NS', TTL: 172800, ResourceRecords: [{ Value: 'ns-9.awsdns-09.net.' }] },
+    { Name: 'lyr.cloud.', Type: 'SOA', TTL: 900, ResourceRecords: [{ Value: 'ns-9.awsdns-09.net. hostmaster 1 7200 900 1209600 86400' }] },
+  ];
   stripeCalls = [];
   stripeState = { decline: false };
   upstreamQueries = [];
@@ -581,4 +604,110 @@ test('the public lookup explains what a .lyr name resolves to', async () => {
   assert.deepEqual([txt.body.status, txt.body.answers[0].value], ['NOERROR', 'hello']);
   assert.equal((await call(null, 'GET', '/public/lyr/lookup', undefined, { name: 'nobody' })).body.status, 'NXDOMAIN');
   assert.equal((await call(null, 'GET', '/public/lyr/lookup', undefined, { name: 'google.com' })).status, 400);
+});
+
+// ---------------------------------------------------------------- name.lyr.cloud
+
+const subItem = (fqdn) => domainsTable().get(`sub#${fqdn}|sub`);
+const setPlan = (person, plan) => { tables.users.get(person.userId).plan = plan; };
+const paySubdomain = (order) => webhook('checkout.session.completed', { id: order.sessionId, metadata: { orderId: order.orderId }, payment_status: 'paid', amount_total: order.amountCents, currency: 'usd', payment_intent: 'pi_s', customer: 'cus_1' });
+
+test('Scale and Enterprise accounts claim a name.lyr.cloud for free and point it anywhere', async () => {
+  setPlan(ALICE, 'scale');
+  const claimed = await call(ALICE, 'POST', '/domains/subdomains', { label: 'Shop' });
+  assert.equal(claimed.status, 200);
+  assert.deepEqual([claimed.body.subdomain.name, claimed.body.subdomain.free, claimed.body.subdomain.status], ['shop.lyr.cloud', true, 'active']);
+  assert.equal((await call(BOB, 'POST', '/domains/subdomains', { label: 'shop' })).status, 409, 'taken');
+  assert.equal((await call(ALICE, 'POST', '/domains/subdomains', { label: 'www' })).status, 409, 'reserved');
+  assert.equal((await call(ALICE, 'POST', '/domains/subdomains', { label: 'no_way' })).status, 400);
+
+  // A subdomain may be a CNAME (unlike a zone's root), and only its own names are listed and edited.
+  assert.equal((await call(ALICE, 'PUT', '/domains/subdomains/shop/records', { type: 'CNAME', name: '@', values: ['myapp.lyrcloud.app'] })).status, 200);
+  assert.equal((await call(ALICE, 'PUT', '/domains/subdomains/shop/records', { type: 'TXT', name: 'mail', values: ['v=spf1 -all'] })).status, 200);
+  setPlan(BOB, 'enterprise');
+  await call(BOB, 'POST', '/domains/subdomains', { label: 'shop2' });
+  await call(BOB, 'PUT', '/domains/subdomains/shop2/records', { type: 'A', name: '@', values: ['203.0.113.66'] });
+  const detail = await call(ALICE, 'GET', '/domains/subdomains/shop');
+  assert.deepEqual(detail.body.records.map((r) => [r.type, r.label]), [['CNAME', '@'], ['TXT', 'mail']]);
+  assert.equal((await call(BOB, 'GET', '/domains/subdomains/shop')).status, 404);
+  assert.equal((await call(BOB, 'PUT', '/domains/subdomains/shop/records', { type: 'A', name: '@', values: ['203.0.113.66'] })).status, 404);
+
+  const mine = await call(ALICE, 'GET', '/domains');
+  assert.deepEqual([mine.body.subdomains.enabled, mine.body.subdomains.freeWithPlan, mine.body.subdomains.items.length], [true, true, 1]);
+
+  // Releasing deletes its records (and nothing else in the zone) and frees the name.
+  assert.equal((await call(ALICE, 'DELETE', '/domains/subdomains/shop')).status, 200);
+  assert.deepEqual(subZone.map((set) => `${set.Name} ${set.Type}`).sort(), ['lyr.cloud. NS', 'lyr.cloud. SOA', 'shop2.lyr.cloud. A']);
+  assert.equal((await call(BOB, 'POST', '/domains/subdomains', { label: 'shop' })).status, 200);
+});
+
+test('Launch accounts pay yearly through Checkout; renewals charge the saved card', async () => {
+  await connectStripe();
+  const res = await call(ALICE, 'POST', '/domains/subdomains', { label: 'cafe' });
+  assert.equal(res.status, 200);
+  assert.match(res.body.url, /checkout\.stripe\.com/);
+  const order = ordersOf().find((item) => item.orderId === res.body.orderId);
+  assert.deepEqual([order.action, order.amountCents], ['subdomain', 499]);
+  assert.equal(subItem('cafe.lyr.cloud').status, 'awaiting_payment');
+  assert.equal((await call(BOB, 'POST', '/domains/subdomains', { label: 'cafe' })).status, 409);
+  await paySubdomain(order);
+  const item = subItem('cafe.lyr.cloud');
+  assert.equal(item.status, 'active');
+  assert.ok(Math.abs(Date.parse(item.expiresAt) - Date.now() - 365 * 86_400_000) < 60_000);
+  assert.equal(item.paymentMethodId, 'pm_card');
+
+  item.expiresAt = new Date(Date.now() + 10 * 86_400_000).toISOString();
+  const before = Date.parse(item.expiresAt);
+  await tick();
+  const charge = stripeCalls.find((entry) => entry.path === '/payment_intents' && entry.method === 'POST');
+  assert.equal(charge.params.amount, '499');
+  assert.ok(Math.abs(Date.parse(subItem('cafe.lyr.cloud').expiresAt) - before - 365 * 86_400_000) < 60_000, 'a year is added on top');
+  await tick();
+  assert.equal(stripeCalls.filter((entry) => entry.path === '/payment_intents' && entry.method === 'POST').length, 1, 'charged once');
+});
+
+test('a declined subdomain renewal is reported, and names past their grace period are released', async () => {
+  await connectStripe();
+  const res = await call(ALICE, 'POST', '/domains/subdomains', { label: 'cafe' });
+  await paySubdomain(ordersOf().find((item) => item.orderId === res.body.orderId));
+  await call(ALICE, 'PUT', '/domains/subdomains/cafe/records', { type: 'A', name: '@', values: ['203.0.113.5'] });
+  subItem('cafe.lyr.cloud').expiresAt = new Date(Date.now() + 10 * 86_400_000).toISOString();
+  stripeState.decline = true;
+  await tick();
+  assert.match(subItem('cafe.lyr.cloud').lastRenewalError, /declined/);
+  subItem('cafe.lyr.cloud').expiresAt = new Date(Date.now() - 8 * 86_400_000).toISOString();
+  await tick();
+  assert.equal(subItem('cafe.lyr.cloud'), undefined);
+  assert.equal(subZone.some((set) => set.Name === 'cafe.lyr.cloud.'), false);
+});
+
+test('an abandoned subdomain checkout frees the name', async () => {
+  await connectStripe();
+  const res = await call(ALICE, 'POST', '/domains/subdomains', { label: 'cafe' });
+  const order = ordersOf().find((item) => item.orderId === res.body.orderId);
+  await webhook('checkout.session.expired', { id: order.sessionId, metadata: { orderId: order.orderId } });
+  assert.equal(subItem('cafe.lyr.cloud'), undefined);
+});
+
+// ---------------------------------------------------------------- .lyr waitlist
+
+test('anyone signed in can reserve up to three .lyr names for free, first come first served', async () => {
+  assert.deepEqual((await call(null, 'GET', '/public/lyr/available', undefined, { name: 'wonder' })).body, { name: 'wonder.lyr', available: true, reason: null });
+  assert.equal((await call(ALICE, 'POST', '/domains/lyr-waitlist', { name: 'wonder' })).status, 200);
+  assert.equal((await call(ALICE, 'POST', '/domains/lyr-waitlist', { name: 'wonder.lyr' })).status, 200, 'asking again is fine');
+  assert.equal((await call(BOB, 'POST', '/domains/lyr-waitlist', { name: 'wonder' })).status, 409);
+  assert.equal((await call(null, 'GET', '/public/lyr/available', undefined, { name: 'wonder.lyr' })).body.reason, 'waitlisted');
+  assert.equal((await call(ALICE, 'POST', '/domains/lyr-waitlist', { name: 'nic' })).status, 409, 'reserved');
+  await call(SUPER, 'PUT', '/admin/lyr/hello', { records: [] });
+  assert.equal((await call(ALICE, 'POST', '/domains/lyr-waitlist', { name: 'hello' })).status, 409, 'already in the registry');
+  for (const name of ['two', 'three']) assert.equal((await call(ALICE, 'POST', '/domains/lyr-waitlist', { name })).status, 200);
+  assert.match((await call(ALICE, 'POST', '/domains/lyr-waitlist', { name: 'four' })).body.error, /up to 3/);
+
+  assert.deepEqual((await call(ALICE, 'GET', '/domains')).body.lyrReservations.map((item) => item.name).sort(), ['three.lyr', 'two.lyr', 'wonder.lyr']);
+  const admin = await call(SUPER, 'GET', '/admin/lyr');
+  assert.deepEqual(admin.body.reservations.map((item) => item.name).sort(), ['three.lyr', 'two.lyr', 'wonder.lyr']);
+  assert.equal(admin.body.reservations[0].ownerEmail, ALICE.email);
+  assert.equal((await call(BOB, 'DELETE', '/domains/lyr-waitlist/wonder')).status, 404);
+  assert.equal((await call(ALICE, 'DELETE', '/domains/lyr-waitlist/wonder')).status, 200);
+  assert.equal((await call(BOB, 'POST', '/domains/lyr-waitlist', { name: 'wonder' })).status, 200);
 });

@@ -16,6 +16,9 @@ export const DEFAULT_PRICING = {
   round99: true,
   tlds: DEFAULT_TLDS,
   overrides: {},
+  // name.<subdomain zone> (lyr.cloud): the yearly price, and the plans that include one for free.
+  subdomainCents: 499,
+  subdomainFreePlans: ['scale', 'enterprise'],
 };
 
 export const MAX_YEARS = 5;
@@ -71,6 +74,8 @@ export function pricingError(body) {
   if ('flatCents' in body && !(Number.isInteger(body.flatCents) && num(body.flatCents, 100_000))) return [400, 'Flat commission must be 0 to 100000 cents.'];
   if ('dnsCentsPerYear' in body && !(Number.isInteger(body.dnsCentsPerYear) && num(body.dnsCentsPerYear, 10_000))) return [400, 'DNS cost must be 0 to 10000 cents.'];
   if ('round99' in body && typeof body.round99 !== 'boolean') return [400, '"round99" must be true or false.'];
+  if ('subdomainCents' in body && !(Number.isInteger(body.subdomainCents) && body.subdomainCents >= 50 && body.subdomainCents <= 100_000)) return [400, 'Subdomain price must be 50 to 100000 cents.'];
+  if ('subdomainFreePlans' in body && !(Array.isArray(body.subdomainFreePlans) && body.subdomainFreePlans.every((plan) => ['launch', 'scale', 'enterprise'].includes(plan)))) return [400, 'Free plans must be launch, scale or enterprise.'];
   if ('tlds' in body) {
     if (!Array.isArray(body.tlds) || !body.tlds.length || body.tlds.length > 100) return [400, 'List between 1 and 100 TLDs.'];
     if (!body.tlds.every((tld) => typeof tld === 'string' && /^[a-z]{2,63}$/.test(tld))) return [400, 'TLDs are lowercase letters only, without the dot.'];
@@ -238,8 +243,9 @@ export function txtValue(text) {
   return chunks.map((chunk) => `"${chunk.replace(/["\\]/g, '\\$&')}"`).join(' ');
 }
 
-// Returns [status, message] or null for a record set { type, name, values[], ttl }.
-export function recordError(record, domain) {
+// Returns [status, message] or null for a record set { type, name, values[], ttl }. A zone's root can't
+// be a CNAME, but a subdomain someone holds inside our zone (shop.lyr.cloud) can: pass apexCname.
+export function recordError(record, domain, { apexCname = false } = {}) {
   if (!record || !RECORD_TYPES.includes(record.type)) return [400, `Type must be one of ${RECORD_TYPES.join(', ')}.`];
   const name = recordName(record.name, domain);
   if (!name) return [400, 'Enter a valid record name, or @ for the domain itself.'];
@@ -255,7 +261,7 @@ export function recordError(record, domain) {
     TXT: [(v) => v.length <= 4000, 'TXT values are at most 4000 characters.'],
   }[record.type];
   if (!values.every(check[0])) return [400, check[1]];
-  if (record.type === 'CNAME' && name === domain) return [400, 'The domain itself can’t be a CNAME. Use an A record.'];
+  if (record.type === 'CNAME' && name === domain && !apexCname) return [400, 'The domain itself can’t be a CNAME. Use an A record.'];
   if (record.type === 'CNAME' && values.length > 1) return [400, 'A CNAME has exactly one target.'];
   return null;
 }
@@ -312,3 +318,18 @@ export const stripeMode = (secretKey) => (String(secretKey).startsWith('sk_live_
 
 // When an auto-renewing domain should be charged: RENEW_DAYS_BEFORE days before it expires.
 export const renewalDue = (expiresAt, now = Date.now()) => Boolean(expiresAt) && new Date(expiresAt).getTime() - now <= RENEW_DAYS_BEFORE * 86_400_000;
+
+// ------------------------------------------------------------------ name.lyr.cloud subdomains
+
+// Labels kept for Lyrcloud in the subdomain zone.
+export const RESERVED_SUBDOMAINS = ['www', 'mail', 'email', 'smtp', 'imap', 'pop', 'mx', 'api', 'app', 'admin', 'dash', 'dashboard', 'dns', 'ns', 'ns1', 'ns2', 'ns3', 'ns4',
+  'lyr', 'lyrcloud', 'support', 'help', 'status', 'blog', 'docs', 'cdn', 'static', 'assets', 'billing', 'account', 'login', 'auth', 'secure', 'root', 'test', 'dev', 'staging'];
+export const MAX_SUBDOMAINS = 5;
+export const MAX_LYR_RESERVATIONS = 3;
+
+// "My-Shop" -> "my-shop"; null if it can't be a label (letters, digits, hyphens, 1-63 characters).
+export function cleanLabel(input) {
+  const label = String(input || '').trim().toLowerCase();
+  if (!LABEL_RE.test(label) || (label.slice(2, 4) === '--' && !label.startsWith('xn--'))) return null;
+  return label;
+}

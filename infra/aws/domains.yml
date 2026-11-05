@@ -22,6 +22,14 @@ Parameters:
   AllowedOrigins:
     Type: CommaDelimitedList
     Default: 'https://www.lyrcloud.com,http://localhost:5173'
+  SubdomainZone:
+    Type: String
+    Default: ''
+    Description: Domain whose subdomains customers claim (lyr.cloud). Blank keeps name.<zone> switched off.
+  SubdomainZoneId:
+    Type: String
+    Default: ''
+    Description: The Route 53 hosted zone ID of SubdomainZone.
 
 Resources:
   DomainsTable:
@@ -128,6 +136,8 @@ Resources:
           SUPER_ADMIN_EMAIL: !Ref SuperAdminEmail
           SITE_URL: https://www.lyrcloud.com
           ALLOWED_ORIGINS: !Join [',', !Ref AllowedOrigins]
+          SUBDOMAIN_ZONE: !Ref SubdomainZone
+          SUBDOMAIN_ZONE_ID: !Ref SubdomainZoneId
       Code:
         S3Bucket: !Ref ArtifactsBucketName
         S3Key: !Ref LambdaCodeS3Key
@@ -223,10 +233,13 @@ Resources:
   LyrLookupRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /public/lyr/lookup', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE }
+  LyrAvailableRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /public/lyr/available', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE }
 
   Stage:
     Type: AWS::ApiGatewayV2::Stage
-    DependsOn: [SearchRoute, DohGetRoute, DohPostRoute, LyrLookupRoute]
+    DependsOn: [SearchRoute, DohGetRoute, DohPostRoute, LyrLookupRoute, LyrAvailableRoute]
     Properties:
       ApiId: !Ref HttpApi
       StageName: '$default'
@@ -247,6 +260,9 @@ Resources:
           ThrottlingBurstLimit: 500
           ThrottlingRateLimit: 200
         'GET /public/lyr/lookup':
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        'GET /public/lyr/available':
           ThrottlingBurstLimit: 10
           ThrottlingRateLimit: 5
 
