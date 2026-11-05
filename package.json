@@ -9,7 +9,7 @@
     "check": "node scripts/check.mjs",
     "create:s3": "bash scripts/create-s3.sh",
     "deploy:aws": "bash scripts/deploy-aws.sh",
-    "test": "node --test api/account/roles.test.mjs api/account/handler.test.mjs api/account/lyrbot.test.mjs api/account/messages.test.mjs api/github-bridge/index.test.mjs api/projects/rules.test.mjs api/projects/handler.test.mjs"
+    "test": "node --test api/account/roles.test.mjs api/account/handler.test.mjs api/account/lyrbot.test.mjs api/account/messages.test.mjs api/github-bridge/index.test.mjs api/projects/rules.test.mjs api/projects/handler.test.mjs api/domains/rules.test.mjs api/domains/handler.test.mjs"
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.133.0",
@@ -18,6 +18,8 @@
     "@aws-sdk/client-codebuild": "^3.1161.0",
     "@aws-sdk/client-cognito-identity-provider": "^3.1161.0",
     "@aws-sdk/client-dynamodb": "^3.682.0",
+    "@aws-sdk/client-route-53": "^3.1162.0",
+    "@aws-sdk/client-route-53-domains": "^3.1162.0",
     "@aws-sdk/client-s3": "^3.1161.0",
     "@aws-sdk/client-secrets-manager": "^3.1152.0",
     "@aws-sdk/client-sesv2": "^3.1161.0",

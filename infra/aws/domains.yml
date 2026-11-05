@@ -1,0 +1,245 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lyrcloud Domains - search, sell, transfer in and renew domains through Route 53 Domains, paid with Stripe.
+# Deploy with scripts/deploy-domains.sh. Lambda source: api/domains/ (plus api/account/roles.mjs and phone.mjs).
+# The Lambda uses the AWS SDK that ships with the Node.js runtime; Stripe is called over its REST API.
+
+Parameters:
+  ArtifactsBucketName:
+    Type: String
+    Default: lyrcloud-deploy-artifacts
+  LambdaCodeS3Key:
+    Type: String
+  UserPoolId:
+    Type: String
+  UserPoolClientId:
+    Type: String
+  UsersTableName:
+    Type: String
+    Default: lyrcloud-users
+  SuperAdminEmail:
+    Type: String
+    Default: lyrclouds@gmail.com
+  AllowedOrigins:
+    Type: CommaDelimitedList
+    Default: 'https://www.lyrcloud.com,http://localhost:5173'
+
+Resources:
+  DomainsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: lyrcloud-domains
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: ownerId, AttributeType: S }
+        - { AttributeName: createdAt, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: byOwner
+          KeySchema:
+            - { AttributeName: ownerId, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+
+  # Stripe secret key and webhook signing secret. The API writes them when the super admin connects
+  # Stripe in the admin console; leave this placeholder unchanged or the stored values are replaced.
+  StripeSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: lyrcloud/stripe
+      Description: Stripe credentials for Lyrcloud Domains. Written by the domains API.
+      SecretString: '{}'
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: Domains
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:Scan]
+                Resource: [!GetAtt DomainsTable.Arn, !Sub '${DomainsTable.Arn}/index/*']
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${UsersTableName}'
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue, secretsmanager:PutSecretValue]
+                Resource: !Ref StripeSecret
+              # Route 53 Domains has no resource-level permissions. The API only registers, transfers
+              # or renews a domain after Stripe confirms the customer paid for it.
+              - Effect: Allow
+                Action:
+                  - route53domains:CheckDomainAvailability
+                  - route53domains:CheckDomainTransferability
+                  - route53domains:GetDomainSuggestions
+                  - route53domains:ListPrices
+                  - route53domains:GetDomainDetail
+                  - route53domains:GetOperationDetail
+                  - route53domains:RegisterDomain
+                  - route53domains:TransferDomain
+                  - route53domains:RenewDomain
+                Resource: '*'
+              # Registering a domain makes a hosted zone for it. The API only edits zones it looked up
+              # for a domain the caller owns.
+              - Effect: Allow
+                Action: route53:ListHostedZonesByName
+                Resource: '*'
+              - Effect: Allow
+                Action: [route53:ListResourceRecordSets, route53:ChangeResourceRecordSets, route53:GetHostedZone]
+                Resource: 'arn:aws:route53:::hostedzone/*'
+              # RegisterDomain creates the hosted zone on the caller's behalf.
+              - Effect: Allow
+                Action: [route53:CreateHostedZone, route53:GetChange]
+                Resource: '*'
+
+  DomainsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lyrcloud-domains
+      Runtime: nodejs22.x
+      Handler: domains/index.handler
+      Role: !GetAtt FunctionRole.Arn
+      MemorySize: 512
+      Timeout: 120 # the scheduled run follows every domain; API Gateway still answers callers within 30 s
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DomainsTable
+          USERS_TABLE_NAME: !Ref UsersTableName
+          STRIPE_SECRET_NAME: !Ref StripeSecret
+          SUPER_ADMIN_EMAIL: !Ref SuperAdminEmail
+          SITE_URL: https://www.lyrcloud.com
+          ALLOWED_ORIGINS: !Join [',', !Ref AllowedOrigins]
+      Code:
+        S3Bucket: !Ref ArtifactsBucketName
+        S3Key: !Ref LambdaCodeS3Key
+
+  # Follows registrar operations and charges auto-renewals.
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Lyrcloud Domains - follow registrations and transfers, charge and run renewals.
+      ScheduleExpression: rate(15 minutes)
+      Targets:
+        - Id: domains
+          Arn: !GetAtt DomainsFunction.Arn
+
+  SchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DomainsFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: lyrcloud-domains-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: !Ref AllowedOrigins
+        AllowMethods: [GET, PUT, POST, DELETE, OPTIONS]
+        AllowHeaders: [Authorization, Content-Type]
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      Name: CognitoJwtAuthorizer
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration:
+        Audience: [!Ref UserPoolClientId]
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}'
+
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt DomainsFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  ListDomainsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /domains', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  DomainGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /domains/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  DomainPostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'POST /domains/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  DomainPutRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'PUT /domains/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  DomainDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'DELETE /domains/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  AdminGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /admin/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  AdminPutRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'PUT /admin/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  AdminDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'DELETE /admin/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  # Unauthenticated: the public search and price list, and Stripe's webhook (checked by its signature).
+  SearchRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /public/domains/search', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE }
+  PricesRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /public/domains/prices', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE }
+  StripeWebhookRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'POST /public/stripe/webhook', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE }
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    DependsOn: [SearchRoute]
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 20
+      # Route 53 Domains allows about five requests a second for the whole account.
+      RouteSettings:
+        'GET /public/domains/search':
+          ThrottlingBurstLimit: 6
+          ThrottlingRateLimit: 2
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DomainsFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*'
+
+Outputs:
+  DomainsApiBaseUrl:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  StripeWebhookUrl:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/public/stripe/webhook'

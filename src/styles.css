@@ -1845,3 +1845,96 @@ code.inline {
 .lyrbot-whatsapp { display: inline-flex; align-items: center; gap: 5px; padding: 5px 10px; border-radius: 999px; background: color-mix(in srgb, var(--success) 14%, var(--surface-solid)); color: var(--success); font-weight: 700; text-decoration: none; }
 .lyrbot-whatsapp svg { width: 15px; height: 15px; }
 .lyrbot-email { color: var(--link); font-weight: 600; text-decoration: none; }
+
+/* Domains page (domains.js): search and results. */
+.domain-search {
+  display: flex;
+  gap: 10px;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 10px;
+}
+
+.domain-search input {
+  flex: 1;
+  min-width: 0;
+  min-height: 48px;
+  padding: 0 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--text);
+  background: var(--surface-solid);
+  font: inherit;
+  font-size: 1.05rem;
+}
+
+.domain-status {
+  max-width: 760px;
+  min-height: 1.5em;
+  margin: 12px auto 0;
+  color: var(--muted);
+  text-align: center;
+}
+
+.domain-results {
+  display: grid;
+  gap: 8px;
+  max-width: 760px;
+  margin: 12px auto 0;
+  padding: 0;
+  list-style: none;
+}
+
+.domain-result {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface-solid);
+}
+
+.domain-result.is-available {
+  border-color: color-mix(in srgb, var(--brand) 55%, var(--line));
+}
+
+.domain-result .domain-name {
+  overflow-wrap: anywhere;
+  font-weight: 700;
+}
+
+.domain-price {
+  display: grid;
+  justify-items: end;
+  text-align: right;
+}
+
+.domain-price small,
+.domain-price.muted {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.domain-subhead {
+  max-width: 760px;
+  margin: 28px auto 0;
+  font-size: 1rem;
+}
+
+@media (max-width: 560px) {
+  .domain-search {
+    flex-direction: column;
+  }
+
+  .domain-result {
+    grid-template-columns: 1fr auto;
+  }
+
+  .domain-result .domain-price {
+    justify-items: start;
+    text-align: left;
+    grid-row: 2;
+  }
+}
