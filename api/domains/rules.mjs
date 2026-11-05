@@ -2,18 +2,19 @@
 // DNS records and Stripe webhook signatures. Everything here is synchronous and side-effect free.
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
-// TLDs sold out of the box. All of them register on Route 53 without TLD-specific extra parameters;
+// TLDs sold out of the box. None of them need TLD-specific registry fields at DNA (the registrar);
 // the super admin can change the list in the admin console.
 export const DEFAULT_TLDS = ['com', 'net', 'org', 'io', 'co', 'dev', 'app', 'xyz', 'online', 'site', 'store', 'tech', 'me', 'info', 'biz', 'cloud'];
 
-// Lyrcloud's commission on top of what the registrar charges. `dnsCentsPerYear` is what DNS hosting
-// costs Lyrcloud per domain (a Route 53 hosted zone is $0.50 a month); it's added to the cost of
-// registrations and renewals that use Lyrcloud DNS. `round99` rounds the final price up to .99.
+// Lyrcloud's commission on top of what the registrar charges: 1%, so domains sell at close to DNA's
+// cost. `dnsCentsPerYear` is what DNS hosting costs Lyrcloud per domain and is added to registrations and
+// renewals that use Lyrcloud DNS; DNA hosts the zones of the domains it registers for free, so it's 0.
+// `round99` rounds the final price up to .99.
 export const DEFAULT_PRICING = {
-  percent: 10,
+  percent: 1,
   flatCents: 0,
-  dnsCentsPerYear: 600,
-  round99: true,
+  dnsCentsPerYear: 0,
+  round99: false,
   tlds: DEFAULT_TLDS,
   overrides: {},
   // name.<subdomain zone> (lyr.cloud): the yearly price, and the plans that include one for free.
@@ -110,8 +111,8 @@ export function retailCents(cost, tld, config) {
   return Math.max(cents, cost);
 }
 
-// Register and renewal include DNS hosting (Route 53 makes a hosted zone for every registration);
-// transfers keep the customer's current DNS, so they don't.
+// Register and renewal include DNS hosting (every registration gets Lyrcloud DNS); transfers keep the
+// customer's current DNS, so they don't.
 export function quote(prices, tld, config) {
   const cost = {
     register: costCents(prices, tld, 'register', config, true),
@@ -130,20 +131,6 @@ export function quote(prices, tld, config) {
 }
 
 export const stripeFeeCents = (amount) => Math.round((amount * STRIPE_PERCENT) / 100) + STRIPE_FIXED_CENTS;
-
-// Route 53's price list ({ Name, RegistrationPrice: { Price }, ... }[]) -> { [tld]: { register, renew, transfer } }.
-export function priceTable(list) {
-  const table = {};
-  for (const item of list || []) {
-    if (!item?.Name) continue;
-    table[item.Name] = {
-      register: item.RegistrationPrice?.Price ?? null,
-      renew: item.RenewalPrice?.Price ?? null,
-      transfer: item.TransferPrice?.Price ?? null,
-    };
-  }
-  return table;
-}
 
 // ------------------------------------------------------------------ registrant contact
 
@@ -173,25 +160,6 @@ export function contactError(contact) {
 // Keeps only known contact fields, trimmed.
 export const cleanContact = (contact) =>
   Object.fromEntries(Object.keys(CONTACT_FIELDS).filter((key) => contact?.[key]).map((key) => [key, String(contact[key]).trim()]));
-
-// Our contact shape -> Route 53 Domains ContactDetail.
-export function route53Contact(contact) {
-  const c = cleanContact(contact);
-  return {
-    ContactType: c.organization ? 'COMPANY' : 'PERSON',
-    ...(c.organization ? { OrganizationName: c.organization } : {}),
-    FirstName: c.firstName,
-    LastName: c.lastName,
-    AddressLine1: c.address1,
-    ...(c.address2 ? { AddressLine2: c.address2 } : {}),
-    City: c.city,
-    ...(c.state ? { State: c.state } : {}),
-    CountryCode: c.country,
-    ZipCode: c.zip,
-    PhoneNumber: `+${c.phoneCountry.replace('+', '')}.${c.phone.replace(/[\s().-]/g, '')}`,
-    Email: c.email,
-  };
-}
 
 // ------------------------------------------------------------------ orders
 

@@ -32,6 +32,8 @@ function row(item) {
     action = el('a', { class: 'button ghost', href: buyUrl(item.domain, 'transfer') }, 'Own it? Transfer in');
   } else if (item.status === 'NOT_SOLD') {
     note = el('span', { class: 'domain-price muted' }, `We don’t sell .${item.tld} yet`);
+  } else if (item.status === 'PREMIUM' || item.status === 'DOCUMENTS') {
+    note = el('span', { class: 'domain-price muted' }, item.status === 'PREMIUM' ? 'Premium name, not sold here' : 'Needs registry documents');
   } else {
     note = el('span', { class: 'domain-price muted' }, 'Couldn’t check right now');
     action = el('button', { class: 'button ghost', type: 'button', 'data-q': item.domain }, 'Check again');
