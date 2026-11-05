@@ -13,13 +13,13 @@ import {
   recordError,
   recordName,
   retailCents,
-  route53Contact,
   route53RecordSet,
   searchName,
   stripeForm,
   txtValue,
   validStripeSignature,
 } from './rules.mjs';
+import { alreadyDone, dnaAvailability, dnaContact, dnaDate, DnaError, dnaPriceTable, fromDnaZone, zoneStruct } from './dna.mjs';
 
 const CONTACT = {
   firstName: 'Ada', lastName: 'Lovelace', email: 'ada@example.com', phoneCountry: '+44', phone: '20 7946 0958',
@@ -66,17 +66,75 @@ test('pricing updates are validated', () => {
   assert.equal(pricingError({ overrides: { io: { percent: 900 } } })[0], 400);
 });
 
-test('contacts are validated and mapped to Route 53', () => {
+test('contacts are validated and mapped to DNA', () => {
   assert.equal(contactError(CONTACT), null);
   assert.match(contactError({ ...CONTACT, email: 'nope' })[1], /email/);
   assert.match(contactError({ ...CONTACT, country: 'Britain' })[1], /country/i);
   assert.match(contactError({ ...CONTACT, phone: 'call me' })[1], /digits/);
   assert.match(contactError({ ...CONTACT, city: ' ' })[1], /City/);
-  const mapped = route53Contact({ ...CONTACT, organization: 'Engines Ltd' });
-  assert.equal(mapped.PhoneNumber, '+44.2079460958');
-  assert.equal(mapped.ContactType, 'COMPANY');
-  assert.equal(mapped.CountryCode, 'GB');
-  assert.equal(route53Contact(CONTACT).ContactType, 'PERSON');
+  const mapped = dnaContact({ ...CONTACT, organization: 'Engines Ltd', address2: 'Floor 2' });
+  assert.deepEqual(mapped, {
+    firstName: 'Ada', lastName: 'Lovelace', companyName: 'Engines Ltd', eMail: 'ada@example.com',
+    address: '1 Analytical Way, Floor 2', city: 'London', state: 'London', postalCode: 'N1 9GU', country: 'GB',
+    phoneCountryCode: '44', phone: '2079460958',
+  });
+  assert.equal('companyName' in dnaContact(CONTACT), false, 'individuals send no company, or DNA fills in their name');
+});
+
+test('the DNA catalogue becomes a yearly USD price table for the account’s price group', () => {
+  const entry = (name, extra = {}) => ({
+    name, registrationPeriods: [1, 2, 3], renewalPeriods: [1, 2], isPrivacyAvailable: true, attributes: [],
+    prices: [
+      { priceGroup: 'Platinum', register: [{ period: 1, price: 9, currency: 'USD' }], renew: [{ period: 1, price: 9, currency: 'USD' }], transfer: [] },
+      { priceGroup: 'Reseller', register: [{ period: 3, price: 36.57, currency: 'USD' }, { period: 1, price: 11.99, currency: 'USD' }], renew: [{ period: 1, price: 12.29, currency: 'USD' }], transfer: [{ period: 1, price: 11.99, currency: 'USD' }] },
+    ],
+    ...extra,
+  });
+  const table = dnaPriceTable([
+    entry('com'),
+    entry('com.tr', { attributes: [{ key: 'TRABISDOMAINCATEGORY', isRequired: true, type: 'DropdownList' }] }),
+    entry('eu', { isTrusteeRequired: true }),
+    { name: 'nope', prices: [] },
+  ], 'Reseller');
+  assert.deepEqual(table.com, { register: 11.99, renew: 12.29, transfer: 11.99, registerYears: [1, 2, 3], renewYears: [1, 2], privacy: true, transferable: true, transferCheck: true, plain: true });
+  assert.equal(table['com.tr'].plain, false, 'extensions with required registry fields are not sold');
+  assert.equal(table.eu.plain, false);
+  assert.equal('nope' in table, false);
+  // 1% commission, no .99 rounding, DNS hosting free: $11.99 -> $12.11.
+  assert.equal(quote(table, 'com', pricingConfig()).register, 1211);
+});
+
+test('DNA search answers, dates, zones and never-retry errors are translated', () => {
+  assert.equal(dnaAvailability({ status: 'AVAILABLE' }), 'AVAILABLE');
+  assert.equal(dnaAvailability({ status: 'AVAILABLE', isPremium: true }), 'PREMIUM');
+  assert.equal(dnaAvailability({ status: 'AVAILABLE', isDocumentRequired: true }), 'DOCUMENTS');
+  assert.equal(dnaAvailability({ status: 'NOTAVAILABLE' }), 'UNAVAILABLE');
+  assert.equal(dnaAvailability({ status: 'ERROR' }), 'DONT_KNOW');
+  assert.equal(dnaAvailability(undefined), 'DONT_KNOW');
+  assert.equal(dnaDate('2027-11-05T05:23:33.627'), '2027-11-05T02:23:33.627Z', 'no zone means Turkish time');
+  assert.equal(dnaDate('2027-11-05T05:23:33.6275008+03:00'), '2027-11-05T02:23:33.627Z');
+  assert.equal(dnaDate('0001-01-01T00:00:00'), null);
+
+  const records = fromDnaZone([
+    { name: 'wonder.com.', type: 'SOA', ttl: 3600, records: [{ content: 'tr.domainnameapi.com. hostmaster 1 2 3 4 5' }] },
+    { name: 'wonder.com.', type: 'TXT', ttl: 300, records: [{ content: '"v=spf1 -all"' }] },
+    { name: 'www.wonder.com.', type: 'CNAME', ttl: 3600, records: [{ content: 'wonder.com.' }] },
+    { name: 'old.wonder.com.', type: 'A', ttl: 3600, records: [{ content: '203.0.113.1', disabled: true }] },
+  ], 'wonder.com');
+  assert.deepEqual(records, [
+    { type: 'TXT', name: 'wonder.com', label: '@', values: ['v=spf1 -all'], ttl: 300 },
+    { type: 'CNAME', name: 'www.wonder.com', label: 'www', values: ['wonder.com'], ttl: 3600 },
+  ]);
+  assert.deepEqual(zoneStruct({ type: 'TXT', name: '@', values: ['"v=spf1 -all"'], ttl: 600 }, 'wonder.com'), { name: '@', type: 'TXT', ttl: 600, contents: ['v=spf1 -all'] });
+  assert.equal(zoneStruct({ type: 'A', name: 'shop.wonder.com', values: ['203.0.113.9'] }, 'wonder.com').name, 'shop');
+
+  const err = (code, message) => new DnaError(message, { code });
+  assert.equal(alreadyDone(err('Dna.DomainService:Domain:10059', 'x')), true);
+  assert.equal(alreadyDone(err('Dna.DomainService:Domain:10060', 'x')), true);
+  assert.equal(alreadyDone(err('Dna.DomainService:Domain:10058', 'Registry created the domain but it could not be recorded')), true);
+  assert.equal(alreadyDone(err('Dna.DomainService:Domain:10058', 'Domain name mixes multiple scripts')), false, 'the harmless meaning of 10058');
+  assert.equal(alreadyDone(err('Dna.DomainService:Deposit:10001', 'Insufficient balance')), false);
+  assert.equal(alreadyDone(new Error('network')), false);
 });
 
 test('checkout requests are validated', () => {

@@ -1465,7 +1465,7 @@ function adminGithubAppPanel(isSuper) {
 
 // ------------------------------------------------------------------ Lyrcloud Domains
 
-// Real: domains are bought from the registrar (Route 53 Domains) through the domains API once the
+// Real: domains are bought from the registrar (DNA, Domain Name API) through the domains API once the
 // customer has paid with Stripe. Registered domains get Lyrcloud DNS, edited here with real records.
 const domainsApi = (path, options) => api(path, options, DOMAINS_API_BASE);
 const DOMAINS_ENABLED = !DOMAINS_API_BASE.endsWith('.invalid');
@@ -1622,10 +1622,14 @@ function domainResult(item) {
     ? `<a class="btn primary small" href="${buy}">Buy</a>`
     : item.status === 'UNAVAILABLE'
       ? `<a class="btn small" href="${buy}&action=transfer">Transfer in</a>`
-      : item.status === 'NOT_SOLD' ? '' : `<button class="btn small" data-action="domain-search-again" data-q="${esc(item.domain)}">Check again</button>`;
+      : ['NOT_SOLD', 'PREMIUM', 'DOCUMENTS'].includes(item.status) ? '' : `<button class="btn small" data-action="domain-search-again" data-q="${esc(item.domain)}">Check again</button>`;
+  const unavailable = {
+    UNAVAILABLE: 'Taken', NOT_SOLD: `We don’t sell .${esc(item.tld)} yet`, DONT_KNOW: 'Couldn’t check right now',
+    PREMIUM: 'Premium name, not sold here', DOCUMENTS: 'Needs registry documents',
+  };
   const note = item.available
     ? `<b>${money(item.price)}</b><small>first year · renews at ${money(item.renew)}/yr</small>`
-    : `<span class="muted">${item.status === 'UNAVAILABLE' ? 'Taken' : item.status === 'NOT_SOLD' ? `We don’t sell .${esc(item.tld)} yet` : item.status === 'DONT_KNOW' ? 'Couldn’t check right now' : 'Not available'}</span>`;
+    : `<span class="muted">${unavailable[item.status] || 'Not available'}</span>`;
   return `<li class="domain-result${item.available ? ' is-available' : ''}"><span class="domain-name mono">${esc(item.domain)}</span><span class="domain-price">${note}</span>${action}</li>`;
 }
 
@@ -1800,6 +1804,13 @@ function domainView(route) {
     ${progress ? `<section class="panel callout"><p>${progress}</p></section>` : ''}
     ${item.failureReason ? `<section class="panel"><p class="form-error">The registry didn’t accept this ${item.action === 'transfer' ? 'transfer' : 'registration'}: ${esc(item.failureReason)}. Your payment was refunded in full.</p></section>` : ''}
     ${item.lastRenewalError ? `<section class="panel"><p class="form-error">${esc(item.lastRenewalError)}</p></section>` : ''}
+    ${item.testRegistry ? '<section class="panel callout"><p>Bought with a Stripe test card, so this domain lives in the registrar’s test registry. It isn’t real and doesn’t resolve.</p></section>' : ''}
+    ${detail.verification?.pending ? `
+      <section class="panel callout">
+        <p><b>Confirm the owner’s e-mail address.</b> The registry sent a link to <b>${esc(detail.verification.email || 'the registrant')}</b>.
+        ${detail.verification.expired ? 'The link has expired and the domain may be suspended — send a new one.' : `If nobody clicks it by ${detail.verification.deadline ? formatDate(detail.verification.deadline) : 'its deadline'}, the registry suspends the domain and it stops working until it’s confirmed.`}</p>
+        <button class="btn small" data-action="domain-verify-email">Send the e-mail again</button>
+      </section>` : ''}
     ${live ? `
       <div class="grid-2">
         <section class="panel">
@@ -2003,7 +2014,7 @@ function adminDomainsTab(isSuper) {
         <label class="field">Per-TLD commission (one per line, e.g. “io 5% +2.00”)<textarea name="overrides" rows="3" class="mono"${lock}>${esc(overridesText(config.overrides))}</textarea></label>
         ${isSuper ? '<div class="row"><button class="btn primary" type="submit">Save prices</button></div>' : '<p class="muted">Only the super admin can change prices.</p>'}
       </form>
-      <p class="muted small">Price = (registrar cost + DNS hosting) × (1 + commission) + flat fee. Route 53 makes a DNS zone for every registration at $0.50/month; transfers keep their own DNS, so they don’t include it.</p>
+      <p class="muted small">Price = (registrar cost + DNS hosting) × (1 + commission) + flat fee. Domains are bought from DNA, paid from Lyrcloud’s prepaid DNA balance, and DNA hosts their DNS for free; transfers keep their own DNS, so they never include it. Stripe’s fee is paid out of the commission.</p>
       <div class="table-scroll"><table class="table">
         <thead><tr><th>TLD</th><th>Your cost</th><th>Register</th><th>Renew</th><th>Transfer</th><th>Card fee</th><th>Margin / yr</th></tr></thead>
         <tbody>${pricing.tlds.map((row) => `<tr${row.sold ? '' : ' class="muted"'}>
@@ -2198,6 +2209,16 @@ const domainChangeActions = {
       toast(`Auto-renew ${target.checked ? 'on' : 'off'}`);
     } catch (error) {
       target.checked = !target.checked;
+      toast(error.message);
+    }
+    target.disabled = false;
+  },
+  'domain-verify-email': async (target) => {
+    target.disabled = true;
+    try {
+      const result = await domainsApi(`/domains/${encodeURIComponent(currentRoute.domain)}/verify-email`, { method: 'POST' });
+      toast(result.verified ? 'Already confirmed — nothing to send.' : 'Sent. Check the inbox, and the spam folder.');
+    } catch (error) {
       toast(error.message);
     }
     target.disabled = false;

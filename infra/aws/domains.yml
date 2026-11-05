@@ -66,6 +66,15 @@ Resources:
       Description: Stripe credentials for Lyrcloud Domains. Written by the domains API.
       SecretString: '{}'
 
+  # DNA (the registrar) credentials: { apiKey, resellerId, testApiKey }. deploy-domains.sh writes them from
+  # DNA_API_KEY, DNA_RESELLER_ID and DNA_TEST_API_KEY; leave this placeholder unchanged or they're replaced.
+  DnaSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: lyrcloud/dna
+      Description: DNA Rest API credentials for Lyrcloud Domains. Written by deploy-domains.sh.
+      SecretString: '{}'
+
   FunctionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -92,32 +101,16 @@ Resources:
               - Effect: Allow
                 Action: [secretsmanager:GetSecretValue, secretsmanager:PutSecretValue]
                 Resource: !Ref StripeSecret
-              # Route 53 Domains has no resource-level permissions. The API only registers, transfers
-              # or renews a domain after Stripe confirms the customer paid for it.
+              # Domains are bought from DNA over HTTPS with the key in this secret, only after Stripe
+              # confirms the customer paid.
               - Effect: Allow
-                Action:
-                  - route53domains:CheckDomainAvailability
-                  - route53domains:CheckDomainTransferability
-                  - route53domains:GetDomainSuggestions
-                  - route53domains:ListPrices
-                  - route53domains:GetDomainDetail
-                  - route53domains:GetOperationDetail
-                  - route53domains:RegisterDomain
-                  - route53domains:TransferDomain
-                  - route53domains:RenewDomain
-                Resource: '*'
-              # Registering a domain makes a hosted zone for it. The API only edits zones it looked up
-              # for a domain the caller owns.
-              - Effect: Allow
-                Action: route53:ListHostedZonesByName
-                Resource: '*'
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DnaSecret
+              # Route 53 hosts the name.lyr.cloud zone and the zones of domains bought before the switch
+              # to DNA. The API only edits a zone stored on a domain or subdomain the caller owns.
               - Effect: Allow
                 Action: [route53:ListResourceRecordSets, route53:ChangeResourceRecordSets, route53:GetHostedZone]
                 Resource: 'arn:aws:route53:::hostedzone/*'
-              # RegisterDomain creates the hosted zone on the caller's behalf.
-              - Effect: Allow
-                Action: [route53:CreateHostedZone, route53:GetChange]
-                Resource: '*'
 
   DomainsFunction:
     Type: AWS::Lambda::Function
@@ -133,6 +126,7 @@ Resources:
           TABLE_NAME: !Ref DomainsTable
           USERS_TABLE_NAME: !Ref UsersTableName
           STRIPE_SECRET_NAME: !Ref StripeSecret
+          DNA_SECRET_NAME: !Ref DnaSecret
           SUPER_ADMIN_EMAIL: !Ref SuperAdminEmail
           SITE_URL: https://www.lyrcloud.com
           ALLOWED_ORIGINS: !Join [',', !Ref AllowedOrigins]

@@ -1,13 +1,14 @@
-// Lyrcloud Domains API: search, buy, transfer in and renew domains, resold through Route 53 Domains
-// with Lyrcloud's commission on top (rules.mjs) and paid with Stripe Checkout.
+// Lyrcloud Domains API: search, buy, transfer in and renew domains, resold from DNA (Domain Name API,
+// dna.mjs) with Lyrcloud's commission on top (rules.mjs) and paid with Stripe Checkout.
 //
 //   GET    /public/domains/search?q=name     availability and prices for a name across TLDs
 //   GET    /public/domains/prices            the price list for every TLD Lyrcloud sells
 //   POST   /public/stripe/webhook            Stripe events: payment done -> register/transfer/renew
 //   GET    /domains                          your domains, your saved registrant contact, payments status
 //   POST   /domains/checkout                 { action, domain, years?, autoRenew?, contact?, authCode? } -> Stripe URL
-//   GET    /domains/{name}                   one domain, its registrar details and DNS records
+//   GET    /domains/{name}                   one domain, its registrar details, DNS records and e-mail verification
 //   PUT    /domains/{name}                   { autoRenew }
+//   POST   /domains/{name}/verify-email      send the registrant's verification e-mail again
 //   PUT    /domains/{name}/records           { type, name, values[], ttl? } create or replace a record set
 //   DELETE /domains/{name}/records?type=&name=   delete a record set
 //   POST   /domains/subdomains               { label, autoRenew? } claim label.<SUBDOMAIN_ZONE>: free on some plans, else Stripe
@@ -30,26 +31,36 @@
 //   DELETE /admin/lyr/{name}                 release a name (super admin)
 //
 // Money only moves one way: the customer pays Lyrcloud first, and only then does Lyrcloud buy the domain
-// from Route 53. If the registrar refuses, the payment is refunded. Route 53 auto-renew stays off; a
-// scheduled run (every 15 minutes) follows registrar operations and charges the saved card for renewals
-// RENEW_DAYS_BEFORE days ahead, renewing at Route 53 only once that charge succeeds.
+// from DNA, out of Lyrcloud's prepaid DNA balance. If the registrar refuses, the payment is refunded. A
+// scheduled run (every 15 minutes) follows registrations and transfers until they're live, and charges the
+// saved card for renewals RENEW_DAYS_BEFORE days ahead, renewing at DNA only once that charge succeeds.
+// Stripe test-mode orders go to DNA's test environment, which simulates the registry and charges nothing.
+//
+// Domains registered here get DNA's name servers and are edited through DNA's free DNS records API.
+// Domains from before the switch to DNA were bought from Route 53 Domains (no `registrar` field); their
+// Route 53 hosted zones can still be edited, but nothing renews or follows them automatically any more.
 import { randomUUID } from 'node:crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DeleteCommand, DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { GetSecretValueCommand, PutSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
+import { ChangeResourceRecordSetsCommand, ListResourceRecordSetsCommand, Route53Client } from '@aws-sdk/client-route-53';
 import {
-  CheckDomainAvailabilityCommand,
-  CheckDomainTransferabilityCommand,
-  GetDomainDetailCommand,
-  GetDomainSuggestionsCommand,
-  GetOperationDetailCommand,
-  ListPricesCommand,
-  RegisterDomainCommand,
-  RenewDomainCommand,
-  Route53DomainsClient,
-  TransferDomainCommand,
-} from '@aws-sdk/client-route-53-domains';
-import { ChangeResourceRecordSetsCommand, ListHostedZonesByNameCommand, ListResourceRecordSetsCommand, Route53Client } from '@aws-sdk/client-route-53';
+  alreadyDone,
+  dnaAvailability,
+  dnaCall,
+  dnaContact,
+  dnaDate,
+  DnaError,
+  DNA_LIVE,
+  DNA_NAMESERVERS,
+  dnaPriceTable,
+  DNA_TEST,
+  fromDnaZone,
+  dnaLabel,
+  RENEW_REFUSALS,
+  TRANSFER_REFUSALS,
+  zoneStruct,
+} from './dna.mjs';
 import { isStaff, planFor, roleFor } from '../account/roles.mjs';
 import {
   answerLyr,
@@ -76,13 +87,11 @@ import {
   orderAmount,
   pricingConfig,
   pricingError,
-  priceTable,
   quote,
   recordError,
   recordName,
   renewalDue,
   RESERVED_SUBDOMAINS,
-  route53Contact,
   route53RecordSet,
   fromRecordSet,
   searchName,
@@ -97,6 +106,8 @@ const env = process.env;
 const TABLE = env.TABLE_NAME;
 const USERS_TABLE = env.USERS_TABLE_NAME;
 const STRIPE_SECRET_NAME = env.STRIPE_SECRET_NAME;
+// DNA credentials: { apiKey, resellerId, testApiKey }, written by deploy-domains.sh.
+const DNA_SECRET_NAME = env.DNA_SECRET_NAME;
 const SUPER_ADMIN_EMAIL = env.SUPER_ADMIN_EMAIL || 'lyrclouds@gmail.com';
 // name.<zone> subdomains (lyr.cloud): off until the zone is registered and both are set (deploy-domains.sh finds them).
 const SUB_ZONE = env.SUBDOMAIN_ZONE || '';
@@ -106,8 +117,7 @@ const ALLOWED_ORIGINS = String(env.ALLOWED_ORIGINS || SITE_URL).split(',').map((
 
 export const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 export const secrets = new SecretsManagerClient({});
-// Route 53 Domains only has an endpoint in us-east-1, and throttles checks to a few a second per account.
-export const registrar = new Route53DomainsClient({ region: 'us-east-1', maxAttempts: 6, retryMode: 'adaptive' });
+// Route 53 still hosts the name.lyr.cloud zone and the zones of domains bought before the switch to DNA.
 export const dns = new Route53Client({ region: 'us-east-1' });
 
 const STRIPE_EVENTS = ['checkout.session.completed', 'checkout.session.expired'];
@@ -132,8 +142,11 @@ function parseJson(event) {
 const domainKey = (domain) => ({ pk: `domain#${domain}`, sk: 'domain' });
 const orderKey = (orderId) => ({ pk: `order#${orderId}`, sk: 'order' });
 const billingKey = (userId) => ({ pk: `user#${userId}`, sk: 'billing' });
-const PRICING_KEY = { pk: '#pricing', sk: 'config' };
-const PRICES_KEY = { pk: '#prices', sk: 'route53' };
+// Pricing moved to a new key with the switch to DNA, so the commission starts at DNA's defaults (1%)
+// instead of the margin set for Route 53's higher prices. The old settings seed it (see getPricing).
+const PRICING_KEY = { pk: '#pricing', sk: 'dna' };
+const LEGACY_PRICING_KEY = { pk: '#pricing', sk: 'config' };
+const PRICES_KEY = { pk: '#prices', sk: 'dna' };
 
 const getItem = async (key) => (await ddb.send(new GetCommand({ TableName: TABLE, Key: key }))).Item;
 const isConditionFailure = (err) => err?.name === 'ConditionalCheckFailedException';
@@ -201,15 +214,41 @@ function siteOrigin(event) {
 
 // ---------------------------------------------------------------- settings, prices and Stripe
 
+// The commission settings. Until the super admin saves them under PRICING_KEY, they're the defaults with
+// the old Route 53-era settings' TLD list and subdomain prices kept (their commission is not carried over).
+const DNA_PRICING_DEFAULTS = { percent: 1, flatCents: 0, dnsCentsPerYear: 0, round99: false, overrides: {} };
 let pricingCache = { value: null, at: 0 };
 async function getPricing() {
   if (!pricingCache.value || Date.now() - pricingCache.at > 30_000) {
-    pricingCache = { value: pricingConfig((await getItem(PRICING_KEY))?.config), at: Date.now() };
+    const stored = (await getItem(PRICING_KEY))?.config;
+    const legacy = stored ? null : (await getItem(LEGACY_PRICING_KEY))?.config;
+    pricingCache = { value: pricingConfig(stored || (legacy ? { ...legacy, ...DNA_PRICING_DEFAULTS } : undefined)), at: Date.now() };
   }
   return pricingCache.value;
 }
 
-// What Route 53 charges, per TLD, refreshed twice a day.
+// DNA credentials. `test` picks the test environment (its own key, same reseller ID).
+let dnaCache = { value: null, at: 0 };
+async function getDnaConfig() {
+  if (env.DNA_JSON) return JSON.parse(env.DNA_JSON);
+  if (!DNA_SECRET_NAME) return {};
+  if (!dnaCache.value || Date.now() - dnaCache.at > 300_000) {
+    const raw = (await secrets.send(new GetSecretValueCommand({ SecretId: DNA_SECRET_NAME }))).SecretString;
+    dnaCache = { value: JSON.parse(raw || '{}'), at: Date.now() };
+  }
+  return dnaCache.value;
+}
+
+// One DNA call, live unless `registrarEnv` is 'test'.
+async function dna(method, path, options, registrarEnv = 'live') {
+  const config = await getDnaConfig();
+  const test = registrarEnv === 'test';
+  const apiKey = test ? config.testApiKey : config.apiKey;
+  if (!apiKey || !config.resellerId) throw new DnaError('The registrar isn’t connected yet.', { status: 503, code: 'Lyrcloud:RegistrarNotConnected' });
+  return dnaCall({ base: test ? DNA_TEST : DNA_LIVE, apiKey, resellerId: config.resellerId }, method, path, options);
+}
+
+// What DNA charges, per TLD, refreshed twice a day: the live catalogue, read for the account's price group.
 let pricesCache = { value: null, at: 0 };
 async function wholesale() {
   if (pricesCache.value && Date.now() - pricesCache.at < PRICES_MAX_AGE_MS) return pricesCache.value;
@@ -218,20 +257,33 @@ async function wholesale() {
     pricesCache = { value: stored.table, at: Date.parse(stored.fetchedAt) };
     return stored.table;
   }
-  const list = [];
-  let Marker;
-  do {
-    const page = await registrar.send(new ListPricesCommand({ MaxItems: 1000, Marker }));
-    list.push(...(page.Prices || []));
-    Marker = page.NextPageMarker;
-  } while (Marker);
-  const table = priceTable(list);
+  let table;
+  try {
+    const account = await dna('GET', 'deposit/accounts/me');
+    const items = [];
+    for (let skip = 0; ; skip += 1000) {
+      const page = await dna('GET', 'products/tlds', { query: { maxResultCount: 1000, skipCount: skip, currency: 'USD' } });
+      items.push(...(page?.items || []));
+      if (!page?.items?.length || items.length >= (page.totalCount ?? 0)) break;
+    }
+    table = dnaPriceTable(items, account?.resellerGroupName);
+  } catch (err) {
+    // Keep selling at the last known prices if DNA is briefly unreachable; nothing is sold without any.
+    console.error('DNA price list failed', err.code || err.name, err.message);
+    if (stored?.table) return stored.table;
+    if (err instanceof DnaError && err.status === 503) return {};
+    throw err;
+  }
   await ddb.send(new PutCommand({ TableName: TABLE, Item: { ...PRICES_KEY, table, fetchedAt: now() } }));
   pricesCache = { value: table, at: Date.now() };
   return table;
 }
 
-const sellable = (prices, config, tld) => config.tlds.includes(tld) && Number.isFinite(prices[tld]?.register) && Number.isFinite(prices[tld]?.renew);
+const sellable = (prices, config, tld) => config.tlds.includes(tld) && prices[tld]?.plain !== false
+  && Number.isFinite(prices[tld]?.register) && Number.isFinite(prices[tld]?.renew);
+// Whether the domain's DNS is hosted by Lyrcloud: DNA's zones for domains registered here, a Route 53
+// hosted zone for ones bought before the switch.
+const lyrcloudDns = (item) => item.dnsProvider === 'dna' || Boolean(item.hostedZoneId);
 
 // Stripe credentials ({} until the super admin connects Stripe). Re-read every minute.
 let stripeCache = { value: null, at: 0 };
@@ -285,16 +337,50 @@ async function caller(event) {
 
 // ---------------------------------------------------------------- availability
 
-// Route 53 answers AVAILABLE, UNAVAILABLE, RESERVED, DONT_KNOW, ... Cached briefly so searches stay cheap.
+// Our words for DNA's answers: AVAILABLE, UNAVAILABLE, PREMIUM, DOCUMENTS, NOT_SOLD, INVALID or DONT_KNOW
+// (dnaAvailability). Cached briefly so searches stay cheap; DNA allows 2 searches a second.
+const availKey = (domain) => ({ pk: `avail#${domain}`, sk: 'avail' });
+async function cacheAvailability(domain, status) {
+  await ddb.send(new PutCommand({ TableName: TABLE, Item: { ...availKey(domain), availability: status, expiresAt: Math.floor(Date.now() / 1000) + AVAILABILITY_CACHE_SECONDS } }));
+}
+
 async function availability(domain, { fresh = false } = {}) {
-  const key = { pk: `avail#${domain}`, sk: 'avail' };
   if (!fresh) {
-    const cached = await getItem(key);
+    const cached = await getItem(availKey(domain));
     if (cached && cached.expiresAt > Date.now() / 1000) return cached.availability;
   }
-  const { Availability } = await registrar.send(new CheckDomainAvailabilityCommand({ DomainName: domain }));
-  await ddb.send(new PutCommand({ TableName: TABLE, Item: { ...key, availability: Availability, expiresAt: Math.floor(Date.now() / 1000) + AVAILABILITY_CACHE_SECONDS } }));
-  return Availability;
+  const answer = await dna('POST', 'domains/search', { body: { domainName: domain } });
+  const status = dnaAvailability(answer?.info);
+  await cacheAvailability(domain, status);
+  return status;
+}
+
+// Several names at once with bulk-search (30 a call). DNA silently drops names it can't answer, so
+// results are matched by name, and a missing one is "don't know", never "available".
+async function availabilityMany(domains) {
+  const statuses = new Map();
+  const unknown = [];
+  await pool(domains, 4, async (domain) => {
+    const cached = await getItem(availKey(domain));
+    if (cached && cached.expiresAt > Date.now() / 1000) statuses.set(domain, cached.availability);
+    else unknown.push(domain);
+  });
+  for (let i = 0; i < unknown.length; i += 30) {
+    const batch = unknown.slice(i, i + 30);
+    try {
+      const answer = await dna('POST', 'domains/bulk-search', { body: batch.map((domainName) => ({ domainName })) });
+      const byName = new Map((answer?.infos || []).map((info) => [String(info.domainName).toLowerCase(), info]));
+      await pool(batch, 4, async (domain) => {
+        const status = dnaAvailability(byName.get(domain));
+        statuses.set(domain, status);
+        if (status !== 'DONT_KNOW') await cacheAvailability(domain, status);
+      });
+    } catch (err) {
+      console.error('bulk search failed', err.code || err.name, err.message);
+      for (const domain of batch) statuses.set(domain, 'DONT_KNOW');
+    }
+  }
+  return statuses;
 }
 
 const offer = (domain, status, q) => ({ domain, tld: tldOf(domain), available: status === 'AVAILABLE', status, price: q.register, renew: q.renew });
@@ -305,35 +391,21 @@ async function search(event) {
   if (!name) return error(400, 'Type a name to search for, like mybrand or mybrand.com.');
   const [config, prices] = await Promise.all([getPricing(), wholesale()]);
   const typed = q.includes('.') ? cleanDomain(q) : null;
+  // The typed domain and the first two other TLDs are the results; the rest of the sold TLDs, when
+  // available, are the suggestions. One bulk-search answers all of them.
   const candidates = [];
   if (typed && sellable(prices, config, tldOf(typed))) candidates.push(typed);
   for (const tld of config.tlds) {
-    if (candidates.length >= 3) break;
     const domain = cleanDomain(`${name}.${tld}`);
-    if (domain && !candidates.includes(domain) && sellable(prices, config, tld)) candidates.push(domain);
+    if (domain && !candidates.includes(domain) && sellable(prices, config, tld) && candidates.length < 30) candidates.push(domain);
   }
-  const results = await pool(candidates, 1, async (domain) => {
-    try {
-      return offer(domain, await availability(domain), quote(prices, tldOf(domain), config));
-    } catch (err) {
-      console.error('availability failed', domain, err.name);
-      return { ...offer(domain, 'DONT_KNOW', quote(prices, tldOf(domain), config)), available: false };
-    }
-  });
+  const statuses = await availabilityMany(candidates);
+  const offers = candidates.map((domain) => offer(domain, statuses.get(domain) || 'DONT_KNOW', quote(prices, tldOf(domain), config)));
+  const results = offers.slice(0, 3);
   if (typed && !sellable(prices, config, tldOf(typed))) {
     results.unshift({ domain: typed, tld: tldOf(typed), available: false, status: 'NOT_SOLD', price: null, renew: null });
   }
-  let suggestions = [];
-  try {
-    const { SuggestionsList } = await registrar.send(new GetDomainSuggestionsCommand({ DomainName: typed || `${name}.com`, SuggestionCount: 25, OnlyAvailable: true }));
-    suggestions = (SuggestionsList || [])
-      .map((item) => cleanDomain(item.DomainName))
-      .filter((domain) => domain && !candidates.includes(domain) && sellable(prices, config, tldOf(domain)))
-      .slice(0, 10)
-      .map((domain) => offer(domain, 'AVAILABLE', quote(prices, tldOf(domain), config)));
-  } catch (err) {
-    console.error('suggestions failed', err.name);
-  }
+  const suggestions = offers.slice(3).filter((item) => item.available).slice(0, 10);
   return json(200, { query: name, currency: 'usd', results, suggestions });
 }
 
@@ -359,7 +431,8 @@ function publicDomain(item, config, prices) {
     autoRenew: item.autoRenew === true,
     expiresAt: item.expiresAt || null,
     nameservers: item.nameservers || [],
-    lyrcloudDns: Boolean(item.hostedZoneId),
+    lyrcloudDns: lyrcloudDns(item),
+    testRegistry: item.registrarEnv === 'test',
     createdAt: item.createdAt,
     activatedAt: item.activatedAt || null,
     holdUntil: item.status === 'awaiting_payment' ? item.holdUntil : null,
@@ -369,7 +442,7 @@ function publicDomain(item, config, prices) {
     failureReason: item.failureReason || null,
     renewing: item.renewing === true,
     lastRenewalError: item.lastRenewalError || null,
-    renewPrice: q ? (item.hostedZoneId ? q.renew : q.renewNoDns) : null,
+    renewPrice: q ? (lyrcloudDns(item) ? q.renew : q.renewNoDns) : null,
     hasCard: Boolean(item.paymentMethodId),
   };
 }
@@ -405,14 +478,27 @@ async function myDomains(who) {
   return json(200, { domains, orders, subdomains, lyrReservations, contact: billing?.contact || null, paymentsReady: Boolean(stripeConfig.secretKey), currency: 'usd' });
 }
 
-// Why a transfer can't start, in words, for Route 53's Transferability answer.
-const TRANSFER_REFUSALS = {
-  UNTRANSFERABLE: 'This domain can’t be transferred right now. Unlock it at your current registrar, and note that domains can’t move within 60 days of being registered or transferred.',
-  DOMAIN_IN_OWN_ACCOUNT: 'This domain is already with Lyrcloud’s registrar.',
-  DOMAIN_IN_ANOTHER_ACCOUNT: 'This domain is with Route 53 in another account. Ask its owner to transfer it to Lyrcloud.',
-  PREMIUM_DOMAIN: 'Premium domains can’t be transferred to Lyrcloud yet.',
-  DONT_KNOW: 'The registry didn’t say whether this domain can move. Try again in a few minutes.',
-};
+const UNTRANSFERABLE = 'This domain can’t be transferred right now. Unlock it at your current registrar, and note that domains can’t move within 60 days of being registered or transferred.';
+
+// Asks DNA whether `domain` can move to Lyrcloud with `authCode`. Returns a refusal message, or null.
+// DNA answers a refusal with an error code rather than a false field (docs: "Transfer a domain in").
+async function transferRefusal(domain, authCode, prices) {
+  const facts = prices[tldOf(domain)];
+  if (facts?.transferable === false) return `.${tldOf(domain)} domains can’t be transferred to Lyrcloud.`;
+  if (facts?.transferCheck === false) return null; // the registry has no pre-transfer check; /transfer decides
+  try {
+    const check = await dna('POST', 'domains/transfers/check', { body: { domainName: domain, authCode } });
+    if (check?.isPremium) return 'Premium domains can’t be transferred to Lyrcloud yet.';
+    if (check?.transferLock) return TRANSFER_REFUSALS['Dna.DomainService:Domain:10006'];
+    if (check && check.authCodeIsValid === false) return TRANSFER_REFUSALS['Dna.DomainService:Domain:10008'];
+    if (check && check.transferAvailabilityStatus === false) return check.message || UNTRANSFERABLE;
+    return null;
+  } catch (err) {
+    if (!(err instanceof DnaError) || err.status >= 500 || err.status === 429) throw err;
+    if (err.code === 'Dna.DomainService:Domain:10025') return null;
+    return TRANSFER_REFUSALS[err.code] || err.message || UNTRANSFERABLE;
+  }
+}
 
 async function checkout(event, who) {
   const body = parseJson(event);
@@ -432,11 +518,14 @@ async function checkout(event, who) {
 
   let amount;
   let costCents;
+  const terms = action === 'renew' ? prices[tld]?.renewYears : action === 'register' ? prices[tld]?.registerYears : null;
+  if (terms?.length && !terms.includes(years)) return error(400, `.${tld} domains can be ${action === 'renew' ? 'renewed' : 'registered'} for ${[...terms].sort((a, b) => a - b).join(', ')} years.`);
   if (action === 'renew') {
     if (!existing || existing.ownerId !== who.userId) return error(404, 'That domain isn’t in your account.');
+    if (existing.registrar !== 'dna') return error(409, 'This domain was bought through Lyrcloud’s previous registrar. Contact support to renew it.');
     if (existing.status !== 'active') return error(409, 'Only active domains can be renewed.');
     if (existing.renewing) return error(409, 'A renewal for this domain is already in progress.');
-    const withDns = Boolean(existing.hostedZoneId);
+    const withDns = lyrcloudDns(existing);
     amount = (withDns ? q.renew : q.renewNoDns) * years;
     costCents = (withDns ? q.cost.renew : q.cost.renewNoDns) * years;
   } else {
@@ -445,11 +534,12 @@ async function checkout(event, who) {
     if (!free) return error(409, `${domain} is being bought by someone else. Try again in half an hour, or pick another name.`);
     if (action === 'register') {
       const status = await availability(domain, { fresh: true });
+      if (status === 'PREMIUM') return error(409, `${domain} is a premium name with its own registry price. Lyrcloud doesn’t sell premium names yet.`);
+      if (status === 'DOCUMENTS') return error(409, `The registry wants documents before ${domain} can be registered. Lyrcloud can’t take those yet.`);
       if (status !== 'AVAILABLE') return error(409, `${domain} isn’t available to register. If it’s yours, transfer it in instead.`);
     } else {
-      const { Transferability } = await registrar.send(new CheckDomainTransferabilityCommand({ DomainName: domain, AuthCode: body.authCode.trim() }));
-      const answer = Transferability?.Transferable;
-      if (answer !== 'TRANSFERABLE') return error(409, TRANSFER_REFUSALS[answer] || 'This domain can’t be transferred right now.');
+      const refusal = await transferRefusal(domain, body.authCode.trim(), prices);
+      if (refusal) return error(409, refusal);
     }
     amount = orderAmount(q, action, years);
     costCents = action === 'register' ? q.cost.register + q.cost.renew * (years - 1) : q.cost.transfer;
@@ -562,17 +652,89 @@ async function zoneRecords(zoneId) {
   return records;
 }
 
+// DNA zones answer only for live domains; the test environment returns 500 for every zone call.
+const dnaZones = (item) => item.dnsProvider === 'dna' && item.registrarEnv !== 'test';
+
+// The registrant's e-mail verification. For most TLDs the registry suspends a domain whose registrant
+// hasn't clicked DNA's verification link within 15 days, so the dashboard shows it until it's done.
+async function verificationFor(item) {
+  if (item.registrar !== 'dna' || item.status !== 'active' || !item.registrantHandle) return null;
+  try {
+    const answer = await dna('GET', 'contacts/verification/check', { query: { handleCode: item.registrantHandle } }, item.registrarEnv);
+    const open = (answer?.results || []).find((result) => result.fieldType === 'Email' && !result.isUserVerified
+      && ['None', 'VerificationPending', 'TokenExpired', 'MailChanged', 0, 1, 3, 6].includes(result.operationStatus));
+    return open ? { pending: true, email: open.fieldValue || null, deadline: dnaDate(open.tokenExpireDate), expired: [3, 'TokenExpired'].includes(open.operationStatus) } : { pending: false };
+  } catch (err) {
+    if (err.code === 'Dna.DomainService:Contact:Verification:10005') return { pending: false }; // nothing to verify
+    console.error('verification check failed', item.domain, err.code || err.name);
+    return null;
+  }
+}
+
 async function domainDetail(item, who) {
   const [config, prices] = await Promise.all([getPricing(), wholesale()]);
   const orders = (await itemsOf(item.ownerId)).filter((row) => row.kind === 'order' && row.domain === item.domain && row.status !== 'open' && row.status !== 'expired').map(publicOrder);
   let records = null;
-  if (item.hostedZoneId && item.status === 'active') {
+  if (item.status === 'active' && dnaZones(item)) {
+    records = fromDnaZone(await dna('GET', 'domains/zones', { query: { domainName: item.domain } }), item.domain);
+  } else if (item.hostedZoneId && item.status === 'active') {
     records = (await zoneRecords(item.hostedZoneId)).map((set) => fromRecordSet(set, item.domain)).filter(Boolean);
   }
-  return json(200, { domain: publicDomain(item, config, prices), records, orders, owner: isStaff(who.role) ? item.ownerEmail : undefined });
+  const verification = await verificationFor(item);
+  return json(200, { domain: publicDomain(item, config, prices), records, orders, verification, owner: isStaff(who.role) ? item.ownerEmail : undefined });
+}
+
+// Sends DNA's verification e-mail to the registrant again (a fresh 15-day link if the old one lapsed).
+async function resendVerification(item, who) {
+  if (item.ownerId !== who.userId && !isStaff(who.role)) return error(403, 'Only the owner can do that.');
+  if (item.registrar !== 'dna' || !item.registrantHandle) return error(409, 'This domain has no e-mail verification to send.');
+  try {
+    await dna('POST', 'contacts/verification/request', { body: { handleCode: item.registrantHandle } }, item.registrarEnv);
+  } catch (err) {
+    if (err.code === 'Dna.DomainService:Contact:Verification:10003') return json(200, { sent: false, verified: true });
+    if (err.code === 'Dna.DomainService:Contact:Verification:10002') return error(429, 'The e-mail was sent less than a minute ago. Wait a moment and try again.');
+    if (err instanceof DnaError && err.status < 500) return error(409, err.message);
+    throw err;
+  }
+  return json(200, { sent: true });
+}
+
+// Our record set -> DNA: replace the set if it exists, else add it. DNA locates a set by name and type.
+async function changeDnaRecord(event, item, method) {
+  const domainName = item.domain;
+  const current = fromDnaZone(await dna('GET', 'domains/zones', { query: { domainName } }), domainName);
+  if (method === 'PUT') {
+    const record = parseJson(event);
+    const refused = recordError(record, domainName);
+    if (refused) return error(...refused);
+    const name = recordName(record.name, domainName);
+    const exists = current.some((set) => set.type === record.type && set.name === name);
+    const conflict = current.find((set) => set.name === name && (set.type === 'CNAME') !== (record.type === 'CNAME'));
+    if (conflict) return error(400, `${name} already has a ${conflict.type} record. A CNAME can’t share its name with other records.`);
+    try {
+      await dna(exists ? 'PUT' : 'POST', 'domains/zones', {
+        query: exists ? { domainName, recordName: dnaLabel(record.name, domainName) } : { domainName },
+        body: { zoneStruct: zoneStruct(record, domainName) },
+      });
+    } catch (err) {
+      if (err instanceof DnaError && err.status < 500) return error(400, err.message);
+      throw err;
+    }
+    return json(200, { saved: true });
+  }
+  const type = event.queryStringParameters?.type;
+  const name = recordName(event.queryStringParameters?.name, domainName);
+  const existing = current.find((set) => set.type === type && set.name === name);
+  if (!existing) return error(404, 'No such record.');
+  // DNA deletes one value at a time; the set goes when its last value does.
+  for (const value of existing.values) {
+    await dna('DELETE', 'domains/zones', { query: { domainName }, body: { name, recordType: type, record: value } });
+  }
+  return json(200, { deleted: true });
 }
 
 async function changeRecord(event, item, method) {
+  if (item.status === 'active' && dnaZones(item)) return changeDnaRecord(event, item, method);
   if (item.status !== 'active' || !item.hostedZoneId) return error(409, 'DNS records can be edited once the domain is active on Lyrcloud DNS.');
   if (method === 'PUT') {
     const record = parseJson(event);
@@ -603,10 +765,11 @@ async function domainRoutes(event, method, path, who) {
   if (path === '/domains/checkout' && method === 'POST') return checkout(event, who);
   if (path === '/domains/subdomains' || path.startsWith('/domains/subdomains/')) return subdomainRoutes(event, method, path, who);
   if (path === '/domains/lyr-waitlist' || path.startsWith('/domains/lyr-waitlist/')) return waitlistRoutes(event, method, path, who);
-  const match = path.match(/^\/domains\/([^/]+)(\/records)?$/);
+  const match = path.match(/^\/domains\/([^/]+)(\/records|\/verify-email)?$/);
   if (!match) return error(404, 'not_found');
   const item = await ownedDomain(decodeURIComponent(match[1]), who);
   if (!item) return error(404, 'That domain isn’t in your account.');
+  if (match[2] === '/verify-email') return method === 'POST' ? resendVerification(item, who) : error(404, 'not_found');
   if (match[2]) {
     if (method === 'PUT' || method === 'DELETE') return changeRecord(event, item, method);
     return error(404, 'not_found');
@@ -624,26 +787,62 @@ async function domainRoutes(event, method, path, who) {
 
 // ---------------------------------------------------------------- payments -> registrar
 
-async function startOperation(order) {
+// A refusal the customer may read; DNA's wording for most, but never Lyrcloud's own account problems.
+function refusalReason(err) {
+  if (err instanceof DnaError && ['Dna.DomainService:Deposit:10001', 'Dna.DomainService:Reseller:10001', 'Lyrcloud:RegistrarAuth', 'Lyrcloud:RegistrarNotConnected'].includes(err.code)) {
+    console.error('REGISTRAR ACCOUNT PROBLEM: top up or reconnect DNA', err.code, err.message, JSON.stringify(err.data || {}));
+    return 'Lyrcloud couldn’t complete this purchase with the registry right now';
+  }
+  return err.message || err.name;
+}
+
+// Starts the paid operation at DNA. Registrations and renewals usually finish in the call; transfers wait
+// days for approval. followOperation (now, and from the scheduled run) reads the outcome.
+async function startOperation(order, registrarEnv) {
+  const domainName = order.domain;
   if (order.action === 'renew') {
-    const detail = await registrar.send(new GetDomainDetailCommand({ DomainName: order.domain }));
-    const { OperationId } = await registrar.send(new RenewDomainCommand({
-      DomainName: order.domain, DurationInYears: order.years, CurrentExpiryYear: new Date(detail.ExpirationDate).getUTCFullYear(),
-    }));
-    return OperationId;
+    const check = await dna('POST', 'domains/renew/check', { body: { domainName, period: order.years } }, registrarEnv);
+    if (check && check.renewabilityStatus === false) {
+      throw new DnaError(RENEW_REFUSALS[check.errorMessageKey] || 'The registry won’t renew this domain right now.', { status: 409, code: check.errorMessageKey });
+    }
+    if (check?.isPremium) throw new DnaError('This is a premium domain with its own renewal price. Contact support to renew it.', { status: 409, code: 'Lyrcloud:Premium' });
+    try {
+      await dna('POST', 'domains/renew', { body: { domainName, period: order.years } }, registrarEnv);
+    } catch (err) {
+      // The registry already auto-renewed it after expiry; the new expiry is read from /domains/info.
+      if (err.code !== 'Dna.DomainService:Domain:10020') throw err;
+    }
+    return 'dna-renew';
   }
-  const contact = route53Contact(order.contact);
-  const contacts = {
-    AdminContact: contact, RegistrantContact: contact, TechContact: contact,
-    PrivacyProtectAdminContact: true, PrivacyProtectRegistrantContact: true, PrivacyProtectTechContact: true,
-    AutoRenew: false,
-  };
   if (order.action === 'transfer') {
-    const { OperationId } = await registrar.send(new TransferDomainCommand({ DomainName: order.domain, DurationInYears: 1, AuthCode: order.authCode, ...contacts }));
-    return OperationId;
+    const started = await dna('POST', 'domains/transfer', { body: { domainName, authCode: order.authCode, period: 1 } }, registrarEnv);
+    return `dna-transfer:${started?.domainId || ''}`;
   }
-  const { OperationId } = await registrar.send(new RegisterDomainCommand({ DomainName: order.domain, DurationInYears: order.years, ...contacts }));
-  return OperationId;
+  const registered = await dna('POST', 'domains/register-with-contacts', {
+    body: {
+      domainName,
+      period: order.years,
+      nameServers: DNA_NAMESERVERS,
+      // One contact fills all four roles (DNA copies it to Admin, Tech and Billing).
+      contacts: [{ contactType: 'Registrant', ...dnaContact(order.contact) }],
+    },
+  }, registrarEnv);
+  return `dna-register:${registered?.domainId || ''}`;
+}
+
+// After a registration goes live: WHOIS privacy where the registry offers it, and DNA's DNS. Neither may
+// undo the registration, so failures are only logged.
+async function afterRegistration(item) {
+  const prices = await wholesale().catch(() => ({}));
+  if (prices[item.tld]?.privacy !== false) {
+    await dna('POST', 'domains/privacy', { body: { domainName: item.domain, privacyStatus: true } }, item.registrarEnv)
+      .catch((err) => console.error('privacy failed', item.domain, err.code || err.name, err.message));
+  }
+  if (item.registrarEnv !== 'test') {
+    // Delegates to DNA's name servers if the registry didn't take them at registration; safe to repeat.
+    await dna('POST', 'domains/zones/apply', { query: { domainName: item.domain } })
+      .catch((err) => console.error('zones/apply failed', item.domain, err.code || err.name, err.message));
+  }
 }
 
 // Gives the money back when the registrar won't do what was paid for.
@@ -670,33 +869,56 @@ async function refund(order, reason) {
 export const TEST_MODE_REASON = 'Stripe is in test mode, so no real domain was bought. Connect a live Stripe key to sell domains.';
 
 // After the money is in: start the registrar operation, or refund if it can't start.
-// Test-mode payments are fake but registrar orders cost real money, so they never reach the registrar
-// (unless ALLOW_TEST_REGISTRATIONS is set, as the tests do).
+// Test-mode payments are fake, so they go to DNA's test environment, which simulates the registry and
+// charges nothing; without a DNA test key they're refunded. A renewal goes wherever the domain lives.
+// Subdomain test orders are refunded unless ALLOW_TEST_REGISTRATIONS is set, as the tests do.
 async function fulfil(order) {
-  if (stripeMode((await getStripe()).secretKey) === 'test' && env.ALLOW_TEST_REGISTRATIONS !== '1') {
+  const testMode = stripeMode((await getStripe()).secretKey) === 'test';
+  if (order.action === 'subdomain' || order.action === 'subdomain-renew') {
+    if (testMode && env.ALLOW_TEST_REGISTRATIONS !== '1') await refund(order, TEST_MODE_REASON);
+    else await activateSubdomain(order);
+    return;
+  }
+  const domainItem = order.action === 'renew' ? await getItem(domainKey(order.domain)) : null;
+  const registrarEnv = domainItem?.registrarEnv || (testMode ? 'test' : 'live');
+  if (registrarEnv === 'test' && !(await getDnaConfig()).testApiKey) {
     await refund(order, TEST_MODE_REASON);
     return;
   }
-  if (order.action === 'subdomain' || order.action === 'subdomain-renew') {
-    await activateSubdomain(order);
-    return;
-  }
   let operationId;
+  let reconcile = false;
   try {
-    operationId = await startOperation(order);
+    operationId = await startOperation(order, registrarEnv);
   } catch (err) {
-    await refund(order, err.message || err.name);
-    return;
+    if (!alreadyDone(err)) {
+      await refund(order, refusalReason(err));
+      return;
+    }
+    // The registry did it but DNA couldn't record it: never retry, never refund. DNA reconciles it, and
+    // the scheduled run picks the domain up once /domains/info knows it.
+    console.error('REGISTRAR RECONCILING (do not retry)', order.orderId, order.domain, err.code, err.message);
+    operationId = `dna-reconcile:${err.code}`;
+    reconcile = true;
   }
-  await update(orderKey(order.orderId), { status: 'processing', operationId }, ['authCode']);
+  await update(orderKey(order.orderId), { status: 'processing', operationId, registrarEnv }, ['authCode']);
   if (order.action === 'renew') {
     await update(domainKey(order.domain), { renewing: true, renewOrderId: order.orderId, renewOperationId: operationId, lastRenewalError: null });
   } else {
     await update(domainKey(order.domain), {
       status: order.action === 'register' ? 'registering' : 'transferring',
+      registrar: 'dna', registrarEnv, ...(order.action === 'register' ? { dnsProvider: 'dna' } : {}),
       operationId, orderId: order.orderId, paidAt: now(), contact: order.contact,
       stripeCustomerId: order.stripeCustomerId, paymentMethodId: order.paymentMethodId,
+      ...(reconcile ? { operationMessage: 'The registry is confirming this order.' } : {}),
     }, ['holdUntil', 'checkoutUrl']);
+  }
+  // Most registrations and every renewal are already done: show them as such without waiting for the run.
+  if (!reconcile && order.action !== 'transfer') {
+    try {
+      await followOperation(await getItem(domainKey(order.domain)));
+    } catch (err) {
+      console.error('immediate follow-up failed', order.domain, err.code || err.name, err.message);
+    }
   }
 }
 
@@ -749,33 +971,70 @@ async function stripeWebhook(event) {
 
 // ---------------------------------------------------------------- scheduled work
 
-async function hostedZoneFor(domain) {
-  const { HostedZones } = await dns.send(new ListHostedZonesByNameCommand({ DNSName: domain, MaxItems: 1 }));
-  const zone = HostedZones?.find((item) => item.Name === `${domain}.` && !item.Config?.PrivateZone);
-  return zone ? zone.Id.split('/').pop() : null;
-}
+// DNA domain statuses that mean the registration or transfer is over and didn't work.
+const DEAD_STATUSES = ['TransferredOut', 'TransferRejected', 'Deleted', 'PendingDelete'];
+const TRANSFER_FAILED = { clientRejected: 'The current owner rejected the transfer.', clientCancelled: 'The transfer was cancelled at the current registrar.', serverCancelled: 'The registry cancelled the transfer.' };
+const WAITING_WORDS = {
+  WaitingForRegistration: 'The registry is still processing the registration.',
+  WaitingForDocument: 'The registry is waiting for documents. Contact support.',
+  WaitingForIncomingTransfer: 'Waiting for the current registrar to release the domain.',
+  ConfirmationEmailSend: 'Waiting for the domain owner to approve the transfer by e-mail.',
+};
 
+// Reads where a paid operation stands at DNA and moves the domain on: live, still waiting, or refunded.
 async function followOperation(item) {
+  if (item.registrar !== 'dna') return; // bought from Route 53 before the switch; nothing to follow here
   const renewal = item.renewing && item.renewOperationId;
-  const OperationId = renewal ? item.renewOperationId : item.operationId;
   const orderId = renewal ? item.renewOrderId : item.orderId;
-  const op = await registrar.send(new GetOperationDetailCommand({ OperationId }));
-  if (op.Status === 'SUCCESSFUL') {
-    const detail = await registrar.send(new GetDomainDetailCommand({ DomainName: item.domain }));
-    const facts = { expiresAt: new Date(detail.ExpirationDate).toISOString(), nameservers: (detail.Nameservers || []).map((ns) => ns.Name) };
-    if (renewal) {
-      await update(domainKey(item.domain), { ...facts, renewing: false, lastRenewedAt: now(), lastRenewalError: null }, ['renewOperationId', 'renewOrderId']);
-    } else {
-      const hostedZoneId = item.action === 'register' ? await hostedZoneFor(item.domain) : null;
-      await update(domainKey(item.domain), { ...facts, status: 'active', activatedAt: now(), hostedZoneId: hostedZoneId || undefined, operationStatus: op.Status }, ['operationMessage']);
-    }
-    if (orderId) await update(orderKey(orderId), { status: 'fulfilled', fulfilledAt: now() });
-  } else if (op.Status === 'FAILED' || op.Status === 'ERROR') {
+  const env = item.registrarEnv;
+  const finish = async () => { if (orderId) await update(orderKey(orderId), { status: 'fulfilled', fulfilledAt: now() }); };
+  const failed = async (reason) => {
     const order = orderId && (await getItem(orderKey(orderId)));
-    if (order && order.status !== 'refunded') await refund(order, op.Message || `The registrar reported ${op.Status}.`);
-  } else {
-    await update(domainKey(item.domain), { operationStatus: op.Status, operationMessage: op.StatusFlag ? `${op.StatusFlag}: ${op.Message || ''}`.trim() : op.Message || null, checkedAt: now() });
+    if (order && order.status !== 'refunded') await refund(order, reason);
+  };
+
+  if (!renewal && item.status === 'transferring') {
+    let transfer = null;
+    try {
+      transfer = await dna('POST', 'domains/transfers/query', { body: { domainName: item.domain } }, env);
+    } catch (err) {
+      // "Not in a transfer state" once it has finished; anything else is asked again next run.
+      if (err.code !== 'Dna.DomainService:Domain:10025' && err.code !== 'Dna.DomainService:Domain:10027') throw err;
+    }
+    if (TRANSFER_FAILED[transfer?.status]) return failed(TRANSFER_FAILED[transfer.status]);
+    if (transfer?.status === 'pending') {
+      const by = dnaDate(transfer.finalDate);
+      await update(domainKey(item.domain), { operationStatus: 'pending', operationMessage: by ? `Completes by ${by.slice(0, 10)} unless the current owner approves it sooner.` : null, checkedAt: now() });
+      return;
+    }
   }
+
+  let info;
+  try {
+    info = await dna('GET', 'domains/info', { query: { domainName: item.domain } }, env);
+  } catch (err) {
+    // Not in the account yet: a transfer not finished, or a never-retry order DNA is still reconciling.
+    if (err.code === 'Dna.DomainService:Domain:10007') {
+      await update(domainKey(item.domain), { checkedAt: now() });
+      return;
+    }
+    throw err;
+  }
+  const facts = { expiresAt: dnaDate(info.expirationDate) || undefined, nameservers: info.nameservers?.length ? info.nameservers : undefined, checkedAt: now() };
+  if (renewal) {
+    await update(domainKey(item.domain), { ...facts, renewing: false, lastRenewedAt: now(), lastRenewalError: null }, ['renewOperationId', 'renewOrderId']);
+    return finish();
+  }
+  if (info.status === 'Active') {
+    const registrant = (info.contacts || []).find((contact) => contact.contactType === 'Registrant');
+    const live = await update(domainKey(item.domain), {
+      ...facts, status: 'active', activatedAt: now(), operationStatus: 'Active', registrantHandle: registrant?.handle || undefined,
+    }, ['operationMessage']);
+    if (item.action === 'register') await afterRegistration(live);
+    return finish();
+  }
+  if (DEAD_STATUSES.includes(info.status)) return failed(`The registry reported ${info.status}.`);
+  await update(domainKey(item.domain), { ...facts, operationStatus: info.status, operationMessage: WAITING_WORDS[info.status] || info.statusReason || null });
 }
 
 // Charges the saved card for an auto-renewing domain, then renews it at the registrar.
@@ -787,7 +1046,7 @@ async function chargeRenewal(item) {
   }
   const [config, prices] = await Promise.all([getPricing(), wholesale()]);
   const q = quote(prices, item.tld, config);
-  const withDns = Boolean(item.hostedZoneId);
+  const withDns = lyrcloudDns(item);
   const amount = withDns ? q.renew : q.renewNoDns;
   if (!Number.isFinite(amount)) return;
   const orderId = randomUUID();
@@ -824,6 +1083,8 @@ export async function tick() {
     try {
       if (item.kind === 'subdomain') {
         await subdomainTick(item);
+      } else if (item.registrar !== 'dna' && item.status !== 'awaiting_payment') {
+        // Bought from Route 53 before the switch to DNA: no automatic follow-up or renewal charges.
       } else if ((['registering', 'transferring'].includes(item.status) && item.operationId) || (item.renewing && item.renewOperationId)) {
         await followOperation(item);
       } else if (item.status === 'active' && item.autoRenew && !item.renewing && renewalDue(item.expiresAt)
@@ -1349,6 +1610,7 @@ export function resetCaches() {
   pricingCache = { value: null, at: 0 };
   pricesCache = { value: null, at: 0 };
   stripeCache = { value: null, at: 0 };
+  dnaCache = { value: null, at: 0 };
 }
 
 export const handler = async (event) => {
@@ -1373,9 +1635,13 @@ export const handler = async (event) => {
   } catch (err) {
     console.error('Domains API failed', err);
     if (err instanceof StripeError) return error(502, `Stripe said: ${err.message}`);
-    if (err.name === 'ThrottlingException' || err.name === 'TooManyRequestsException') return error(429, 'The registrar is busy. Try again in a moment.');
-    if (err.name === 'UnsupportedTLD') return error(400, 'That domain ending isn’t supported.');
-    if (err.name === 'InvalidInput') return error(400, err.message);
+    if (err instanceof DnaError) {
+      if (err.status === 429) return error(429, 'The registrar is busy. Try again in a moment.');
+      if (err.status === 503 || err.code === 'Lyrcloud:RegistrarAuth') return error(503, 'Domain sales are paused for a moment. Please try again soon.');
+      if (err.status === 400 || err.status === 422) return error(400, err.message);
+      return error(502, 'The registrar didn’t answer. Please try again.');
+    }
+    if (err.name === 'TimeoutError') return error(504, 'The registrar took too long to answer. Please try again.');
     return error(500, 'Something went wrong. Please try again.');
   }
 };
