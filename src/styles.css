@@ -2023,3 +2023,159 @@ code.inline {
 .lyr-teaser span:last-child {
   color: var(--muted);
 }
+
+/* Cloud regions map (cloud-map.js) and directory, on the Network page and in the dashboard. */
+:root {
+  --map-land: rgba(15, 23, 42, 0.18);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --map-land: rgba(226, 232, 240, 0.16);
+  }
+}
+
+.world-map {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.world-map .map-land-dot {
+  fill: var(--map-land);
+}
+
+.world-map .map-dot {
+  stroke: var(--surface-solid);
+  stroke-width: 1.5;
+  opacity: 0.92;
+}
+
+.world-map .map-ring {
+  fill: none;
+  stroke: var(--text);
+  stroke-width: 2;
+}
+
+.world-map .map-marker:hover .map-dot {
+  opacity: 1;
+  stroke: var(--text);
+}
+
+.provider-filter {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin: 0 auto 16px;
+}
+
+.provider-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-solid);
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.provider-chip i {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.provider-chip small {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.provider-chip input {
+  margin: 0;
+}
+
+.cloud-map {
+  padding: 12px;
+}
+
+.region-directory {
+  display: grid;
+  gap: 10px;
+  max-width: 980px;
+  margin: 18px auto 0;
+}
+
+.region-group {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface-solid);
+}
+
+.region-group summary {
+  display: flex;
+  justify-content: space-between;
+  padding: 12px 16px;
+  cursor: pointer;
+}
+
+.region-group summary span {
+  color: var(--muted);
+}
+
+.region-rows {
+  display: grid;
+  margin: 0;
+  padding: 0 16px 12px;
+  list-style: none;
+}
+
+.region-rows li {
+  display: grid;
+  grid-template-columns: minmax(140px, 220px) 1fr;
+  gap: 10px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.region-city small {
+  color: var(--muted);
+}
+
+.region-codes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.region-codes code {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  border: 1px solid var(--line);
+}
+
+.region-codes .provider-aws { border-color: #ff9900; }
+.region-codes .provider-azure { border-color: #0078d4; }
+.region-codes .provider-gcp { border-color: #34a853; }
+.region-codes .provider-oracle { border-color: #c74634; }
+.region-codes .provider-alibaba { border-color: #ff6a00; }
+.region-codes .provider-ibm { border-color: #0f62fe; }
+.region-codes .provider-digitalocean { border-color: #0080ff; }
+
+.region-note {
+  max-width: 980px;
+  margin: 12px auto 0;
+  color: var(--muted);
+  font-size: 0.88rem;
+  text-align: center;
+}
+
+@media (max-width: 560px) {
+  .region-rows li {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+}

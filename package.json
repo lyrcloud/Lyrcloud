@@ -9,21 +9,25 @@
     "check": "node scripts/check.mjs",
     "create:s3": "bash scripts/create-s3.sh",
     "deploy:aws": "bash scripts/deploy-aws.sh",
-    "test": "node --test api/account/roles.test.mjs api/account/handler.test.mjs api/account/lyrbot.test.mjs api/account/messages.test.mjs api/github-bridge/index.test.mjs api/projects/rules.test.mjs api/projects/handler.test.mjs api/domains/rules.test.mjs api/domains/lyrdns.test.mjs api/domains/handler.test.mjs"
+    "test": "node --test api/account/roles.test.mjs api/account/handler.test.mjs api/account/lyrbot.test.mjs api/account/messages.test.mjs api/github-bridge/index.test.mjs api/projects/rules.test.mjs api/projects/handler.test.mjs api/domains/rules.test.mjs api/domains/lyrdns.test.mjs api/domains/handler.test.mjs api/cloud/rules.test.mjs api/cloud/handler.test.mjs"
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.133.0",
+    "@aws-sdk/client-cloudformation": "^3.1162.0",
     "@aws-sdk/client-cloudfront-keyvaluestore": "^3.1161.0",
     "@aws-sdk/client-cloudwatch-logs": "^3.1161.0",
     "@aws-sdk/client-codebuild": "^3.1161.0",
     "@aws-sdk/client-cognito-identity-provider": "^3.1161.0",
     "@aws-sdk/client-dynamodb": "^3.682.0",
+    "@aws-sdk/client-ec2": "^3.1162.0",
+    "@aws-sdk/client-iam": "^3.1162.0",
     "@aws-sdk/client-route-53": "^3.1162.0",
     "@aws-sdk/client-route-53-domains": "^3.1162.0",
     "@aws-sdk/client-s3": "^3.1161.0",
     "@aws-sdk/client-secrets-manager": "^3.1152.0",
     "@aws-sdk/client-sesv2": "^3.1161.0",
     "@aws-sdk/client-sns": "^3.1161.0",
+    "@aws-sdk/client-sts": "^3.1162.0",
     "@aws-sdk/lib-dynamodb": "^3.682.0",
     "@aws-sdk/signature-v4a": "^3.1138.0",
     "esbuild": "^0.24.2"
