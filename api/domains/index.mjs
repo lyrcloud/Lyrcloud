@@ -10,6 +10,11 @@
 //   PUT    /domains/{name}                   { autoRenew }
 //   PUT    /domains/{name}/records           { type, name, values[], ttl? } create or replace a record set
 //   DELETE /domains/{name}/records?type=&name=   delete a record set
+//   POST   /domains/subdomains               { label, autoRenew? } claim label.<SUBDOMAIN_ZONE>: free on some plans, else Stripe
+//   GET|PUT|DELETE /domains/subdomains/{label}   one subdomain; { autoRenew }; release it
+//   PUT|DELETE /domains/subdomains/{label}/records   its DNS records, as for domains
+//   POST   /domains/lyr-waitlist             { name } reserve a .lyr name for free, for when .lyr becomes official
+//   DELETE /domains/lyr-waitlist/{name}      give the reservation up
 //   GET    /admin/domains                    every domain and recent order (staff)
 //   GET    /admin/domain-pricing             commission settings, cost and price per TLD, Stripe status (staff)
 //   PUT    /admin/domain-pricing             { percent?, flatCents?, dnsCentsPerYear?, round99?, tlds?, overrides? } (super admin)
@@ -19,6 +24,7 @@
 // The .lyr namespace (preview, lyrdns.mjs; not an ICANN TLD and not for sale yet):
 //   GET|POST /dns-query                      Lyrcloud's DNS-over-HTTPS resolver: answers .lyr, forwards the rest
 //   GET    /public/lyr/lookup?name=&type=    a .lyr name's answer as JSON (for the /lyr/ page)
+//   GET    /public/lyr/available?name=       whether a .lyr name can be reserved
 //   GET    /admin/lyr                        every .lyr name (staff)
 //   PUT    /admin/lyr/{name}                 { owner?, note?, records[] } create or update a name (super admin)
 //   DELETE /admin/lyr/{name}                 release a name (super admin)
@@ -44,7 +50,7 @@ import {
   TransferDomainCommand,
 } from '@aws-sdk/client-route-53-domains';
 import { ChangeResourceRecordSetsCommand, ListHostedZonesByNameCommand, ListResourceRecordSetsCommand, Route53Client } from '@aws-sdk/client-route-53';
-import { isStaff, roleFor } from '../account/roles.mjs';
+import { isStaff, planFor, roleFor } from '../account/roles.mjs';
 import {
   answerLyr,
   buildResponse,
@@ -62,8 +68,11 @@ import {
 import {
   checkoutError,
   cleanContact,
+  cleanLabel,
   cleanDomain,
   HOLD_MINUTES,
+  MAX_LYR_RESERVATIONS,
+  MAX_SUBDOMAINS,
   orderAmount,
   pricingConfig,
   pricingError,
@@ -72,6 +81,7 @@ import {
   recordError,
   recordName,
   renewalDue,
+  RESERVED_SUBDOMAINS,
   route53Contact,
   route53RecordSet,
   fromRecordSet,
@@ -88,6 +98,9 @@ const TABLE = env.TABLE_NAME;
 const USERS_TABLE = env.USERS_TABLE_NAME;
 const STRIPE_SECRET_NAME = env.STRIPE_SECRET_NAME;
 const SUPER_ADMIN_EMAIL = env.SUPER_ADMIN_EMAIL || 'lyrclouds@gmail.com';
+// name.<zone> subdomains (lyr.cloud): off until the zone is registered and both are set (deploy-domains.sh finds them).
+const SUB_ZONE = env.SUBDOMAIN_ZONE || '';
+const SUB_ZONE_ID = env.SUBDOMAIN_ZONE_ID || '';
 const SITE_URL = env.SITE_URL || 'https://www.lyrcloud.com';
 const ALLOWED_ORIGINS = String(env.ALLOWED_ORIGINS || SITE_URL).split(',').map((origin) => origin.trim());
 
@@ -267,7 +280,7 @@ async function caller(event) {
   const userId = event.requestContext?.authorizer?.jwt?.claims?.sub;
   if (!userId) return null;
   const profile = (await ddb.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId } }))).Item || { userId };
-  return { userId, profile, role: roleFor(profile, SUPER_ADMIN_EMAIL), email: profile.email || null };
+  return { userId, profile, role: roleFor(profile, SUPER_ADMIN_EMAIL), plan: planFor(profile), email: profile.email || null };
 }
 
 // ---------------------------------------------------------------- availability
@@ -380,7 +393,16 @@ async function myDomains(who) {
   const [items, billing, config, prices, stripeConfig] = await Promise.all([itemsOf(who.userId), getItem(billingKey(who.userId)), getPricing(), wholesale(), getStripe()]);
   const domains = items.filter((item) => item.kind === 'domain' && !staleHold(item)).map((item) => publicDomain(item, config, prices));
   const orders = items.filter((item) => item.kind === 'order' && item.status !== 'open' && item.status !== 'expired').slice(0, 20).map(publicOrder);
-  return json(200, { domains, orders, contact: billing?.contact || null, paymentsReady: Boolean(stripeConfig.secretKey), currency: 'usd' });
+  const subdomains = {
+    enabled: subdomainsOn(),
+    zone: SUB_ZONE || null,
+    price: config.subdomainCents,
+    freeWithPlan: config.subdomainFreePlans.includes(who.plan),
+    freePlans: config.subdomainFreePlans,
+    items: items.filter((item) => item.kind === 'subdomain' && !staleHold(item) && item.status !== 'expired').map((item) => publicSubdomain(item, config)),
+  };
+  const lyrReservations = items.filter((item) => item.kind === 'lyrwait').map((item) => ({ name: item.name, createdAt: item.createdAt }));
+  return json(200, { domains, orders, subdomains, lyrReservations, contact: billing?.contact || null, paymentsReady: Boolean(stripeConfig.secretKey), currency: 'usd' });
 }
 
 // Why a transfer can't start, in words, for Route 53's Transferability answer.
@@ -466,28 +488,14 @@ async function checkout(event, who) {
     },
   }));
 
-  const billing = await getItem(billingKey(who.userId));
-  const mode = stripeMode(stripeConfig.secretKey);
-  const customer = billing?.stripeCustomers?.[mode];
-  const origin = siteOrigin(event);
   const label = { register: 'Domain registration', transfer: 'Domain transfer (adds 1 year)', renew: 'Domain renewal' }[action];
   let session;
   try {
-    session = await stripe('POST', '/checkout/sessions', {
-      mode: 'payment',
-      payment_method_types: ['card'],
-      ...(customer ? { customer } : { customer_creation: 'always', customer_email: contact?.email || who.email || undefined }),
-      client_reference_id: orderId,
-      line_items: [{
-        quantity: 1,
-        price_data: { currency: 'usd', unit_amount: amount, product_data: { name: `${label}: ${domain}`, description: `${years} year${years === 1 ? '' : 's'}` } },
-      }],
-      payment_intent_data: { setup_future_usage: 'off_session', description: `${label}: ${domain}`, metadata: { orderId, domain, action } },
-      metadata: { orderId, domain, action },
-      expires_at: Math.floor(Date.now() / 1000) + 31 * 60,
-      success_url: `${origin}/dash/#/domains/${domain}?paid=1`,
-      cancel_url: `${origin}/dash/#/domains/buy?domain=${domain}&action=${action}&cancelled=1`,
-    }, { idempotencyKey: `checkout-${orderId}` });
+    session = await openCheckout(event, who, {
+      orderId, amount, domain, action, email: contact?.email,
+      title: `${label}: ${domain}`, description: `${years} year${years === 1 ? '' : 's'}`,
+      successPath: `/dash/#/domains/${domain}?paid=1`, cancelPath: `/dash/#/domains/buy?domain=${domain}&action=${action}&cancelled=1`,
+    });
   } catch (err) {
     await update(orderKey(orderId), { status: 'expired', failureReason: err.message });
     if (action !== 'renew') await releaseHold(domain, orderId);
@@ -500,11 +508,31 @@ async function checkout(event, who) {
   return json(200, { url: session.url, orderId });
 }
 
-async function releaseHold(domain, orderId) {
+// A Stripe Checkout page for one order. The card is saved for renewals (setup_future_usage).
+async function openCheckout(event, who, { orderId, amount, domain, action, email, title, description, successPath, cancelPath }) {
+  const stripeConfig = await getStripe();
+  const billing = await getItem(billingKey(who.userId));
+  const customer = billing?.stripeCustomers?.[stripeMode(stripeConfig.secretKey)];
+  const origin = siteOrigin(event);
+  return stripe('POST', '/checkout/sessions', {
+    mode: 'payment',
+    payment_method_types: ['card'],
+    ...(customer ? { customer } : { customer_creation: 'always', customer_email: email || who.email || undefined }),
+    client_reference_id: orderId,
+    line_items: [{ quantity: 1, price_data: { currency: 'usd', unit_amount: amount, product_data: { name: title, description } } }],
+    payment_intent_data: { setup_future_usage: 'off_session', description: title, metadata: { orderId, domain, action } },
+    metadata: { orderId, domain, action },
+    expires_at: Math.floor(Date.now() / 1000) + 31 * 60,
+    success_url: `${origin}${successPath}`,
+    cancel_url: `${origin}${cancelPath}`,
+  }, { idempotencyKey: `checkout-${orderId}` });
+}
+
+async function releaseHold(domain, orderId, key = domainKey(domain)) {
   try {
     await ddb.send(new DeleteCommand({
       TableName: TABLE,
-      Key: domainKey(domain),
+      Key: key,
       ConditionExpression: '#s = :awaiting AND orderId = :o',
       ExpressionAttributeNames: { '#s': 'status' },
       ExpressionAttributeValues: { ':awaiting': 'awaiting_payment', ':o': orderId },
@@ -573,6 +601,8 @@ async function changeRecord(event, item, method) {
 async function domainRoutes(event, method, path, who) {
   if (path === '/domains' && method === 'GET') return myDomains(who);
   if (path === '/domains/checkout' && method === 'POST') return checkout(event, who);
+  if (path === '/domains/subdomains' || path.startsWith('/domains/subdomains/')) return subdomainRoutes(event, method, path, who);
+  if (path === '/domains/lyr-waitlist' || path.startsWith('/domains/lyr-waitlist/')) return waitlistRoutes(event, method, path, who);
   const match = path.match(/^\/domains\/([^/]+)(\/records)?$/);
   if (!match) return error(404, 'not_found');
   const item = await ownedDomain(decodeURIComponent(match[1]), who);
@@ -623,6 +653,13 @@ async function refund(order, reason) {
     await stripe('POST', '/refunds', { payment_intent: order.paymentIntentId, metadata: { orderId: order.orderId } }, { idempotencyKey: `refund-${order.orderId}` });
   }
   await update(orderKey(order.orderId), { status: 'refunded', failureReason: reason, refundedAt: now() }, ['authCode']);
+  if (order.action === 'subdomain' || order.action === 'subdomain-renew') {
+    const item = await getItem(subKey(order.domain));
+    if (item?.ownerId !== order.ownerId) return;
+    if (order.action === 'subdomain-renew') await update(subKey(order.domain), { lastRenewalError: `Renewal failed and was refunded: ${reason}` });
+    else if (item.status === 'awaiting_payment') await update(subKey(order.domain), { status: 'failed', failureReason: reason }, ['holdUntil', 'checkoutUrl']);
+    return;
+  }
   if (order.action === 'renew') {
     await update(domainKey(order.domain), { renewing: false, lastRenewalError: `Renewal failed and was refunded: ${reason}` }, ['renewOrderId', 'renewOperationId']);
   } else {
@@ -638,6 +675,10 @@ export const TEST_MODE_REASON = 'Stripe is in test mode, so no real domain was b
 async function fulfil(order) {
   if (stripeMode((await getStripe()).secretKey) === 'test' && env.ALLOW_TEST_REGISTRATIONS !== '1') {
     await refund(order, TEST_MODE_REASON);
+    return;
+  }
+  if (order.action === 'subdomain' || order.action === 'subdomain-renew') {
+    await activateSubdomain(order);
     return;
   }
   let operationId;
@@ -692,7 +733,8 @@ async function onCheckoutExpired(session) {
   const order = orderId && (await getItem(orderKey(orderId)));
   if (!order || order.status !== 'open') return;
   await update(orderKey(orderId), { status: 'expired' }, ['authCode']);
-  if (order.action !== 'renew') await releaseHold(order.domain, orderId);
+  if (order.action === 'subdomain') await releaseHold(order.domain, orderId, subKey(order.domain));
+  else if (order.action !== 'renew') await releaseHold(order.domain, orderId);
 }
 
 async function stripeWebhook(event) {
@@ -776,11 +818,13 @@ async function chargeRenewal(item) {
 }
 
 export async function tick() {
-  const items = await collect(ScanCommand, { FilterExpression: '#k = :d', ExpressionAttributeNames: { '#k': 'kind' }, ExpressionAttributeValues: { ':d': 'domain' } });
+  const items = await collect(ScanCommand, { FilterExpression: '#k IN (:d, :s)', ExpressionAttributeNames: { '#k': 'kind' }, ExpressionAttributeValues: { ':d': 'domain', ':s': 'subdomain' } });
   const day = 86_400_000;
   await pool(items, 2, async (item) => {
     try {
-      if ((['registering', 'transferring'].includes(item.status) && item.operationId) || (item.renewing && item.renewOperationId)) {
+      if (item.kind === 'subdomain') {
+        await subdomainTick(item);
+      } else if ((['registering', 'transferring'].includes(item.status) && item.operationId) || (item.renewing && item.renewOperationId)) {
         await followOperation(item);
       } else if (item.status === 'active' && item.autoRenew && !item.renewing && renewalDue(item.expiresAt)
         && Date.parse(item.expiresAt) > Date.now() && (!item.lastRenewAttemptAt || Date.now() - Date.parse(item.lastRenewAttemptAt) > day)) {
@@ -797,6 +841,281 @@ export async function tick() {
   return { checked: items.length };
 }
 
+
+// ---------------------------------------------------------------- name.lyr.cloud subdomains
+
+const subKey = (fqdn) => ({ pk: `sub#${fqdn}`, sk: 'sub' });
+const subdomainsOn = () => Boolean(SUB_ZONE && SUB_ZONE_ID);
+const SUB_GRACE_MS = 7 * 86_400_000;
+const YEAR_MS = 365 * 86_400_000;
+
+function publicSubdomain(item, config) {
+  const awaiting = item.status === 'awaiting_payment';
+  return {
+    name: item.fqdn, label: item.label, status: item.status, free: item.free === true, autoRenew: item.autoRenew === true,
+    expiresAt: item.free ? null : item.expiresAt || null, createdAt: item.createdAt,
+    holdUntil: awaiting ? item.holdUntil : null, checkoutUrl: awaiting ? item.checkoutUrl || null : null,
+    lastRenewalError: item.lastRenewalError || null, failureReason: item.failureReason || null,
+    renewPrice: item.free ? 0 : config.subdomainCents,
+  };
+}
+
+// The item can be (re)claimed by `who` unless someone else holds or owns it.
+const CLAIMABLE = {
+  ConditionExpression: 'attribute_not_exists(pk) OR #s IN (:expired, :failed) OR (#s = :awaiting AND (holdUntil < :now OR ownerId = :me))',
+  names: { '#s': 'status' },
+  values: (who) => ({ ':expired': 'expired', ':failed': 'failed', ':awaiting': 'awaiting_payment', ':now': now(), ':me': who.userId }),
+};
+
+async function claimSubdomain(event, who) {
+  if (!subdomainsOn()) return error(503, `name.${SUB_ZONE || 'lyr.cloud'} addresses are coming soon.`);
+  const body = parseJson(event);
+  const label = cleanLabel(body?.label);
+  if (!label) return error(400, 'Use letters, digits and hyphens, like my-shop.');
+  const fqdn = `${label}.${SUB_ZONE}`;
+  if (RESERVED_SUBDOMAINS.includes(label)) return error(409, `${fqdn} is reserved.`);
+  const config = await getPricing();
+  const held = (await itemsOf(who.userId)).filter((item) => item.kind === 'subdomain' && item.status === 'active');
+  if (held.some((item) => item.fqdn === fqdn)) return error(409, `${fqdn} is already yours.`);
+  if (held.length >= MAX_SUBDOMAINS) return error(409, `You can hold up to ${MAX_SUBDOMAINS} ${SUB_ZONE} names.`);
+  const existing = await getItem(subKey(fqdn));
+  const claimable = !existing || ['expired', 'failed'].includes(existing.status) || staleHold(existing) || (existing.status === 'awaiting_payment' && existing.ownerId === who.userId);
+  if (!claimable) return error(409, `${fqdn} is taken.`);
+  const free = config.subdomainFreePlans.includes(who.plan);
+  const createdAt = now();
+  const base = { ...subKey(fqdn), kind: 'subdomain', fqdn, label, ownerId: who.userId, ownerEmail: who.email, createdAt, autoRenew: body.autoRenew !== false };
+  const put = async (item) => {
+    try {
+      await ddb.send(new PutCommand({ TableName: TABLE, Item: item, ConditionExpression: CLAIMABLE.ConditionExpression, ExpressionAttributeNames: CLAIMABLE.names, ExpressionAttributeValues: CLAIMABLE.values(who) }));
+      return true;
+    } catch (err) {
+      if (isConditionFailure(err)) return false;
+      throw err;
+    }
+  };
+  if (free) {
+    const item = { ...base, status: 'active', free: true, plan: who.plan, activatedAt: createdAt };
+    if (!(await put(item))) return error(409, `${fqdn} is taken.`);
+    return json(200, { subdomain: publicSubdomain(item, config) });
+  }
+  if (!(await getStripe()).secretKey) return error(503, 'Payments aren’t switched on yet. Please check back soon.');
+  const orderId = randomUUID();
+  const holdUntil = new Date(Date.now() + HOLD_MINUTES * 60_000).toISOString();
+  if (!(await put({ ...base, status: 'awaiting_payment', free: false, orderId, holdUntil }))) return error(409, `${fqdn} is taken.`);
+  await ddb.send(new PutCommand({
+    TableName: TABLE,
+    Item: { ...orderKey(orderId), kind: 'order', orderId, domain: fqdn, ownerId: who.userId, action: 'subdomain', years: 1, amountCents: config.subdomainCents, costCents: 0, status: 'open', createdAt },
+  }));
+  let session;
+  try {
+    session = await openCheckout(event, who, {
+      orderId, amount: config.subdomainCents, domain: fqdn, action: 'subdomain', title: `${fqdn} for one year`, description: 'Renews yearly; cancel any time',
+      successPath: `/dash/#/domains/sub/${label}?paid=1`, cancelPath: `/dash/#/domains?cancelled=${label}`,
+    });
+  } catch (err) {
+    await update(orderKey(orderId), { status: 'expired', failureReason: err.message });
+    await releaseHold(fqdn, orderId, subKey(fqdn));
+    if (err instanceof StripeError) return error(502, `Payment page couldn’t be created: ${err.message}`);
+    throw err;
+  }
+  await update(orderKey(orderId), { sessionId: session.id });
+  await update(subKey(fqdn), { checkoutUrl: session.url });
+  return json(200, { url: session.url, orderId });
+}
+
+// Paid: start (or extend) a year. The hold may have run out and gone to someone else: then refund.
+async function activateSubdomain(order) {
+  const item = await getItem(subKey(order.domain));
+  if (!item || item.ownerId !== order.ownerId || (order.action === 'subdomain' && item.status !== 'active' && item.orderId !== order.orderId)) {
+    await refund(order, 'The hold on this name ran out before the payment arrived.');
+    return;
+  }
+  const from = item.status === 'active' && item.expiresAt && Date.parse(item.expiresAt) > Date.now() ? Date.parse(item.expiresAt) : Date.now();
+  await update(subKey(order.domain), {
+    status: 'active', free: false, expiresAt: new Date(from + YEAR_MS).toISOString(), paidAt: now(), activatedAt: item.activatedAt || now(),
+    stripeCustomerId: order.stripeCustomerId || item.stripeCustomerId, paymentMethodId: order.paymentMethodId || item.paymentMethodId, lastRenewalError: null,
+  }, ['holdUntil', 'checkoutUrl', 'failureReason']);
+  await update(orderKey(order.orderId), { status: 'fulfilled', fulfilledAt: now() });
+}
+
+// Record sets at or below `fqdn` in the subdomain zone. Route 53 lists names in DNS order, so they sit
+// together from `fqdn` on.
+async function subRecordSets(fqdn) {
+  const sets = [];
+  let start = { StartRecordName: fqdn };
+  for (;;) {
+    const page = await dns.send(new ListResourceRecordSetsCommand({ HostedZoneId: SUB_ZONE_ID, MaxItems: 300, ...start }));
+    for (const set of page.ResourceRecordSets || []) {
+      const name = String(set.Name).replace(/\.$/, '').replace(/\\052/g, '*');
+      if (name !== fqdn && !name.endsWith(`.${fqdn}`)) return sets;
+      sets.push(set);
+    }
+    if (!page.IsTruncated) return sets;
+    start = { StartRecordName: page.NextRecordName, StartRecordType: page.NextRecordType };
+  }
+}
+
+const recordSetName = (set) => String(set.Name).replace(/\.$/, '').replace(/\\052/g, '*');
+
+async function subdomainRoutes(event, method, path, who) {
+  if (path === '/domains/subdomains') return method === 'POST' ? claimSubdomain(event, who) : error(404, 'not_found');
+  const match = path.match(/^\/domains\/subdomains\/([^/]+)(\/records)?$/);
+  const label = match && cleanLabel(decodeURIComponent(match[1]));
+  if (!label || !subdomainsOn()) return error(404, 'not_found');
+  const fqdn = `${label}.${SUB_ZONE}`;
+  const item = await getItem(subKey(fqdn));
+  if (!item || (item.ownerId !== who.userId && !isStaff(who.role)) || staleHold(item) || item.status === 'expired') return error(404, 'That name isn’t in your account.');
+  const config = await getPricing();
+  if (match[2]) {
+    if (item.status !== 'active') return error(409, 'Records can be added once the name is active.');
+    if (method === 'PUT') {
+      const record = parseJson(event);
+      const refused = recordError(record, fqdn, { apexCname: true });
+      if (refused) return error(...refused);
+      try {
+        await dns.send(new ChangeResourceRecordSetsCommand({ HostedZoneId: SUB_ZONE_ID, ChangeBatch: { Comment: `Lyrcloud: ${fqdn}`, Changes: [{ Action: 'UPSERT', ResourceRecordSet: route53RecordSet(record, fqdn) }] } }));
+      } catch (err) {
+        if (err.name === 'InvalidChangeBatch' || err.name === 'InvalidInput') return error(400, err.message);
+        throw err;
+      }
+      return json(200, { saved: true });
+    }
+    if (method === 'DELETE') {
+      const type = event.queryStringParameters?.type;
+      const name = recordName(event.queryStringParameters?.name, fqdn);
+      const existing = (await subRecordSets(fqdn)).find((set) => set.Type === type && recordSetName(set) === name && !set.AliasTarget);
+      if (!existing || !['A', 'AAAA', 'CNAME', 'MX', 'TXT'].includes(type)) return error(404, 'No such record.');
+      await dns.send(new ChangeResourceRecordSetsCommand({ HostedZoneId: SUB_ZONE_ID, ChangeBatch: { Changes: [{ Action: 'DELETE', ResourceRecordSet: existing }] } }));
+      return json(200, { deleted: true });
+    }
+    return error(404, 'not_found');
+  }
+  if (method === 'GET') {
+    const records = item.status === 'active' ? (await subRecordSets(fqdn)).map((set) => fromRecordSet(set, fqdn)).filter(Boolean) : [];
+    return json(200, { subdomain: publicSubdomain(item, config), records, owner: isStaff(who.role) ? item.ownerEmail : undefined });
+  }
+  if (item.ownerId !== who.userId) return error(403, 'Only the owner can change this name.');
+  if (method === 'PUT') {
+    const body = parseJson(event);
+    if (!body || typeof body.autoRenew !== 'boolean') return error(400, 'Send { "autoRenew": true | false }.');
+    return json(200, { subdomain: publicSubdomain(await update(subKey(fqdn), { autoRenew: body.autoRenew }), config) });
+  }
+  if (method === 'DELETE') {
+    await releaseSubdomain(item);
+    return json(200, { released: fqdn });
+  }
+  return error(404, 'not_found');
+}
+
+// Deletes the name's records and frees it.
+async function releaseSubdomain(item) {
+  // Only the record types customers can create; never anything structural.
+  const sets = (await subRecordSets(item.fqdn)).filter((set) => ['A', 'AAAA', 'CNAME', 'MX', 'TXT'].includes(set.Type));
+  for (let i = 0; i < sets.length; i += 100) {
+    await dns.send(new ChangeResourceRecordSetsCommand({ HostedZoneId: SUB_ZONE_ID, ChangeBatch: { Changes: sets.slice(i, i + 100).map((set) => ({ Action: 'DELETE', ResourceRecordSet: set })) } }));
+  }
+  await ddb.send(new DeleteCommand({ TableName: TABLE, Key: subKey(item.fqdn) }));
+}
+
+// Charges the saved card for a paid subdomain's next year.
+async function chargeSubRenewal(item) {
+  const attemptAt = now();
+  await update(subKey(item.fqdn), { lastRenewAttemptAt: attemptAt });
+  if (!item.stripeCustomerId || !item.paymentMethodId) {
+    await update(subKey(item.fqdn), { lastRenewalError: 'No saved card. Turn auto-renew off and on again after paying, or contact support.' });
+    return;
+  }
+  const amount = (await getPricing()).subdomainCents;
+  const orderId = randomUUID();
+  await ddb.send(new PutCommand({
+    TableName: TABLE,
+    Item: { ...orderKey(orderId), kind: 'order', orderId, domain: item.fqdn, ownerId: item.ownerId, action: 'subdomain-renew', years: 1, auto: true, amountCents: amount, costCents: 0, status: 'open', createdAt: attemptAt },
+  }));
+  let intent;
+  try {
+    intent = await stripe('POST', '/payment_intents', {
+      amount, currency: 'usd', customer: item.stripeCustomerId, payment_method: item.paymentMethodId, off_session: true, confirm: true,
+      description: `Renewal: ${item.fqdn}`, metadata: { orderId, domain: item.fqdn, action: 'subdomain-renew' },
+    }, { idempotencyKey: `renew-${orderId}` });
+  } catch (err) {
+    await update(orderKey(orderId), { status: 'failed', failureReason: err.message });
+    await update(subKey(item.fqdn), { lastRenewalError: `Auto-renew charge failed: ${err.message}` });
+    return;
+  }
+  if (intent.status !== 'succeeded') {
+    await update(orderKey(orderId), { status: 'failed', failureReason: `Payment ${intent.status}` });
+    await update(subKey(item.fqdn), { lastRenewalError: 'Your bank asked for confirmation. Contact support to renew.' });
+    return;
+  }
+  await fulfil(await update(orderKey(orderId), { status: 'paid', paidAt: now(), paymentIntentId: intent.id, stripeCustomerId: item.stripeCustomerId, paymentMethodId: item.paymentMethodId }));
+}
+
+async function subdomainTick(item) {
+  const day = 86_400_000;
+  if (item.status === 'awaiting_payment' && Date.parse(item.holdUntil) < Date.now() - 3600_000) {
+    await releaseHold(item.fqdn, item.orderId, subKey(item.fqdn));
+  } else if (item.status === 'active' && !item.free && item.expiresAt) {
+    const expires = Date.parse(item.expiresAt);
+    if (expires + SUB_GRACE_MS < Date.now()) {
+      if (subdomainsOn()) await releaseSubdomain(item);
+    } else if (item.autoRenew && renewalDue(item.expiresAt) && (!item.lastRenewAttemptAt || Date.now() - Date.parse(item.lastRenewAttemptAt) > day)) {
+      await chargeSubRenewal(item);
+    }
+  }
+}
+
+// ---------------------------------------------------------------- .lyr waitlist
+
+const waitKey = (name) => ({ pk: `lyrwait#${name}`, sk: 'lyrwait' });
+
+// Whether `name` (already cleaned) can be reserved, and if not, why.
+async function lyrNameState(name, who) {
+  if (isReservedLyr(name)) return { available: false, reason: 'reserved' };
+  if (await getItem(lyrKey(name))) return { available: false, reason: 'taken' };
+  const waiting = await getItem(waitKey(name));
+  if (waiting) return { available: false, reason: waiting.ownerId === who?.userId ? 'yours' : 'waitlisted' };
+  return { available: true, reason: null };
+}
+
+async function lyrAvailable(event) {
+  const name = cleanLyrName(event.queryStringParameters?.name);
+  if (!name) return error(400, 'Use a name like shop.lyr: letters, digits and hyphens.');
+  return json(200, { name, ...(await lyrNameState(name, null)) });
+}
+
+async function waitlistRoutes(event, method, path, who) {
+  if (path === '/domains/lyr-waitlist' && method === 'POST') {
+    const name = cleanLyrName(parseJson(event)?.name);
+    if (!name) return error(400, 'Use a name like shop.lyr: letters, digits and hyphens.');
+    const state = await lyrNameState(name, who);
+    if (state.reason === 'yours') return json(200, { reservation: { name } });
+    if (!state.available) return error(409, { reserved: `${name} is reserved.`, taken: `${name} is already in use.`, waitlisted: `Someone has already reserved ${name}.` }[state.reason]);
+    const mine = (await itemsOf(who.userId)).filter((item) => item.kind === 'lyrwait');
+    if (mine.length >= MAX_LYR_RESERVATIONS) return error(409, `You can reserve up to ${MAX_LYR_RESERVATIONS} .lyr names.`);
+    const createdAt = now();
+    try {
+      await ddb.send(new PutCommand({
+        TableName: TABLE,
+        Item: { ...waitKey(name), kind: 'lyrwait', name, ownerId: who.userId, ownerEmail: who.email, createdAt },
+        ConditionExpression: 'attribute_not_exists(pk)',
+      }));
+    } catch (err) {
+      if (isConditionFailure(err)) return error(409, `Someone has just reserved ${name}.`);
+      throw err;
+    }
+    return json(200, { reservation: { name, createdAt } });
+  }
+  const match = path.match(/^\/domains\/lyr-waitlist\/([^/]+)$/);
+  const name = match && cleanLyrName(decodeURIComponent(match[1]));
+  if (!name || method !== 'DELETE') return error(404, 'not_found');
+  try {
+    await ddb.send(new DeleteCommand({ TableName: TABLE, Key: waitKey(name), ConditionExpression: 'ownerId = :me', ExpressionAttributeValues: { ':me': who.userId } }));
+  } catch (err) {
+    if (isConditionFailure(err)) return error(404, 'That reservation isn’t yours.');
+    throw err;
+  }
+  return json(200, { released: name });
+}
 
 // ---------------------------------------------------------------- .lyr resolver and registry
 
@@ -892,8 +1211,11 @@ function normalizeLyrRecords(records, name) {
 
 async function lyrAdminRoutes(event, method, path, who) {
   if (path === '/admin/lyr' && method === 'GET') {
-    const items = await collect(ScanCommand, { FilterExpression: '#k = :l', ExpressionAttributeNames: { '#k': 'kind' }, ExpressionAttributeValues: { ':l': 'lyr' } });
-    return json(200, { names: items.map(publicLyr).sort((a, b) => a.name.localeCompare(b.name)) });
+    const items = await collect(ScanCommand, { FilterExpression: '#k IN (:l, :w)', ExpressionAttributeNames: { '#k': 'kind' }, ExpressionAttributeValues: { ':l': 'lyr', ':w': 'lyrwait' } });
+    const reservations = items.filter((item) => item.kind === 'lyrwait')
+      .map((item) => ({ name: item.name, ownerEmail: item.ownerEmail || null, createdAt: item.createdAt }))
+      .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+    return json(200, { names: items.filter((item) => item.kind === 'lyr').map(publicLyr).sort((a, b) => a.name.localeCompare(b.name)), reservations });
   }
   const match = path.match(/^\/admin\/lyr\/([^/]+)$/);
   if (!match) return error(404, 'not_found');
@@ -959,7 +1281,7 @@ async function adminRoutes(event, method, path, who) {
       const refused = pricingError(body);
       if (refused) return error(...refused);
       const current = await getPricing();
-      const allowed = ['percent', 'flatCents', 'dnsCentsPerYear', 'round99', 'tlds', 'overrides'];
+      const allowed = ['percent', 'flatCents', 'dnsCentsPerYear', 'round99', 'tlds', 'overrides', 'subdomainCents', 'subdomainFreePlans'];
       const config = pricingConfig({ ...current, ...Object.fromEntries(allowed.filter((key) => key in body).map((key) => [key, body[key]])) });
       await ddb.send(new PutCommand({ TableName: TABLE, Item: { ...PRICING_KEY, config, updatedAt: now(), updatedBy: who.userId } }));
       pricingCache = { value: config, at: Date.now() };
@@ -973,6 +1295,7 @@ async function adminRoutes(event, method, path, who) {
       config,
       tlds,
       available: Object.keys(prices).sort(),
+      subdomains: { enabled: subdomainsOn(), zone: SUB_ZONE || null },
       stripe: {
         connected: Boolean(stripeConfig.secretKey),
         mode: stripeConfig.secretKey ? stripeMode(stripeConfig.secretKey) : null,
@@ -1039,6 +1362,7 @@ export const handler = async (event) => {
     if (path === '/public/domains/prices' && method === 'GET') return await priceList();
     if (path === '/dns-query' && (method === 'GET' || method === 'POST')) return await dnsQuery(event, method);
     if (path === '/public/lyr/lookup' && method === 'GET') return await lyrLookup(event);
+    if (path === '/public/lyr/available' && method === 'GET') return await lyrAvailable(event);
 
     const who = await caller(event);
     if (!who) return error(401, 'unauthorized');

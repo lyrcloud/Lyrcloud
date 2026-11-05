@@ -527,9 +527,18 @@ ${pageHero({
           <ul>
             <li><b>.lyr isn’t an official extension yet.</b> It isn’t approved by ICANN, so most devices can’t open .lyr names. They work once a device or browser uses Lyrcloud DNS (below).</li>
             <li><b>No padlock yet.</b> Public certificate authorities don’t issue certificates for .lyr, so .lyr sites open over plain <code>http://</code>.</li>
-            <li><b>Not for sale.</b> .lyr names aren’t sold yet. We’ll open them up once these limits are solved.</li>
+            <li><b>Not for sale — but you can reserve one.</b> .lyr names aren’t sold yet. Reserve up to three for free below and you’ll get first claim when .lyr opens.</li>
           </ul>
         </div>
+      </section>
+
+      <section class="section">
+        <div class="section-heading compact"><h2>Reserve your .lyr name</h2><p>Free, no card needed. First come, first served.</p></div>
+        <form class="domain-search glass-card" id="lyr-reserve">
+          <input name="name" id="lyr-reserve-name" placeholder="mybrand.lyr" aria-label=".lyr name to reserve" autocomplete="off" required />
+          <button class="button primary" type="submit">Check</button>
+        </form>
+        <div class="lyr-result" id="lyr-reserve-result" role="status" aria-live="polite"></div>
       </section>
 
       <section class="section">
