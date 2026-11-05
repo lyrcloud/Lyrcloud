@@ -493,7 +493,67 @@ ${pageHero({
           ${domainFaqs.map(([question, answer]) => `<details><summary>${question}</summary><p>${answer}</p></details>`).join('\n          ')}
         </div>
       </section>
+      <section class="section tight">
+        <a class="lyr-teaser glass-card" href="/lyr/"><span class="eyebrow">Preview</span><b>Coming later: .lyr names</b><span>See how Lyrcloud’s own extension works →</span></a>
+      </section>
 ${ctaBand('Already have a domain?', 'Put it on Lyrcloud for a global CDN, free TLS and DDoS protection, wherever it’s registered.')}
+    </main>`,
+};
+
+// Must match DOMAINS_API_BASE in src/auth.js (and public/lyr.mobileconfig).
+const LYR_RESOLVER = 'https://uqp5mc2gq0.execute-api.us-east-1.amazonaws.com/dns-query';
+
+const lyrSetup = [
+  ['Chrome, Edge or Brave (computer or Android)', `Open <b>Settings → Privacy and security → Security → Use secure DNS</b>, choose <b>Custom</b> (on Android: <b>Choose another provider → Custom</b>) and paste the address above.`],
+  ['Firefox', `Open <b>Settings → Privacy &amp; Security → DNS over HTTPS</b>, choose <b>Max Protection</b>, pick <b>Custom</b> and paste the address above. Then type names with a slash, like <code>shop.lyr/</code>, so Firefox doesn’t search for them.`],
+  ['iPhone, iPad or Mac', `<a href="/lyr.mobileconfig">Download the Lyrcloud DNS profile</a>, then install it in <b>Settings → General → VPN, DNS &amp; Device Management</b>. Remove it there any time.`],
+];
+
+const lyrPage = {
+  route: '/lyr/',
+  title: '.lyr preview',
+  description: 'A preview of .lyr, Lyrcloud’s own domain extension. See how .lyr names work and try them with Lyrcloud DNS.',
+  scripts: ['/src/lyr.js'],
+  body: `
+    <main>
+${pageHero({
+  eyebrow: 'Preview',
+  title: 'Meet .lyr — names that end in Lyr.',
+  lede: 'A preview of Lyrcloud’s own domain extension. .lyr names work today on any device that uses Lyrcloud DNS.',
+})}
+      <section class="section tight">
+        <div class="lyr-callout glass-card">
+          <h2>What “preview” means</h2>
+          <ul>
+            <li><b>.lyr isn’t an official extension yet.</b> It isn’t approved by ICANN, so most devices can’t open .lyr names. They work once a device or browser uses Lyrcloud DNS (below).</li>
+            <li><b>No padlock yet.</b> Public certificate authorities don’t issue certificates for .lyr, so .lyr sites open over plain <code>http://</code>.</li>
+            <li><b>Not for sale.</b> .lyr names aren’t sold yet. We’ll open them up once these limits are solved.</li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-heading compact"><h2>Look up a .lyr name</h2><p>Asks Lyrcloud DNS directly, so it works on any device.</p></div>
+        <form class="domain-search glass-card" id="lyr-lookup">
+          <input name="name" id="lyr-name" placeholder="hello.lyr" aria-label=".lyr name" autocomplete="off" required />
+          <select name="type" id="lyr-type" aria-label="Record type"><option>A</option><option>AAAA</option><option>CNAME</option><option>TXT</option><option>MX</option></select>
+          <button class="button primary" type="submit">Look up</button>
+        </form>
+        <div class="lyr-result" id="lyr-result" role="status" aria-live="polite"></div>
+      </section>
+
+      <section class="section">
+        <div class="section-heading compact"><h2>Open .lyr names on your device</h2><p>Lyrcloud DNS answers .lyr names and passes every other lookup to a public resolver, so the rest of the web works as usual.</p></div>
+        <div class="lyr-resolver glass-card">
+          <span>Lyrcloud DNS address</span>
+          <code id="lyr-resolver">${LYR_RESOLVER}</code>
+          <button class="button ghost" type="button" id="lyr-copy">Copy</button>
+        </div>
+        <div class="faq">
+          ${lyrSetup.map(([device, steps]) => `<details><summary>${device}</summary><p>${steps}</p></details>`).join('\n          ')}
+        </div>
+      </section>
+${ctaBand('Want a name that works everywhere today?', 'Register a .com, .io, .dev and more with free WHOIS privacy and Lyrcloud DNS.')}
     </main>`,
 };
 
@@ -781,6 +841,7 @@ export const pages = [
   developersPage,
   networkPage,
   domainsPage,
+  lyrPage,
   pricingPage,
   aboutPage,
   contactPage,

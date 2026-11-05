@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Lyrcloud DNS for iPhone, iPad and Mac: switches the device to Lyrcloud's DNS-over-HTTPS resolver so
+     .lyr names (a Lyrcloud preview, not an ICANN extension) resolve. Other names go to a public resolver.
+     The ServerURL must match DOMAINS_API_BASE in src/auth.js + /dns-query. -->
+<plist version="1.0">
+<dict>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>DNSSettings</key>
+      <dict>
+        <key>DNSProtocol</key>
+        <string>HTTPS</string>
+        <key>ServerURL</key>
+        <string>https://uqp5mc2gq0.execute-api.us-east-1.amazonaws.com/dns-query</string>
+      </dict>
+      <key>PayloadDisplayName</key>
+      <string>Lyrcloud DNS</string>
+      <key>PayloadIdentifier</key>
+      <string>com.lyrcloud.dns.settings</string>
+      <key>PayloadType</key>
+      <string>com.apple.dnsSettings.managed</string>
+      <key>PayloadUUID</key>
+      <string>5D6F4AAC-6DF6-5B41-95CC-E7F7B197B788</string>
+      <key>PayloadVersion</key>
+      <integer>1</integer>
+    </dict>
+  </array>
+  <key>PayloadDescription</key>
+  <string>Uses Lyrcloud DNS so .lyr names open on this device. Remove it any time in Settings → General → VPN, DNS &amp; Device Management.</string>
+  <key>PayloadDisplayName</key>
+  <string>Lyrcloud DNS (.lyr preview)</string>
+  <key>PayloadIdentifier</key>
+  <string>com.lyrcloud.dns</string>
+  <key>PayloadOrganization</key>
+  <string>Lyrcloud</string>
+  <key>PayloadRemovalDisallowed</key>
+  <false/>
+  <key>PayloadType</key>
+  <string>Configuration</string>
+  <key>PayloadUUID</key>
+  <string>AD87BA75-1A9E-58A7-9BD2-929F6C375C57</string>
+  <key>PayloadVersion</key>
+  <integer>1</integer>
+</dict>
+</plist>

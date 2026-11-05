@@ -56,6 +56,14 @@ Lyrcloud resells domains through Route 53 Domains, with its own commission on to
 - **Stripe:** the super admin pastes a secret key in the admin console; the API checks it, registers its own webhook (`/public/stripe/webhook`) and keeps both in the `lyrcloud/stripe` secret.
 - **DNS:** registered domains get a Route 53 hosted zone; owners edit A, AAAA, CNAME, MX and TXT records in the dashboard, and the domain shows up as an active website.
 
+### .lyr (preview)
+
+`.lyr` is Lyrcloud's own extension. It is **not** an ICANN TLD, so it isn't in the public DNS: `.lyr` names only resolve on devices whose browser or OS uses Lyrcloud's DNS-over-HTTPS resolver, and public CAs won't issue TLS certificates for them. It isn't for sale; the super admin creates names in Admin console → Domains → .lyr names. `/lyr/` explains it and has a lookup tool and setup steps.
+
+- **Resolver:** `GET|POST /dns-query` on the domains API (RFC 8484, `api/domains/lyrdns.mjs`). It answers `.lyr` questions from the `lyrcloud-domains` table (`lyr#<name>` items), follows CNAMEs, and forwards every other query unchanged to Cloudflare's resolver. Queries aren't logged.
+- **Setup for users:** a custom secure-DNS address in Chrome/Edge/Brave/Firefox, or `public/lyr.mobileconfig` on Apple devices. The resolver URL is in three places that must agree: `DOMAINS_API_BASE` in `src/auth.js`, `LYR_RESOLVER` in `site/pages.mjs`, and `public/lyr.mobileconfig`.
+- **Before selling:** a real `.lyr` needs an ICANN application in a new-gTLD round; until then, sold names would only work for people using Lyrcloud DNS.
+
 ## Theme
 
 Light by default; dark when the visitor’s OS prefers dark. Colors are tokens on `:root` in `src/styles.css`.

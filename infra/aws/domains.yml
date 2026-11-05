@@ -213,10 +213,20 @@ Resources:
   StripeWebhookRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties: { ApiId: !Ref HttpApi, RouteKey: 'POST /public/stripe/webhook', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE }
+  # The .lyr preview: Lyrcloud's DNS-over-HTTPS resolver (RFC 8484) and a JSON lookup for the /lyr/ page.
+  DohGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /dns-query', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE }
+  DohPostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'POST /dns-query', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE }
+  LyrLookupRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /public/lyr/lookup', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE }
 
   Stage:
     Type: AWS::ApiGatewayV2::Stage
-    DependsOn: [SearchRoute]
+    DependsOn: [SearchRoute, DohGetRoute, DohPostRoute, LyrLookupRoute]
     Properties:
       ApiId: !Ref HttpApi
       StageName: '$default'
@@ -229,6 +239,16 @@ Resources:
         'GET /public/domains/search':
           ThrottlingBurstLimit: 6
           ThrottlingRateLimit: 2
+        # A browser looks up dozens of names per page, all through this resolver once it's switched on.
+        'GET /dns-query':
+          ThrottlingBurstLimit: 500
+          ThrottlingRateLimit: 200
+        'POST /dns-query':
+          ThrottlingBurstLimit: 500
+          ThrottlingRateLimit: 200
+        'GET /public/lyr/lookup':
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
 
   ApiInvokePermission:
     Type: AWS::Lambda::Permission
@@ -241,5 +261,7 @@ Resources:
 Outputs:
   DomainsApiBaseUrl:
     Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  LyrResolverUrl:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/dns-query'
   StripeWebhookUrl:
     Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/public/stripe/webhook'

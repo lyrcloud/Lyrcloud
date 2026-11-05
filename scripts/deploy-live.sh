@@ -26,6 +26,12 @@ aws s3 sync dist/assets/ "s3://$BUCKET/assets/" --cache-control "public,max-age=
 aws s3 sync dist/ "s3://$BUCKET/" --exclude "*.html" --exclude "assets/*" --cache-control "public,max-age=3600"
 aws s3 sync dist/ "s3://$BUCKET/" --exclude "*" --include "*.html" \
   --cache-control "public,max-age=0,must-revalidate" --content-type "text/html; charset=utf-8"
+# iOS only installs configuration profiles served with their own MIME type.
+for profile in dist/*.mobileconfig; do
+  [[ -e "$profile" ]] || continue
+  aws s3 cp "$profile" "s3://$BUCKET/$(basename "$profile")" --only-show-errors \
+    --content-type "application/x-apple-aspen-config" --cache-control "public,max-age=300"
+done
 
 # 3. Attach the function and 404 page to each distribution, then invalidate.
 for id in $DISTRIBUTIONS; do
