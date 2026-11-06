@@ -66,8 +66,9 @@ Customers claim `name.lyr.cloud` in Dashboard → Domains and edit its records (
 
 - **Resolver:** `GET|POST /dns-query` on the domains API (RFC 8484, `api/domains/lyrdns.mjs`). It answers `.lyr` questions from the `lyrcloud-domains` table (`lyr#<name>` items), follows CNAMEs, and forwards every other query unchanged to Cloudflare's resolver. Queries aren't logged.
 - **Setup for users:** a custom secure-DNS address in Chrome/Edge/Brave/Firefox, or `public/lyr.mobileconfig` on Apple devices. The resolver URL is in three places that must agree: `DOMAINS_API_BASE` in `src/auth.js`, `LYR_RESOLVER` in `site/pages.mjs`, and `public/lyr.mobileconfig`.
-- **Waitlist:** signed-in customers reserve up to three `.lyr` names for free (`POST /domains/lyr-waitlist`), first come first served; `/lyr/` checks availability. The admin console lists reservations. Nothing is sold.
-- **Before selling:** a real `.lyr` needs an ICANN application in a new-gTLD round; until then, sold names would only work for people using Lyrcloud DNS.
+- **Claiming and running names:** signed-in customers claim up to three `.lyr` names for free (`POST /domains/lyr-waitlist`), first come first served; `/lyr/` checks availability. Saving records in Dashboard → Domains → Manage (`PUT /domains/lyr/{name}`) switches a name on; giving it up switches it off. The super admin can still edit any name in the admin console.
+- **HTTPS (Lyr Root CA):** `api/domains/lyrca.mjs` issues 90-day certificates for `name.lyr` and `*.name.lyr` (`POST /domains/lyr/{name}/certificate`, optionally with the holder's CSR; 5 a day per name). The root carries a critical name constraint (only `.lyr`, no IP addresses), so browsers reject anything else it signs. Its key lives only in the `lyrcloud/lyr-ca` secret. Set it up once, after `deploy-domains.sh`: run `node scripts/lyr-root-ca.mjs` (writes `public/lyr-root.crt` and adds the root to `public/lyr.mobileconfig`), commit both, then `bash scripts/deploy-live.sh`. The `/lyr/` page shows the install steps once `public/lyr-root.crt` exists. Never regenerate the root: everyone would have to install it again.
+- **Becoming a real TLD:** only ICANN can add `.lyr` to the DNS root. Its 2026 round closed on 12 August 2026 (fee $227,000); no next round is scheduled. Until then, `.lyr` works for people using Lyrcloud DNS.
 
 ## Theme
 

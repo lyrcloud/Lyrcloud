@@ -14,7 +14,7 @@ STACK="${STACK:-lyrcloud-domains}"
 SUBDOMAIN_ZONE="${SUBDOMAIN_ZONE:-lyr.cloud}"
 ARTIFACTS_BUCKET="${ARTIFACTS_BUCKET:-lyrcloud-deploy-artifacts}"
 
-node --test api/domains/rules.test.mjs api/domains/lyrdns.test.mjs api/domains/handler.test.mjs
+node --test api/domains/rules.test.mjs api/domains/lyrdns.test.mjs api/domains/lyrca.test.mjs api/domains/handler.test.mjs
 
 param() {
   aws cloudformation describe-stacks --stack-name lyrcloud-account-api \
@@ -39,7 +39,7 @@ trap 'rm -rf "$work"' EXIT
 python3 - "$work/code.zip" <<'PY'
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED) as z:
-    for name in ['index', 'rules', 'lyrdns', 'dna']:
+    for name in ['index', 'rules', 'lyrdns', 'lyrca', 'dna']:
         z.write(f'api/domains/{name}.mjs', f'domains/{name}.mjs')
     for name in ['roles', 'phone']:
         z.write(f'api/account/{name}.mjs', f'account/{name}.mjs')
@@ -63,6 +63,10 @@ if [[ -n "${DNA_API_KEY:-}" && -n "${DNA_RESELLER_ID:-}" ]]; then
   echo "Stored the DNA credentials in lyrcloud/dna."
 elif [[ "$(aws secretsmanager get-secret-value --secret-id lyrcloud/dna --query SecretString --output text)" == '{}' ]]; then
   echo "WARNING: no DNA credentials stored yet. Rerun with DNA_API_KEY, DNA_RESELLER_ID and DNA_TEST_API_KEY set; until then nothing can be bought."
+fi
+
+if [[ "$(aws secretsmanager get-secret-value --secret-id lyrcloud/lyr-ca --query SecretString --output text)" == '{}' ]]; then
+  echo "NOTE: no Lyr Root CA yet, so .lyr names can't get HTTPS certificates. Run: node scripts/lyr-root-ca.mjs"
 fi
 
 aws cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].Outputs' --output table

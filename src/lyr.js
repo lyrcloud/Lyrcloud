@@ -45,16 +45,16 @@ reserveForm?.addEventListener('submit', async (event) => {
     if (!response.ok) throw new Error(data.error || 'Couldn’t check that name.');
     if (!data.available) {
       reserveResult.dataset.state = 'none';
-      reserveResult.textContent = { reserved: `${data.name} is kept for Lyrcloud.`, taken: `${data.name} is already in use.`, waitlisted: `Someone has already reserved ${data.name}.` }[data.reason] || `${data.name} isn’t available.`;
+      reserveResult.textContent = { reserved: `${data.name} is kept for Lyrcloud.`, taken: `${data.name} is already in use.`, waitlisted: `Someone has already claimed ${data.name}.` }[data.reason] || `${data.name} isn’t available.`;
       return;
     }
     reserveResult.dataset.state = 'ok';
     const link = document.createElement('a');
     link.className = 'button primary';
     link.href = `/dash/#/domains?reserve=${encodeURIComponent(data.name)}`;
-    link.textContent = `Reserve ${data.name}`;
+    link.textContent = `Claim ${data.name}`;
     const note = document.createElement('p');
-    note.textContent = `${data.name} is free to reserve.`;
+    note.textContent = `${data.name} is free to claim.`;
     reserveResult.replaceChildren(note, link);
   } catch (error) {
     reserveResult.dataset.state = 'none';

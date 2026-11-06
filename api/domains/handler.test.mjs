@@ -1,7 +1,7 @@
 // Domains API end to end, with DynamoDB, Route 53, Secrets Manager, DNA and Stripe replaced by in-memory fakes.
 // The DynamoDB fake evaluates the condition expressions the API uses, so holds and claims are tested for real.
 import assert from 'node:assert/strict';
-import { createHmac } from 'node:crypto';
+import { createHmac, generateKeyPairSync, X509Certificate } from 'node:crypto';
 import { beforeEach, test } from 'node:test';
 import { Route53Client } from '@aws-sdk/client-route-53';
 import { SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
@@ -15,6 +15,8 @@ process.env.ALLOW_TEST_REGISTRATIONS = '1';
 process.env.SUBDOMAIN_ZONE = 'lyr.cloud';
 process.env.SUBDOMAIN_ZONE_ID = 'ZLYR';
 process.env.DNA_JSON = JSON.stringify({ apiKey: 'live-key', resellerId: '00000000-0000-4000-8000-000000000001', testApiKey: 'test-key' });
+const { createRoot } = await import('./lyrca.mjs');
+const LYR_ROOT = createRoot();
 const { handler, resetCaches, tick, TEST_MODE_REASON } = await import('./index.mjs');
 
 const SUPER = { userId: 'sub-super', email: 'lyrclouds@gmail.com', provider: 'GoogleOIDC' };
@@ -775,6 +777,66 @@ test('the public lookup explains what a .lyr name resolves to', async () => {
   assert.deepEqual([txt.body.status, txt.body.answers[0].value], ['NOERROR', 'hello']);
   assert.equal((await call(null, 'GET', '/public/lyr/lookup', undefined, { name: 'nobody' })).body.status, 'NXDOMAIN');
   assert.equal((await call(null, 'GET', '/public/lyr/lookup', undefined, { name: 'google.com' })).status, 400);
+});
+
+test('holders switch their reserved .lyr names on and run them', async () => {
+  const records = [{ type: 'A', name: '@', values: ['203.0.113.7'] }, { type: 'CNAME', name: 'www', values: ['shop.lyr'] }];
+  assert.equal((await call(ALICE, 'PUT', '/domains/lyr/shop', { records })).status, 404, 'not reserved yet');
+  await call(ALICE, 'POST', '/domains/lyr-waitlist', { name: 'shop' });
+  assert.deepEqual((await call(ALICE, 'GET', '/domains/lyr/shop')).body.lyr, { name: 'shop.lyr', live: false, records: [], certificate: null, updatedAt: null });
+  assert.equal((await call(BOB, 'PUT', '/domains/lyr/shop', { records })).status, 404, 'someone else’s reservation');
+  assert.equal((await call(ALICE, 'PUT', '/domains/lyr/shop', { records: [{ type: 'A', name: '@', values: ['nope'] }] })).status, 400);
+  const saved = await call(ALICE, 'PUT', '/domains/lyr/shop', { records });
+  assert.equal(saved.status, 200);
+  assert.equal(saved.body.lyr.live, true);
+  assert.equal((await dohAnswer('www.shop.lyr', 'A')).answers.at(-1).value, '203.0.113.7', 'live on Lyrcloud DNS');
+  assert.equal((await call(ALICE, 'GET', '/domains')).body.lyrReservations[0].live, true);
+  assert.equal((await call(ALICE, 'GET', '/public/lyr/available', undefined, { name: 'shop' })).body.reason, 'taken');
+  assert.equal((await call(ALICE, 'POST', '/domains/lyr-waitlist', { name: 'shop' })).status, 200, 'still yours');
+
+  // The super admin can still edit it without taking it away.
+  await call(SUPER, 'PUT', '/admin/lyr/shop', { records: [{ type: 'TXT', name: '@', values: ['hi'] }] });
+  assert.equal((await call(ALICE, 'GET', '/domains/lyr/shop')).body.lyr.records[0].type, 'TXT');
+
+  // Giving the reservation up switches the name off.
+  assert.equal((await call(ALICE, 'DELETE', '/domains/lyr-waitlist/shop')).status, 200);
+  assert.equal((await dohAnswer('shop.lyr', 'A')).rcode, 3);
+  assert.equal((await call(ALICE, 'GET', '/domains/lyr/shop')).status, 404);
+});
+
+test('a live .lyr name gets HTTPS certificates from the Lyr Root CA', async () => {
+  await call(ALICE, 'POST', '/domains/lyr-waitlist', { name: 'shop' });
+  const ask = (body = {}) => call(ALICE, 'POST', '/domains/lyr/shop/certificate', body);
+  process.env.LYR_CA_JSON = JSON.stringify(LYR_ROOT);
+  try {
+    assert.match((await ask()).body.error, /Switch shop.lyr on/);
+    await call(ALICE, 'PUT', '/domains/lyr/shop', { records: [{ type: 'A', name: '@', values: ['203.0.113.7'] }] });
+    assert.equal((await call(BOB, 'POST', '/domains/lyr/shop/certificate', {})).status, 404);
+
+    const made = await ask();
+    assert.equal(made.status, 200, JSON.stringify(made.body));
+    const cert = new X509Certificate(made.body.certificate.certPem);
+    assert.equal(cert.subjectAltName, 'DNS:shop.lyr, DNS:*.shop.lyr');
+    assert.ok(cert.verify(new X509Certificate(LYR_ROOT.certPem).publicKey), 'signed by the root');
+    assert.ok(cert.checkPrivateKey((await import('node:crypto')).createPrivateKey(made.body.certificate.keyPem)));
+    assert.ok(made.body.certificate.chainPem.endsWith(LYR_ROOT.certPem));
+    assert.ok(!JSON.stringify(domainsTable().get('lyr#shop.lyr|lyr')).includes('PRIVATE KEY'), 'the key isn’t stored');
+
+    const { publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    const own = await ask({ csr: publicKey.export({ type: 'spki', format: 'pem' }) });
+    assert.equal(own.body.certificate.keyPem, null);
+    assert.ok(new X509Certificate(own.body.certificate.certPem).publicKey.equals(publicKey));
+    assert.equal((await ask({ csr: 'nonsense' })).status, 400);
+    assert.match((await ask({ csr: generateKeyPairSync('rsa', { modulusLength: 1024 }).publicKey.export({ type: 'spki', format: 'pem' }) })).body.error, /2048/);
+
+    for (let i = 0; i < 3; i += 1) assert.equal((await ask()).status, 200);
+    assert.equal((await ask()).status, 429, 'five a day');
+    assert.equal((await call(ALICE, 'GET', '/domains/lyr/shop')).body.lyr.certificate.ownKey, false);
+  } finally {
+    delete process.env.LYR_CA_JSON;
+  }
+  resetCaches();
+  assert.match((await call(ALICE, 'POST', '/domains/lyr/shop/certificate', {})).body.error, /coming soon/, 'no root yet');
 });
 
 // ---------------------------------------------------------------- name.lyr.cloud

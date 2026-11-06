@@ -32,6 +32,11 @@ for profile in dist/*.mobileconfig; do
   aws s3 cp "$profile" "s3://$BUCKET/$(basename "$profile")" --only-show-errors \
     --content-type "application/x-apple-aspen-config" --cache-control "public,max-age=300"
 done
+# Browsers and Windows offer to install a root certificate only when it's served as one.
+if [[ -e dist/lyr-root.crt ]]; then
+  aws s3 cp dist/lyr-root.crt "s3://$BUCKET/lyr-root.crt" --only-show-errors \
+    --content-type "application/x-x509-ca-cert" --cache-control "public,max-age=300"
+fi
 
 # 3. Attach the function and 404 page to each distribution, then invalidate.
 for id in $DISTRIBUTIONS; do

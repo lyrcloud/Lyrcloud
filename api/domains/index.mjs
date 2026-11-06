@@ -15,7 +15,10 @@
 //   GET|PUT|DELETE /domains/subdomains/{label}   one subdomain; { autoRenew }; release it
 //   PUT|DELETE /domains/subdomains/{label}/records   its DNS records, as for domains
 //   POST   /domains/lyr-waitlist             { name } reserve a .lyr name for free, for when .lyr becomes official
-//   DELETE /domains/lyr-waitlist/{name}      give the reservation up
+//   DELETE /domains/lyr-waitlist/{name}      give the reservation up (and switch the name off if it's live)
+//   GET    /domains/lyr/{name}               a .lyr name you hold: its records and HTTPS certificate
+//   PUT    /domains/lyr/{name}               { records[] } switch your reserved name on / replace its records
+//   POST   /domains/lyr/{name}/certificate   { csr? } an HTTPS certificate from the Lyr Root CA (lyrca.mjs)
 //   GET    /admin/domains                    every domain and recent order (staff)
 //   GET    /admin/domain-pricing             commission settings, cost and price per TLD, Stripe status (staff)
 //   PUT    /admin/domain-pricing             { percent?, flatCents?, dnsCentsPerYear?, round99?, tlds?, overrides? } (super admin)
@@ -62,6 +65,7 @@ import {
   zoneStruct,
 } from './dna.mjs';
 import { isStaff, planFor, roleFor } from '../account/roles.mjs';
+import { issueCertificate, LEAF_DAYS, publicKeyFrom } from './lyrca.mjs';
 import {
   answerLyr,
   buildResponse,
@@ -108,6 +112,8 @@ const USERS_TABLE = env.USERS_TABLE_NAME;
 const STRIPE_SECRET_NAME = env.STRIPE_SECRET_NAME;
 // DNA credentials: { apiKey, resellerId, testApiKey }, written by deploy-domains.sh.
 const DNA_SECRET_NAME = env.DNA_SECRET_NAME;
+// The Lyr Root CA's key and certificate: { keyPem, certPem }, written once by scripts/lyr-root-ca.mjs.
+const LYR_CA_SECRET_NAME = env.LYR_CA_SECRET_NAME;
 const SUPER_ADMIN_EMAIL = env.SUPER_ADMIN_EMAIL || 'lyrclouds@gmail.com';
 // name.<zone> subdomains (lyr.cloud): off until the zone is registered and both are set (deploy-domains.sh finds them).
 const SUB_ZONE = env.SUBDOMAIN_ZONE || '';
@@ -237,6 +243,18 @@ async function getDnaConfig() {
     dnaCache = { value: JSON.parse(raw || '{}'), at: Date.now() };
   }
   return dnaCache.value;
+}
+
+// The Lyr Root CA ({ keyPem, certPem }), or {} until scripts/lyr-root-ca.mjs has made it.
+let lyrCaCache = { value: null, at: 0 };
+async function getLyrCa() {
+  if (env.LYR_CA_JSON) return JSON.parse(env.LYR_CA_JSON);
+  if (!LYR_CA_SECRET_NAME) return {};
+  if (!lyrCaCache.value || Date.now() - lyrCaCache.at > 300_000) {
+    const raw = (await secrets.send(new GetSecretValueCommand({ SecretId: LYR_CA_SECRET_NAME }))).SecretString;
+    lyrCaCache = { value: JSON.parse(raw || '{}'), at: Date.now() };
+  }
+  return lyrCaCache.value;
 }
 
 // One DNA call, live unless `registrarEnv` is 'test'.
@@ -474,7 +492,8 @@ async function myDomains(who) {
     freePlans: config.subdomainFreePlans,
     items: items.filter((item) => item.kind === 'subdomain' && !staleHold(item) && item.status !== 'expired').map((item) => publicSubdomain(item, config)),
   };
-  const lyrReservations = items.filter((item) => item.kind === 'lyrwait').map((item) => ({ name: item.name, createdAt: item.createdAt }));
+  const live = new Set(items.filter((item) => item.kind === 'lyr').map((item) => item.name));
+  const lyrReservations = items.filter((item) => item.kind === 'lyrwait').map((item) => ({ name: item.name, createdAt: item.createdAt, live: live.has(item.name) }));
   return json(200, { domains, orders, subdomains, lyrReservations, contact: billing?.contact || null, paymentsReady: Boolean(stripeConfig.secretKey), currency: 'usd' });
 }
 
@@ -765,6 +784,7 @@ async function domainRoutes(event, method, path, who) {
   if (path === '/domains/checkout' && method === 'POST') return checkout(event, who);
   if (path === '/domains/subdomains' || path.startsWith('/domains/subdomains/')) return subdomainRoutes(event, method, path, who);
   if (path === '/domains/lyr-waitlist' || path.startsWith('/domains/lyr-waitlist/')) return waitlistRoutes(event, method, path, who);
+  if (path.startsWith('/domains/lyr/')) return lyrOwnerRoutes(event, method, path, who);
   const match = path.match(/^\/domains\/([^/]+)(\/records|\/verify-email)?$/);
   if (!match) return error(404, 'not_found');
   const item = await ownedDomain(decodeURIComponent(match[1]), who);
@@ -1332,7 +1352,8 @@ const waitKey = (name) => ({ pk: `lyrwait#${name}`, sk: 'lyrwait' });
 // Whether `name` (already cleaned) can be reserved, and if not, why.
 async function lyrNameState(name, who) {
   if (isReservedLyr(name)) return { available: false, reason: 'reserved' };
-  if (await getItem(lyrKey(name))) return { available: false, reason: 'taken' };
+  const entry = await getItem(lyrKey(name));
+  if (entry) return { available: false, reason: who && entry.ownerId === who.userId ? 'yours' : 'taken' };
   const waiting = await getItem(waitKey(name));
   if (waiting) return { available: false, reason: waiting.ownerId === who?.userId ? 'yours' : 'waitlisted' };
   return { available: true, reason: null };
@@ -1375,7 +1396,96 @@ async function waitlistRoutes(event, method, path, who) {
     if (isConditionFailure(err)) return error(404, 'That reservation isn’t yours.');
     throw err;
   }
+  // A name its holder switched on goes off with the reservation; one the super admin made stays.
+  try {
+    await ddb.send(new DeleteCommand({ TableName: TABLE, Key: lyrKey(name), ConditionExpression: 'ownerId = :me', ExpressionAttributeValues: { ':me': who.userId } }));
+  } catch (err) {
+    if (!isConditionFailure(err)) throw err;
+  }
   return json(200, { released: name });
+}
+
+// ---------------------------------------------------------------- .lyr names their holders run
+
+const MAX_LYR_CERTS_PER_DAY = 5;
+
+// A .lyr name `who` may run: one they reserved (live or not yet), or one already switched on for them.
+async function heldLyr(name, who) {
+  const [entry, reservation] = await Promise.all([getItem(lyrKey(name)), getItem(waitKey(name))]);
+  if (entry?.ownerId === who.userId) return { entry, reservation };
+  if (!entry && reservation?.ownerId === who.userId) return { entry: null, reservation };
+  return null;
+}
+
+const ownedLyr = (name, entry) => ({
+  name,
+  live: Boolean(entry),
+  records: entry?.records || [],
+  certificate: entry?.certificate || null,
+  updatedAt: entry?.updatedAt || null,
+});
+
+async function lyrOwnerRoutes(event, method, path, who) {
+  const match = path.match(/^\/domains\/lyr\/([^/]+)(\/certificate)?$/);
+  const name = match && cleanLyrName(decodeURIComponent(match[1]));
+  if (!name) return error(404, 'not_found');
+  const held = await heldLyr(name, who);
+  if (!held) return error(404, `${name} isn’t one of your .lyr names.`);
+
+  if (!match[2] && method === 'GET') return json(200, { lyr: ownedLyr(name, held.entry) });
+
+  if (!match[2] && method === 'PUT') {
+    const body = parseJson(event);
+    if (!body) return error(400, 'Invalid JSON body.');
+    const records = body.records ?? [];
+    const refused = lyrRecordsError(records, name, recordError);
+    if (refused) return error(...refused);
+    const [sets, problem] = normalizeLyrRecords(records, name);
+    if (problem) return error(400, problem);
+    const item = {
+      ...(held.entry || {}), ...lyrKey(name), kind: 'lyr', name, records: sets,
+      ownerId: who.userId, owner: who.email || null,
+      createdAt: held.entry?.createdAt || now(), updatedAt: now(), updatedBy: who.userId,
+    };
+    try {
+      // Only while the caller still holds it: the reservation (first switch-on) or the live name.
+      await ddb.send(new PutCommand({
+        TableName: TABLE, Item: item,
+        ConditionExpression: held.entry ? 'ownerId = :me' : 'attribute_not_exists(pk)',
+        ...(held.entry ? { ExpressionAttributeValues: { ':me': who.userId } } : {}),
+      }));
+    } catch (err) {
+      if (isConditionFailure(err)) return error(409, `${name} changed in the meantime. Reload and try again.`);
+      throw err;
+    }
+    return json(200, { lyr: ownedLyr(name, item) });
+  }
+
+  if (match[2] && method === 'POST') {
+    if (!held.entry) return error(409, `Switch ${name} on (save its records) before asking for a certificate.`);
+    const ca = await getLyrCa();
+    if (!ca.keyPem || !ca.certPem) return error(503, 'HTTPS for .lyr is coming soon.');
+    const body = parseJson(event);
+    if (!body) return error(400, 'Invalid JSON body.');
+    let publicKey;
+    if (body.csr) {
+      if (typeof body.csr !== 'string' || body.csr.length > 16_384) return error(400, 'Paste a PEM certificate signing request (CSR) or public key.');
+      try {
+        publicKey = publicKeyFrom(body.csr);
+      } catch (err) {
+        return error(400, err.message);
+      }
+    }
+    const day = now().slice(0, 10);
+    const count = held.entry.certDay === day ? held.entry.certCount || 0 : 0;
+    if (count >= MAX_LYR_CERTS_PER_DAY) return error(429, `${name} has had ${MAX_LYR_CERTS_PER_DAY} certificates today. Try again tomorrow.`);
+    const issued = issueCertificate({ caKeyPem: ca.keyPem, caCertPem: ca.certPem, name, publicKey });
+    const certificate = { serial: issued.serial, notAfter: issued.notAfter, issuedAt: now(), ownKey: Boolean(publicKey) };
+    await update(lyrKey(name), { certDay: day, certCount: count + 1, certificate }, [], ['ownerId = :me', {}, { ':me': who.userId }]);
+    // The private key (when Lyrcloud made one) is only ever in this response; it isn't stored.
+    return json(200, { certificate: { ...certificate, days: LEAF_DAYS, certPem: issued.certPem, chainPem: issued.chainPem, rootPem: ca.certPem, keyPem: issued.keyPem } });
+  }
+  return error(404, 'not_found');
 }
 
 // ---------------------------------------------------------------- .lyr resolver and registry
@@ -1500,6 +1610,7 @@ async function lyrAdminRoutes(event, method, path, who) {
   if ('note' in body && body.note !== null && (typeof body.note !== 'string' || body.note.length > 300)) return error(400, 'Notes are at most 300 characters.');
   const existing = await getItem(lyrKey(name));
   const item = {
+    ...(existing || {}), // keeps the holder (ownerId) and certificate of a name its holder switched on
     ...lyrKey(name), kind: 'lyr', name, records: sets,
     owner: 'owner' in body ? body.owner?.trim() || null : existing?.owner || null,
     note: 'note' in body ? body.note?.trim() || null : existing?.note || null,
@@ -1611,6 +1722,7 @@ export function resetCaches() {
   pricesCache = { value: null, at: 0 };
   stripeCache = { value: null, at: 0 };
   dnaCache = { value: null, at: 0 };
+  lyrCaCache = { value: null, at: 0 };
 }
 
 export const handler = async (event) => {

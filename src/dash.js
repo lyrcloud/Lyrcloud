@@ -709,6 +709,7 @@ const views = {
   'domain-buy': (route) => domainBuyView(route),
   domain: (route) => domainView(route),
   subdomain: (route) => subdomainView(route),
+  'domain-lyr': (route) => lyrNameView(route),
 
   admin(route) {
     if (profileFailed) return `<section class="panel"><p class="form-error">Couldn’t load your account. Reload the page to try again.</p></section>`;
@@ -1479,6 +1480,7 @@ const domains = {
   check: {}, // domain -> search result for the buy page
   detail: null, detailError: '', detailFor: null, loadingDetail: false,
   sub: null, subError: '', subFor: null, loadingSub: false, // one name.lyr.cloud subdomain
+  lyr: null, lyrError: '', lyrFor: null, loadingLyr: false, lyrCert: null, // one .lyr name you hold
   refreshTimer: null,
 };
 const adminDomains = { data: null, pricing: null, lyr: null, error: '', loading: false };
@@ -1597,6 +1599,7 @@ function domainsAfterRender(route) {
   if (route.view === 'subdomain' && domains.sub?.subdomain?.status === 'awaiting_payment' && route.params.get('paid')) {
     domains.refreshTimer = setTimeout(() => currentRoute.view === 'subdomain' && loadSubdomain(currentRoute.label), 5000);
   }
+  if (route.view === 'domain-lyr' && (domains.lyrFor !== route.lyr || (!domains.lyr && !domains.lyrError)) && !domains.loadingLyr) loadLyrName(route.lyr);
   if (route.view === 'domain-buy') {
     loadDomainPrices();
     const name = route.params.get('domain');
@@ -1923,22 +1926,79 @@ function subdomainView(route) {
       </section>` : ''}`;
 }
 
-// ---- .lyr waitlist: free reservations for when .lyr becomes official
+// ---- .lyr names: claimed for free during the preview, then run from the dashboard
 
 function lyrWaitlistPanel(route) {
   const list = domains.data?.lyrReservations || [];
   const prefill = route.params.get('reserve') || '';
   return `
     <section class="panel" id="lyr-waitlist">
-      <div class="panel-head"><h2>Reserve a .lyr name</h2><span class="status pending">◌ Free · preview</span></div>
-      <p class="muted">.lyr is Lyrcloud’s own extension, <a href="/lyr/" target="_blank" rel="noopener">in preview</a>. Reserve up to three names for free; you’ll get first claim on them when .lyr opens. Nothing is charged.</p>
+      <div class="panel-head"><h2>Your .lyr names</h2><span class="status pending">◌ Free · preview</span></div>
+      <p class="muted">.lyr is Lyrcloud’s own extension, <a href="/lyr/" target="_blank" rel="noopener">in preview</a>. Claim up to three names for free, point them anywhere and get HTTPS certificates. They open on devices using Lyrcloud DNS, and you keep first claim if .lyr becomes official.</p>
       <form class="domain-search" data-form="lyr-reserve">
         <div class="suffix-input"><input name="name" placeholder="mybrand" value="${esc(prefill.replace(/\.lyr$/, ''))}" aria-label=".lyr name" autocomplete="off" required maxlength="63" /><span>.lyr</span></div>
-        <button class="btn primary" type="submit"${list.length >= 3 ? ' disabled' : ''}>Reserve</button>
+        <button class="btn primary" type="submit"${list.length >= 3 ? ' disabled' : ''}>Claim</button>
       </form>
       ${list.length ? `<ul class="domain-results">${list.map((item) => `
-        <li class="domain-result"><span class="domain-name mono">${esc(item.name)}</span><span class="domain-price"><small>Reserved ${shortDate(item.createdAt)}</small></span>
+        <li class="domain-result"><span class="domain-name mono">${esc(item.name)}</span>
+          <span class="domain-price">${item.live ? '<span class="status ok">● Live</span>' : `<small>Claimed ${shortDate(item.createdAt)}</small>`}</span>
+          <a class="btn small primary" href="#/domains/lyr/${encodeURIComponent(item.name)}">Manage</a>
           <button class="btn small" data-action="lyr-unreserve" data-name="${esc(item.name)}">Give up</button></li>`).join('')}</ul>` : ''}
+    </section>`;
+}
+
+async function loadLyrName(name) {
+  domains.loadingLyr = true;
+  if (domains.lyrFor !== name) domains.lyrCert = null;
+  domains.lyrFor = name;
+  try {
+    domains.lyr = (await domainsApi(`/domains/lyr/${encodeURIComponent(name)}`)).lyr;
+    domains.lyrError = '';
+  } catch (error) {
+    domains.lyr = null;
+    domains.lyrError = error.message;
+  }
+  domains.loadingLyr = false;
+  if (currentRoute?.view === 'domain-lyr' && currentRoute.lyr === name) render();
+}
+
+const pemLink = (pem, file, label) => `<a class="btn small" download="${file}" href="data:application/x-pem-file;charset=utf-8,${encodeURIComponent(pem)}">${label}</a>`;
+
+function lyrNameView(route) {
+  const back = '<a class="link" href="#/domains">← Domains</a>';
+  if (domains.lyrError && domains.lyrFor === route.lyr) return `${back}<section class="panel"><p class="form-error">${esc(domains.lyrError)}</p></section>`;
+  const item = domains.lyrFor === route.lyr ? domains.lyr : null;
+  if (!item) return `${back}<section class="panel"><p class="muted">Loading…</p></section>`;
+  const issued = domains.lyrCert;
+  const cert = item.certificate;
+  return `
+    ${back}
+    <section class="panel">
+      <div class="panel-head"><h2 class="mono">${esc(item.name)}</h2>${item.live ? '<span class="status ok">● Live on Lyrcloud DNS</span>' : '<span class="status pending">◌ Not switched on</span>'}</div>
+      <p class="muted">${item.live ? 'Changes are live within a minute for everyone using Lyrcloud DNS.' : 'Add records and save to switch this name on.'} One record per line, like <code>@ A 203.0.113.10</code>, <code>www CNAME mysite.lyrcloud.app</code> or <code>@ TXT "hello"</code>. Add <code>ttl=60</code> at the end to change how long it’s cached.</p>
+      <form class="stack" data-form="lyr-records">
+        <textarea name="records" rows="6" class="mono" placeholder="@ A 203.0.113.10&#10;www CNAME ${esc(item.name)}" aria-label="DNS records">${esc(lyrRecordLines(item))}</textarea>
+        <div class="row"><button class="btn primary" type="submit">${item.live ? 'Save records' : 'Switch on'}</button></div>
+      </form>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>HTTPS certificate</h2>${cert ? `<span class="status ok">● Valid until ${shortDate(cert.notAfter)}</span>` : ''}</div>
+      <p class="muted">Signed by the Lyr Root CA for <code>${esc(item.name)}</code> and <code>*.${esc(item.name)}</code>, valid for 90 days. Visitors who <a href="/lyr/" target="_blank" rel="noopener">installed the Lyr root</a> see the padlock.</p>
+      ${item.live ? `
+      <form class="stack" data-form="lyr-cert">
+        <label class="field">Your certificate signing request or public key (optional)<textarea name="csr" rows="4" class="mono" placeholder="-----BEGIN CERTIFICATE REQUEST-----&#10;Leave empty and Lyrcloud makes a key for you."></textarea></label>
+        <div class="row"><button class="btn primary" type="submit">Get a certificate</button><span class="muted small">Up to 5 a day.</span></div>
+      </form>` : '<p class="muted">Switch the name on first.</p>'}
+      ${issued ? `
+      <div class="stack">
+        <p><b>Your certificate is ready.</b>${issued.keyPem ? ' <span class="form-error">Download the private key now: Lyrcloud doesn’t keep it, so it can’t be shown again.</span>' : ''}</p>
+        <div class="row">
+          ${pemLink(issued.chainPem, `${item.name}.fullchain.pem`, 'Certificate chain')}
+          ${issued.keyPem ? pemLink(issued.keyPem, `${item.name}.key.pem`, 'Private key') : ''}
+          ${pemLink(issued.rootPem, 'lyr-root.crt', 'Lyr root')}
+        </div>
+        <p class="muted small">Point your web server’s certificate at the chain file and its key at the private key (nginx: <code>ssl_certificate</code> / <code>ssl_certificate_key</code>; Caddy: <code>tls cert.pem key.pem</code>).</p>
+      </div>` : ''}
     </section>`;
 }
 
@@ -2119,7 +2179,7 @@ const domainClickActions = {
     }
   },
   'lyr-unreserve': async (target) => {
-    if (!confirmed(target, `Give up ${target.dataset.name}? Someone else can reserve it.`)) return;
+    if (!confirmed(target, `Give up ${target.dataset.name}? It stops working on Lyrcloud DNS and someone else can claim it.`)) return;
     target.disabled = true;
     try {
       await domainsApi(`/domains/lyr-waitlist/${encodeURIComponent(target.dataset.name)}`, { method: 'DELETE' });
@@ -2271,7 +2331,44 @@ const domainFormActions = {
       const list = domains.data.lyrReservations.filter((item) => item.name !== reservation.name);
       domains.data.lyrReservations = [...list, { createdAt: new Date().toISOString(), ...reservation }];
       render();
-      toast(`${reservation.name} is reserved for you`);
+      toast(`${reservation.name} is yours`);
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message);
+    }
+  },
+  'lyr-records': async (form, data) => {
+    const button = form.querySelector('[type="submit"]');
+    let records;
+    try {
+      records = parseLyrRecords(data.get('records'));
+    } catch (error) {
+      return toast(error.message);
+    }
+    button.disabled = true;
+    try {
+      const name = currentRoute.lyr;
+      const { lyr } = await domainsApi(`/domains/lyr/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify({ records }) });
+      domains.lyr = lyr;
+      const reservation = domains.data?.lyrReservations?.find((item) => item.name === lyr.name);
+      if (reservation) reservation.live = true;
+      render();
+      toast(`${lyr.name} saved`);
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message);
+    }
+  },
+  'lyr-cert': async (form, data) => {
+    const button = form.querySelector('[type="submit"]');
+    const csr = String(data.get('csr') || '').trim();
+    button.disabled = true;
+    try {
+      const { certificate } = await domainsApi(`/domains/lyr/${encodeURIComponent(currentRoute.lyr)}/certificate`, { method: 'POST', body: JSON.stringify(csr ? { csr } : {}) });
+      domains.lyrCert = certificate;
+      domains.lyr = { ...domains.lyr, certificate: { serial: certificate.serial, notAfter: certificate.notAfter, issuedAt: certificate.issuedAt, ownKey: certificate.ownKey } };
+      render();
+      toast('Certificate issued');
     } catch (error) {
       button.disabled = false;
       toast(error.message);
@@ -2420,6 +2517,7 @@ function parseRoute() {
   if (parts[0] === 'workers' && parts[1]) return { view: 'worker', worker: parts[1], params };
   if (parts[0] === 'projects' && parts[1]) return { view: 'project', projectId: parts[1], params };
   if (parts[0] === 'domains' && parts[1] === 'buy') return { view: 'domain-buy', params };
+  if (parts[0] === 'domains' && parts[1] === 'lyr' && parts[2]) return { view: 'domain-lyr', lyr: parts[2].toLowerCase(), params };
   if (parts[0] === 'domains' && parts[1] === 'sub' && parts[2]) return { view: 'subdomain', label: parts[2].toLowerCase(), params };
   if (parts[0] === 'domains' && parts[1]) return { view: 'domain', domain: parts[1].toLowerCase(), params };
   if (parts[0] && views[parts[0]]) return { view: parts[0], params };

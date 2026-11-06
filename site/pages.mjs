@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { logo } from '../src/logo.js';
 import { escape } from './layout.mjs';
 import { products } from './products.mjs';
@@ -509,6 +510,18 @@ const lyrSetup = [
   ['iPhone, iPad or Mac', `<a href="/lyr.mobileconfig">Download the Lyrcloud DNS profile</a>, then install it in <b>Settings → General → VPN, DNS &amp; Device Management</b>. Remove it there any time.`],
 ];
 
+// HTTPS for .lyr is offered once scripts/lyr-root-ca.mjs has written the root certificate.
+const LYR_HTTPS = existsSync(new URL('../public/lyr-root.crt', import.meta.url));
+
+const lyrHttpsSetup = [
+  ['Windows', `<a href="/lyr-root.crt">Download the root</a>, open it, choose <b>Install Certificate → Current User → Place all certificates in the following store → Trusted Root Certification Authorities</b>. Chrome and Edge use it straight away.`],
+  ['Mac', `The <a href="/lyr.mobileconfig">Lyrcloud DNS profile</a> includes the root. Or <a href="/lyr-root.crt">download it</a>, open it in <b>Keychain Access</b>, double-click <b>Lyrcloud .lyr Root CA</b> and set <b>When using this certificate</b> to <b>Always Trust</b>.`],
+  ['iPhone or iPad', `Install the <a href="/lyr.mobileconfig">Lyrcloud DNS profile</a> (it includes the root), then turn it on in <b>Settings → General → About → Certificate Trust Settings</b>.`],
+  ['Android', `<a href="/lyr-root.crt">Download the root</a>, then open <b>Settings → Security → More security settings → Install from device storage → CA certificate</b>.`],
+  ['Firefox', `Firefox keeps its own list: <b>Settings → Privacy &amp; Security → Certificates → View Certificates → Authorities → Import</b>, pick the root and tick <b>Trust this CA to identify websites</b>.`],
+  ['Linux', `<code>sudo cp lyr-root.crt /usr/local/share/ca-certificates/ &amp;&amp; sudo update-ca-certificates</code>`],
+];
+
 const lyrPage = {
   route: '/lyr/',
   title: '.lyr preview',
@@ -526,14 +539,16 @@ ${pageHero({
           <h2>What “preview” means</h2>
           <ul>
             <li><b>.lyr isn’t an official extension yet.</b> It isn’t approved by ICANN, so most devices can’t open .lyr names. They work once a device or browser uses Lyrcloud DNS (below).</li>
-            <li><b>No padlock yet.</b> Public certificate authorities don’t issue certificates for .lyr, so .lyr sites open over plain <code>http://</code>.</li>
-            <li><b>Not for sale — but you can reserve one.</b> .lyr names aren’t sold yet. Reserve up to three for free below and you’ll get first claim when .lyr opens.</li>
+            ${LYR_HTTPS
+    ? '<li><b>A padlock with one extra step.</b> Public certificate authorities don’t issue certificates for .lyr, so Lyrcloud runs its own. Install the Lyr root (below) and .lyr sites open over <code>https://</code>.</li>'
+    : '<li><b>No padlock yet.</b> Public certificate authorities don’t issue certificates for .lyr, so .lyr sites open over plain <code>http://</code> for now.</li>'}
+            <li><b>Free while it’s a preview.</b> Claim up to three .lyr names below and point them anywhere from your dashboard; they work on Lyrcloud DNS straight away. You keep first claim if .lyr becomes official.</li>
           </ul>
         </div>
       </section>
 
       <section class="section">
-        <div class="section-heading compact"><h2>Reserve your .lyr name</h2><p>Free, no card needed. First come, first served.</p></div>
+        <div class="section-heading compact"><h2>Claim your .lyr name</h2><p>Free, no card needed. First come, first served.</p></div>
         <form class="domain-search glass-card" id="lyr-reserve">
           <input name="name" id="lyr-reserve-name" placeholder="mybrand.lyr" aria-label=".lyr name to reserve" autocomplete="off" required />
           <button class="button primary" type="submit">Check</button>
@@ -560,6 +575,22 @@ ${pageHero({
         </div>
         <div class="faq">
           ${lyrSetup.map(([device, steps]) => `<details><summary>${device}</summary><p>${steps}</p></details>`).join('\n          ')}
+        </div>
+      </section>
+${LYR_HTTPS ? `
+      <section class="section">
+        <div class="section-heading compact"><h2>Get the padlock on .lyr sites</h2><p>Install the Lyr root once. It can only vouch for names ending in .lyr: browsers reject anything else it signs, so it can’t be used against any other website.</p></div>
+        <div class="faq">
+          ${lyrHttpsSetup.map(([device, steps]) => `<details><summary>${device}</summary><p>${steps}</p></details>`).join('\n          ')}
+        </div>
+        <p class="muted">Running a .lyr site? Get its certificate in <a href="/dash/#/domains">Dashboard → Domains</a>.</p>
+      </section>
+` : ''}
+      <section class="section">
+        <div class="section-heading compact"><h2>The road to an official .lyr</h2><p>For .lyr to work on every device with no setup, ICANN has to add it to the root of the internet.</p></div>
+        <div class="faq">
+          <details><summary>Where things stand</summary><p>ICANN accepts new extensions in application rounds. The 2026 round closed on 12 August 2026 and no date is set for the next one. Until then, .lyr works through Lyrcloud DNS, and everything you set up now carries over.</p></details>
+          <details><summary>What happens to my name</summary><p>Names claimed during the preview keep first claim if .lyr becomes official, under whatever rules ICANN sets then.</p></details>
         </div>
       </section>
 ${ctaBand('Want a name that works everywhere today?', 'Register a .com, .io, .dev and more with free WHOIS privacy and Lyrcloud DNS.')}
