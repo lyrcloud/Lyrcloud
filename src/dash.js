@@ -1977,7 +1977,7 @@ function lyrNameView(route) {
       <div class="panel-head"><h2 class="mono">${esc(item.name)}</h2>${item.live ? '<span class="status ok">● Live on Lyrcloud DNS</span>' : '<span class="status pending">◌ Not switched on</span>'}</div>
       <p class="muted">${item.live ? 'Changes are live within a minute for everyone using Lyrcloud DNS.' : 'Add records and save to switch this name on.'} One record per line, like <code>@ A 203.0.113.10</code>, <code>www CNAME mysite.lyrcloud.app</code> or <code>@ TXT "hello"</code>. Add <code>ttl=60</code> at the end to change how long it’s cached.</p>
       <form class="stack" data-form="lyr-records">
-        <textarea name="records" rows="6" class="mono" placeholder="@ A 203.0.113.10&#10;www CNAME ${esc(item.name)}" aria-label="DNS records">${esc(lyrRecordLines(item))}</textarea>
+        <textarea name="records" rows="6" class="mono" placeholder="Empty. Type your records here, for example:&#10;@ A 1.2.3.4   (your server’s IP address)&#10;www CNAME ${esc(item.name)}" aria-label="DNS records">${esc(lyrRecordLines(item))}</textarea>
         <div class="row"><button class="btn primary" type="submit">${item.live ? 'Save records' : 'Switch on'}</button></div>
       </form>
     </section>
@@ -1986,7 +1986,7 @@ function lyrNameView(route) {
       <p class="muted">Signed by the Lyr Root CA for <code>${esc(item.name)}</code> and <code>*.${esc(item.name)}</code>, valid for 90 days. Visitors who <a href="/lyr/" target="_blank" rel="noopener">installed the Lyr root</a> see the padlock.</p>
       ${item.live ? `
       <form class="stack" data-form="lyr-cert">
-        <label class="field">Your certificate signing request or public key (optional)<textarea name="csr" rows="4" class="mono" placeholder="-----BEGIN CERTIFICATE REQUEST-----&#10;Leave empty and Lyrcloud makes a key for you."></textarea></label>
+        <label class="field">Your certificate signing request or public key (optional)<textarea name="csr" rows="4" class="mono" placeholder="Leave empty and Lyrcloud makes a key for you. Or paste one starting with -----BEGIN CERTIFICATE REQUEST-----"></textarea></label>
         <div class="row"><button class="btn primary" type="submit">Get a certificate</button><span class="muted small">Up to 5 a day.</span></div>
       </form>` : '<p class="muted">Switch the name on first.</p>'}
       ${issued ? `
@@ -2345,6 +2345,7 @@ const domainFormActions = {
     } catch (error) {
       return toast(error.message);
     }
+    if (!records.length && !confirmed(button, 'There are no records, so this name won’t point anywhere. Save it empty anyway?')) return;
     button.disabled = true;
     try {
       const name = currentRoute.lyr;
