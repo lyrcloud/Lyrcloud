@@ -26,6 +26,37 @@
       <key>PayloadVersion</key>
       <integer>1</integer>
     </dict>
+    <dict>
+      <!-- lyr-root: written by scripts/lyr-root-ca.mjs -->
+      <key>PayloadCertificateFileName</key>
+      <string>lyr-root.crt</string>
+      <key>PayloadContent</key>
+      <data>
+        MIIB8zCCAZqgAwIBAgIQAf4Z7zX26j+OhGi7CKAEETAKBggqhkjO
+        PQQDAjAzMREwDwYDVQQKDAhMeXJjbG91ZDEeMBwGA1UEAwwVTHly
+        Y2xvdWQgLmx5ciBSb290IENBMB4XDTI2MTEwNjA1NDcxMFoXDTQ2
+        MTEwNjA2NDcxMFowMzERMA8GA1UECgwITHlyY2xvdWQxHjAcBgNV
+        BAMMFUx5cmNsb3VkIC5seXIgUm9vdCBDQTBZMBMGByqGSM49AgEG
+        CCqGSM49AwEHA0IABKsK/6ZQ6v5X/cyXF3B48QHqSMHxTnF6/UAS
+        HzaepdOOMXqbbb4o8YdmsmWe2NrgyFMVxKL8/5iCmmRp7os6l/Wj
+        gY8wgYwwEgYDVR0TAQH/BAgwBgEB/wIBADAOBgNVHQ8BAf8EBAMC
+        AQYwHQYDVR0OBBYEFDudFY7RA+Md8uupaQmWgyWuytY0MEcGA1Ud
+        HgEB/wQ9MDugBzAFggNseXKhMDAKhwgAAAAAAAAAADAihyAAAAAA
+        AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADAKBggqhkjOPQQD
+        AgNHADBEAiAkH74RDgJ9vDbArCO2TuxWtKvzIR6x82exEMo2/oSQ
+        UgIgY1x4jdzwEjRIuui3eHF5aKrMsxxlT85D2tWSwy69hxs=
+      </data>
+      <key>PayloadDisplayName</key>
+      <string>Lyrcloud .lyr Root CA</string>
+      <key>PayloadIdentifier</key>
+      <string>com.lyrcloud.dns.root</string>
+      <key>PayloadType</key>
+      <string>com.apple.security.root</string>
+      <key>PayloadUUID</key>
+      <string>3F0B6C52-6E0F-4E43-9C1D-7A1E5B2F9D10</string>
+      <key>PayloadVersion</key>
+      <integer>1</integer>
+    </dict>
   </array>
   <key>PayloadDescription</key>
   <string>Uses Lyrcloud DNS so .lyr names open on this device. Remove it any time in Settings → General → VPN, DNS &amp; Device Management.</string>
