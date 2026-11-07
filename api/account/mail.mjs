@@ -52,7 +52,7 @@ Your account is ready. Here's how to get going:
 2. Point your domain's nameservers to Lyrcloud
 3. Turn on caching, security rules and edge functions
 
-Questions? Just reply to this email or write to hello@lyrcloud.com.
+Questions? Just reply to this email or write to support@lyrcloud.com.
 
 — The Lyrcloud team
 
@@ -66,7 +66,7 @@ You're getting this one-off email because you created a Lyrcloud account.`;
 <li>Turn on caching, security rules and edge functions</li>
 </ol>
 ${button(`${SITE_URL}/dash/#/add-site`, 'Add your first website')}
-<p style="margin:0">Questions? Just reply to this email or write to <a href="mailto:hello@lyrcloud.com" style="color:#0369a1">hello@lyrcloud.com</a>.</p>
+<p style="margin:0">Questions? Just reply to this email or write to <a href="mailto:support@lyrcloud.com" style="color:#0369a1">support@lyrcloud.com</a>.</p>
 <p style="margin:16px 0 0">— The Lyrcloud team</p>`,
     footerHtml: 'You’re getting this one-off email because you created a Lyrcloud account.',
   });

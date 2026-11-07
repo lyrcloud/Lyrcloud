@@ -1312,7 +1312,7 @@ function projectView(route) {
   return `
     ${pageHead(esc(project.name), `<a class="link" href="${esc(project.url)}" target="_blank" rel="noopener">${esc(project.url.replace('https://', ''))}</a> ${deployBadge(project.status)}`,
       `<a class="btn" href="#/projects">All projects</a>${project.liveDeployId ? `<a class="btn" href="${esc(project.url)}" target="_blank" rel="noopener">Visit ↗</a>` : ''}<button class="btn primary" data-action="project-redeploy"${project.disabled ? ' disabled' : ''}>Redeploy</button>`)}
-    ${project.disabled ? '<p class="form-error">Lyrcloud has disabled this project, so it’s offline. Contact hello@lyrcloud.com.</p>' : ''}
+    ${project.disabled ? '<p class="form-error">Lyrcloud has disabled this project, so it’s offline. Contact support@lyrcloud.com.</p>' : ''}
     <section class="panel">
       <dl class="facts">
         <dt>Source</dt><dd>${sourceLink}</dd>
@@ -2895,7 +2895,7 @@ async function loadProfile() {
   try {
     const response = await authFetch('/me');
     if (response.status === 403) {
-      app.innerHTML = `<section class="panel empty disabled-account"><h2>This account has been disabled</h2><p>Contact hello@lyrcloud.com if you think this is a mistake.</p><button class="btn" data-action="sign-out">Sign out</button></section>`;
+      app.innerHTML = `<section class="panel empty disabled-account"><h2>This account has been disabled</h2><p>Contact support@lyrcloud.com if you think this is a mistake.</p><button class="btn" data-action="sign-out">Sign out</button></section>`;
       return;
     }
     if (!response.ok) throw new Error(`me failed: ${response.status}`);

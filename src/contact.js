@@ -12,5 +12,5 @@ form.addEventListener('submit', (event) => {
     '',
     data.message,
   ].join('\n');
-  location.href = `mailto:hello@lyrcloud.com?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  location.href = `mailto:support@lyrcloud.com?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
 });

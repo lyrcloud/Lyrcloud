@@ -28,7 +28,7 @@ Parameters:
     Description: Sender of the welcome and update emails; its domain must be a verified SES identity. Blank turns email off.
   MailReplyTo:
     Type: String
-    Default: hello@lyrcloud.com
+    Default: support@lyrcloud.com
   SmsSenderId:
     Type: String
     Default: ''

@@ -7,7 +7,7 @@ import { ACCOUNT_API_BASE } from './auth.js';
   const STORAGE_KEY = "lyrbotChat";
   const WHATSAPP_URL = "https://wa.me/16615809465";
   const WHATSAPP_LABEL = "+1 661 580 9465";
-  const SUPPORT_EMAIL = "hello@lyrcloud.com";
+  const SUPPORT_EMAIL = "support@lyrcloud.com";
   const GREETING = "Hi, I'm Lyrbot! Ask me about Lyrcloud's products, plans, or getting your site on the edge.";
   const QUICK_QUESTIONS = ["Is the Launch plan free?", "Which plan should I pick?", "What are Edge Functions?", "How do I get started?"];
 

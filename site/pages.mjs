@@ -684,7 +684,7 @@ const contactPage = {
             <li>✓ Custom SLAs and volume pricing</li>
             <li>✓ Security and compliance reviews</li>
           </ul>
-          <p>Prefer email? <a class="text-link" href="mailto:hello@lyrcloud.com">hello@lyrcloud.com</a></p>
+          <p>Prefer email? <a class="text-link" href="mailto:support@lyrcloud.com">support@lyrcloud.com</a></p>
         </div>
         <form class="form-card glass-card" id="contact-form">
           <label>Full name<input name="name" required autocomplete="name" /></label>
@@ -700,7 +700,7 @@ const contactPage = {
           </label>
           <label>How can we help?<textarea name="message" rows="4" required></textarea></label>
           <button class="button primary large" type="submit">Send message</button>
-          <p class="form-note">Opens your email app with the message pre-filled to hello@lyrcloud.com.</p>
+          <p class="form-note">Opens your email app with the message pre-filled to support@lyrcloud.com.</p>
         </form>
       </section>
     </main>`,

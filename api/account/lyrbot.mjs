@@ -11,7 +11,7 @@ const MAX_TURNS = 12;
 const MAX_MESSAGE_LENGTH = 1000;
 const WHATSAPP_NUMBER = '+1 661 580 9465';
 const WHATSAPP_URL = 'https://wa.me/16615809465';
-const CONTACT_EMAIL = 'hello@lyrcloud.com';
+const CONTACT_EMAIL = 'support@lyrcloud.com';
 
 const SYSTEM_PROMPT = `You are Lyrbot, the help assistant on the website of Lyrcloud (lyrcloud.com), a cloud platform for building, securing and scaling websites, apps and APIs. You chat with visitors in a small window on the site.
 

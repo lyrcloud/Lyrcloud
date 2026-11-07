@@ -29,7 +29,7 @@ const FRIENDLY = {
 function friendly(type, message) {
   if (type === 'NotAuthorizedException') {
     if (/attempts exceeded/i.test(message)) return 'Too many attempts. Wait a few minutes and try again.';
-    if (/disabled/i.test(message)) return 'This account has been disabled. Contact hello@lyrcloud.com.';
+    if (/disabled/i.test(message)) return 'This account has been disabled. Contact support@lyrcloud.com.';
     if (/confirmed/i.test(message)) return 'This account is already confirmed. Log in instead.';
     return 'Email or password is incorrect.';
   }
@@ -84,7 +84,7 @@ export async function signIn(clientId, email, password) {
     AuthFlow: 'USER_PASSWORD_AUTH',
     AuthParameters: { USERNAME: normalizeEmail(email), PASSWORD: password },
   });
-  if (!data.AuthenticationResult) throw new CognitoError(data.ChallengeName || 'Challenge', 'This account needs a step this page doesn’t support yet. Contact hello@lyrcloud.com.');
+  if (!data.AuthenticationResult) throw new CognitoError(data.ChallengeName || 'Challenge', 'This account needs a step this page doesn’t support yet. Contact support@lyrcloud.com.');
   return data.AuthenticationResult;
 }
 
