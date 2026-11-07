@@ -1845,6 +1845,8 @@ code.inline {
 .lyrbot-whatsapp { display: inline-flex; align-items: center; gap: 5px; padding: 5px 10px; border-radius: 999px; background: color-mix(in srgb, var(--success) 14%, var(--surface-solid)); color: var(--success); font-weight: 700; text-decoration: none; }
 .lyrbot-whatsapp svg { width: 15px; height: 15px; }
 .lyrbot-email { color: var(--link); font-weight: 600; text-decoration: none; }
+.lyrbot-lyrchat { display: inline-flex; align-items: center; gap: 4px; padding: 5px 10px; border-radius: 999px; background: color-mix(in srgb, #6247ea 14%, var(--surface-solid)); color: #6247ea; font-weight: 700; text-decoration: none; }
+.lyrbot-lyrchat:hover { text-decoration: underline; }
 
 /* Domains page (domains.js): search and results. */
 .domain-search {

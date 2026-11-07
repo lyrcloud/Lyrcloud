@@ -89,6 +89,7 @@ import { ACCOUNT_API_BASE } from './auth.js';
         <span>Prefer a person?</span>
         <a class="lyrbot-whatsapp" href="${WHATSAPP_URL}" target="_blank" rel="noopener">${WHATSAPP_ICON} WhatsApp ${WHATSAPP_LABEL}</a>
         <a class="lyrbot-email" href="mailto:${SUPPORT_EMAIL}">${SUPPORT_EMAIL}</a>
+        <a class="lyrbot-lyrchat" href="https://lyrsoft.com/chat/#/new?to=support&site=Lyrcloud" target="_blank" rel="noopener">💬 Lyr Chat</a>
       </div>
     </section>`;
   document.body.appendChild(root);
