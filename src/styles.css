@@ -305,8 +305,7 @@ nav a:hover,
 }
 
 .hero {
-  min-height: 640px;
-  padding: 80px 0 72px;
+  padding: clamp(36px, 6vw, 64px) 0 clamp(48px, 6vw, 72px);
   align-items: center;
 }
 
@@ -433,7 +432,7 @@ h3 {
 
 .hero-visual {
   position: relative;
-  min-height: 580px;
+  min-height: clamp(280px, 38vw, 400px);
   display: grid;
   place-items: center;
 }
@@ -456,13 +455,13 @@ h3 {
 }
 
 .orbit-one {
-  width: 540px;
-  height: 540px;
+  width: min(400px, 92vw);
+  height: min(400px, 92vw);
 }
 
 .orbit-two {
-  width: 380px;
-  height: 380px;
+  width: min(290px, 68vw);
+  height: min(290px, 68vw);
   animation-duration: 24s;
   animation-direction: reverse;
 }
@@ -471,9 +470,9 @@ h3 {
   background: linear-gradient(160deg, #0b1220, #111827);
   border-color: rgba(255, 255, 255, 0.08);
   position: relative;
-  width: min(100%, 470px);
-  padding: 20px;
-  border-radius: 34px;
+  width: min(100%, 360px);
+  padding: 14px;
+  border-radius: 24px;
   overflow: hidden;
 }
 
@@ -498,8 +497,9 @@ h3 {
 }
 
 .map-header {
-  margin-bottom: 20px;
+  margin-bottom: 12px;
   color: #dbeafe;
+  font-size: 0.85rem;
 }
 
 .map-header strong {
@@ -508,8 +508,8 @@ h3 {
 
 .globe {
   position: relative;
-  height: 310px;
-  border-radius: 28px;
+  height: clamp(150px, 18vw, 190px);
+  border-radius: 18px;
   background:
     radial-gradient(circle at 45% 45%, rgba(50, 211, 255, 0.22), transparent 26%),
     radial-gradient(circle, rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0.02) 58%, transparent 59%),
@@ -521,7 +521,7 @@ h3 {
 .globe::after {
   content: "";
   position: absolute;
-  inset: 32px;
+  inset: 18px;
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 50%;
 }
@@ -532,11 +532,11 @@ h3 {
 
 .node {
   position: absolute;
-  width: 14px;
-  height: 14px;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
   background: var(--success);
-  box-shadow: 0 0 28px var(--success);
+  box-shadow: 0 0 20px var(--success);
 }
 
 .node-a { left: 18%; top: 42%; }
@@ -552,18 +552,20 @@ h3 {
   transform-origin: left center;
 }
 
-.path-one { width: 230px; left: 23%; top: 45%; transform: rotate(-18deg); }
-.path-two { width: 170px; right: 18%; bottom: 36%; transform: rotate(28deg); }
+.path-one { width: 50%; left: 23%; top: 45%; transform: rotate(-18deg); }
+.path-two { width: 36%; right: 18%; bottom: 36%; transform: rotate(28deg); }
 
 .traffic-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  margin-top: 16px;
+  gap: 8px;
+  margin-top: 10px;
 }
 
 .traffic-grid div {
-  padding: 14px;
-  border-radius: 18px;
+  min-width: 0;
+  padding: 9px 10px;
+  border-radius: 12px;
   background: rgba(255, 255, 255, 0.06);
 }
 
@@ -575,11 +577,15 @@ h3 {
   font-size: 1.45rem;
 }
 
+.traffic-grid b { font-size: 1.05rem; }
+
 .traffic-grid span,
 .metric span {
   color: var(--muted);
   font-size: 0.84rem;
 }
+
+.traffic-grid span { display: block; font-size: 0.72rem; line-height: 1.25; }
 
 .metrics {
   display: grid;
@@ -874,31 +880,17 @@ code {
   .card-grid,
   .pricing-grid,
   .metrics,
-  .pill-grid,
-  .traffic-grid {
+  .pill-grid {
     grid-template-columns: 1fr;
   }
 
-  .hero {
-    min-height: auto;
-  }
-
   .hero-visual {
-    min-height: 440px;
+    min-height: 260px;
   }
 
-  .orbit-one {
-    width: 360px;
-    height: 360px;
-  }
-
-  .orbit-two {
-    width: 260px;
-    height: 260px;
-  }
-
-  .globe {
-    height: 250px;
+  .hero .cta-row .button {
+    flex: 1 1 auto;
+    justify-content: center;
   }
 
   .metrics {
