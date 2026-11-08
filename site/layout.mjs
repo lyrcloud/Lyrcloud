@@ -69,7 +69,7 @@ function footer() {
     <footer class="footer">
       <div class="footer-brand">
         <div class="brand">${logo('footer')}</div>
-        <p>Build, secure, and scale every digital experience on one global cloud.</p>
+        <p>Build, secure, and scale on one global cloud.</p>
       </div>
       <div class="footer-columns">
         ${column('Products', products.map((product) => [`/products/${product.slug}/`, product.name]))}
