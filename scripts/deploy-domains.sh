@@ -39,7 +39,7 @@ trap 'rm -rf "$work"' EXIT
 python3 - "$work/code.zip" <<'PY'
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED) as z:
-    for name in ['index', 'rules', 'lyrdns', 'dna']:
+    for name in ['index', 'rules', 'lyrdns', 'dna', 'lyrpay']:
         z.write(f'api/domains/{name}.mjs', f'domains/{name}.mjs')
     for name in ['roles', 'phone']:
         z.write(f'api/account/{name}.mjs', f'account/{name}.mjs')
