@@ -607,7 +607,7 @@ async function checkout(event, who) {
       ? await lyrpay.openPayment(await getLyrpay(), {
         orderId, amountCents: amount, title: `${label}: ${domain}, ${years} year${years === 1 ? '' : 's'}`,
         returnUrl: `${siteOrigin(event)}${successPath}`, cancelUrl: `${siteOrigin(event)}${cancelPath}`,
-        metadata: { orderId, domain, action },
+        metadata: { orderId, domain, action }, email: contact?.email || who.email,
       })
       : await openCheckout(event, who, {
         orderId, amount, domain, action, email: contact?.email,

@@ -40,10 +40,11 @@ async function call(keys, method, path, body) {
 }
 
 // A payment for one order, in US cents. Returns { id, url } (url: the page on lyrpay.com).
-export async function openPayment(keys, { orderId, amountCents, title, returnUrl, cancelUrl, metadata }) {
+// email only fills in Lyrpay's sign-up form; any Lyr account may still pay
+export async function openPayment(keys, { orderId, amountCents, title, returnUrl, cancelUrl, metadata, email }) {
   const payment = await call(keys, 'POST', '/payments', {
     amount: (amountCents / 100).toFixed(2), currency: 'USD', reference: orderId, description: String(title).slice(0, 140),
-    returnUrl, cancelUrl, expiresInMinutes: 30, metadata,
+    returnUrl, cancelUrl, expiresInMinutes: 30, metadata, ...(/^\S+@\S+\.\S+$/.test(email || '') ? { email } : {}),
   });
   return { id: payment.id, url: payment.url };
 }
