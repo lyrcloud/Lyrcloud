@@ -1761,7 +1761,8 @@ function domainBuyView(route) {
       <p class="form-error" hidden></p>
       <div class="row">
         <button class="btn primary" type="submit"${blocked ? ' disabled' : ''}>Continue to payment<span id="domain-total">${total ? ` · ${money(total)}` : ''}</span></button>
-        <span class="muted small">Secure card payment with Stripe. If the registry refuses the domain, you’re refunded in full.</span>
+        ${domains.data?.lyrpayReady ? `<button class="btn" type="submit" name="payWith" value="lyrpay"${blocked ? ' disabled' : ''}>Pay with Lyrpay balance</button>` : ''}
+        <span class="muted small">Secure card payment with Stripe${domains.data?.lyrpayReady ? ', or from your Lyrpay balance (renew those from here: auto-renew needs a card)' : ''}. If the registry refuses the domain, you’re refunded in full.</span>
       </div>
     </form>`;
 }
@@ -2327,6 +2328,7 @@ const domainFormActions = {
       autoRenew: data.get('autoRenew') === 'on',
       contact,
       ...(action === 'transfer' ? { authCode: String(data.get('authCode') || '').trim() } : {}),
+      ...(data.get('payWith') === 'lyrpay' ? { payWith: 'lyrpay' } : {}),
     };
     button.disabled = true;
     const label = button.innerHTML;
@@ -3555,7 +3557,8 @@ app.addEventListener('submit', (event) => {
   const form = event.target.closest('[data-form]');
   if (!form) return;
   event.preventDefault();
-  formActions[form.dataset.form]?.(form, new FormData(form));
+  // The pressed button's name and value are included (the domain checkout's Pay with Lyrpay)
+  formActions[form.dataset.form]?.(form, new FormData(form, event.submitter?.name ? event.submitter : undefined));
 });
 
 document.addEventListener('keydown', (event) => {

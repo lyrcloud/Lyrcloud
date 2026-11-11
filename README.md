@@ -80,6 +80,15 @@ Customers claim `name.lyr.cloud` in Dashboard → Domains and edit its records (
 - **Waitlist:** signed-in customers reserve up to three `.lyr` names for free (`POST /domains/lyr-waitlist`), first come first served; `/lyr/` checks availability. The admin console lists reservations. Nothing is sold.
 - **Before selling:** a real `.lyr` needs an ICANN application in a new-gTLD round; until then, sold names would only work for people using Lyrcloud DNS.
 
+### Pay with Lyrpay
+
+Customers can pay for a domain (register, transfer or renew) from their Lyrpay balance (`api/domains/lyrpay.mjs`):
+a second button on the checkout form, shown once the `lyrcloud/lyrpay` secret holds the keys from
+lyrpay.com/#admin > Lyr apps (`{"secret_key": "lpk_lyrcloud_...", "webhook_secret": "lpwh_..."}`, callback
+`https://uqp5mc2gq0.execute-api.us-east-1.amazonaws.com/public/lyrpay/callback`). Lyrpay's signed callback runs the
+same fulfilment as a Stripe payment; the 15-minute run picks up a missed callback and frees names whose Lyrpay
+payment expired. Refunds go back to the Lyrpay balance. Auto-renew needs a saved card, so those renew from the dashboard.
+
 ## Theme
 
 Light by default; dark when the visitor’s OS prefers dark. Colors are tokens on `:root` in `src/styles.css`.

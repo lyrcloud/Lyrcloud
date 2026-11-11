@@ -106,6 +106,10 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref DnaSecret
+              # Pay with Lyrpay keys (lyrcloud/lyrpay), saved outside this stack once the app is added in Lyrpay
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:lyrcloud/lyrpay-*'
               # Route 53 hosts the name.lyr.cloud zone and the zones of domains bought before the switch
               # to DNA. The API only edits a zone stored on a domain or subdomain the caller owns.
               - Effect: Allow
@@ -127,6 +131,7 @@ Resources:
           USERS_TABLE_NAME: !Ref UsersTableName
           STRIPE_SECRET_NAME: !Ref StripeSecret
           DNA_SECRET_NAME: !Ref DnaSecret
+          LYRPAY_SECRET_NAME: lyrcloud/lyrpay
           SUPER_ADMIN_EMAIL: !Ref SuperAdminEmail
           SITE_URL: https://www.lyrcloud.com
           ALLOWED_ORIGINS: !Join [',', !Ref AllowedOrigins]
@@ -217,6 +222,9 @@ Resources:
   StripeWebhookRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties: { ApiId: !Ref HttpApi, RouteKey: 'POST /public/stripe/webhook', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE }
+  LyrpayCallbackRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'POST /public/lyrpay/callback', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE }
   # The .lyr preview: Lyrcloud's DNS-over-HTTPS resolver (RFC 8484) and a JSON lookup for the /lyr/ page.
   DohGetRoute:
     Type: AWS::ApiGatewayV2::Route

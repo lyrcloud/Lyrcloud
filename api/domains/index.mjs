@@ -4,8 +4,10 @@
 //   GET    /public/domains/search?q=name     availability and prices for a name across TLDs
 //   GET    /public/domains/prices            the price list for every TLD Lyrcloud sells
 //   POST   /public/stripe/webhook            Stripe events: payment done -> register/transfer/renew
+//   POST   /public/lyrpay/callback           Lyrpay: paid from a Lyrpay balance -> register/transfer/renew (lyrpay.mjs)
 //   GET    /domains                          your domains, your saved registrant contact, payments status
-//   POST   /domains/checkout                 { action, domain, years?, autoRenew?, contact?, authCode? } -> Stripe URL
+//   POST   /domains/checkout                 { action, domain, years?, autoRenew?, contact?, authCode?, payWith? } -> Stripe
+//                                            URL, or the Lyrpay page with payWith: 'lyrpay'
 //   GET    /domains/{name}                   one domain, its registrar details, DNS records and e-mail verification
 //   PUT    /domains/{name}                   { autoRenew }
 //   POST   /domains/{name}/verify-email      send the registrant's verification e-mail again
@@ -62,6 +64,7 @@ import {
   zoneStruct,
 } from './dna.mjs';
 import { isStaff, planFor, roleFor } from '../account/roles.mjs';
+import * as lyrpay from './lyrpay.mjs';
 import {
   answerLyr,
   buildResponse,
@@ -300,6 +303,23 @@ async function saveStripe(value) {
   stripeCache = { value, at: Date.now() };
 }
 
+// Pay with Lyrpay keys ({} until the lyrcloud/lyrpay secret exists). Re-read every minute.
+let lyrpayCache = { value: null, at: 0 };
+async function getLyrpay() {
+  if (env.LYRPAY_JSON) return JSON.parse(env.LYRPAY_JSON);
+  if (!env.LYRPAY_SECRET_NAME) return {};
+  if (!lyrpayCache.value || Date.now() - lyrpayCache.at > 60_000) {
+    let value = {};
+    try {
+      value = JSON.parse((await secrets.send(new GetSecretValueCommand({ SecretId: env.LYRPAY_SECRET_NAME }))).SecretString || '{}');
+    } catch (err) {
+      if (err.name !== 'ResourceNotFoundException') console.error('Lyrpay keys unreadable', err.name);
+    }
+    lyrpayCache = { value, at: Date.now() };
+  }
+  return lyrpayCache.value;
+}
+
 export class StripeError extends Error {
   constructor(message, status, code) {
     super(message);
@@ -475,7 +495,7 @@ async function myDomains(who) {
     items: items.filter((item) => item.kind === 'subdomain' && !staleHold(item) && item.status !== 'expired').map((item) => publicSubdomain(item, config)),
   };
   const lyrReservations = items.filter((item) => item.kind === 'lyrwait').map((item) => ({ name: item.name, createdAt: item.createdAt }));
-  return json(200, { domains, orders, subdomains, lyrReservations, contact: billing?.contact || null, paymentsReady: Boolean(stripeConfig.secretKey), currency: 'usd' });
+  return json(200, { domains, orders, subdomains, lyrReservations, contact: billing?.contact || null, paymentsReady: Boolean(stripeConfig.secretKey), lyrpayReady: Boolean(stripeConfig.secretKey) && lyrpay.usable(await getLyrpay()), currency: 'usd' });
 }
 
 const UNTRANSFERABLE = 'This domain can’t be transferred right now. Unlock it at your current registrar, and note that domains can’t move within 60 days of being registered or transferred.';
@@ -580,16 +600,23 @@ async function checkout(event, who) {
 
   const label = { register: 'Domain registration', transfer: 'Domain transfer (adds 1 year)', renew: 'Domain renewal' }[action];
   let session;
+  const successPath = `/dash/#/domains/${domain}?paid=1`;
+  const cancelPath = action === 'renew' ? `/dash/#/domains/${domain}` : `/dash/#/domains/buy?domain=${domain}&action=${action}&cancelled=1`;
   try {
-    session = await openCheckout(event, who, {
-      orderId, amount, domain, action, email: contact?.email,
-      title: `${label}: ${domain}`, description: `${years} year${years === 1 ? '' : 's'}`,
-      successPath: `/dash/#/domains/${domain}?paid=1`, cancelPath: `/dash/#/domains/buy?domain=${domain}&action=${action}&cancelled=1`,
-    });
+    session = body.payWith === 'lyrpay'
+      ? await lyrpay.openPayment(await getLyrpay(), {
+        orderId, amountCents: amount, title: `${label}: ${domain}, ${years} year${years === 1 ? '' : 's'}`,
+        returnUrl: `${siteOrigin(event)}${successPath}`, cancelUrl: `${siteOrigin(event)}${cancelPath}`,
+        metadata: { orderId, domain, action },
+      })
+      : await openCheckout(event, who, {
+        orderId, amount, domain, action, email: contact?.email,
+        title: `${label}: ${domain}`, description: `${years} year${years === 1 ? '' : 's'}`, successPath, cancelPath,
+      });
   } catch (err) {
     await update(orderKey(orderId), { status: 'expired', failureReason: err.message });
     if (action !== 'renew') await releaseHold(domain, orderId);
-    if (err instanceof StripeError) return error(502, `Payment page couldn’t be created: ${err.message}`);
+    if (err instanceof StripeError || err instanceof lyrpay.LyrpayError) return error(err.status === 503 ? 503 : 502, `Payment page couldn’t be created: ${err.message}`);
     throw err;
   }
   await update(orderKey(orderId), { sessionId: session.id });
@@ -848,7 +875,9 @@ async function afterRegistration(item) {
 // Gives the money back when the registrar won't do what was paid for.
 async function refund(order, reason) {
   console.error('refunding order', order.orderId, reason);
-  if (order.paymentIntentId) {
+  if (lyrpay.isLyrpay(order.paymentIntentId)) {
+    await lyrpay.refundPayment(await getLyrpay(), order.paymentIntentId);
+  } else if (order.paymentIntentId) {
     await stripe('POST', '/refunds', { payment_intent: order.paymentIntentId, metadata: { orderId: order.orderId } }, { idempotencyKey: `refund-${order.orderId}` });
   }
   await update(orderKey(order.orderId), { status: 'refunded', failureReason: reason, refundedAt: now() }, ['authCode']);
@@ -957,6 +986,55 @@ async function onCheckoutExpired(session) {
   await update(orderKey(orderId), { status: 'expired' }, ['authCode']);
   if (order.action === 'subdomain') await releaseHold(order.domain, orderId, subKey(order.domain));
   else if (order.action !== 'renew') await releaseHold(order.domain, orderId);
+}
+
+// A Lyrpay payment for an order was paid: claim the order once, then buy the domain (as onCheckoutCompleted does).
+async function onLyrpayPaid(payment) {
+  const order = payment.reference && (await getItem(orderKey(payment.reference)));
+  if (!order || order.sessionId !== payment.id || payment.status !== 'paid') return;
+  if (lyrpay.paidCents(payment) !== order.amountCents || payment.currency !== 'USD') {
+    console.error('amount mismatch', order.orderId, payment.amount, payment.currency, order.amountCents);
+    return;
+  }
+  let claimed;
+  try {
+    claimed = await update(orderKey(order.orderId), { status: 'paid', paidAt: now(), paymentIntentId: payment.id, paidWith: 'lyrpay' },
+      [], ['#st = :open', { '#st': 'status' }, { ':open': 'open' }]);
+  } catch (err) {
+    if (isConditionFailure(err)) return; // already handled (callback and scheduled run both saw it)
+    throw err;
+  }
+  await fulfil(claimed);
+}
+
+async function lyrpayCallback(event) {
+  const message = lyrpay.verify(await getLyrpay(), rawBody(event), event.headers?.['lyrpay-signature']);
+  if (!message) return error(400, 'Bad signature.');
+  if (message.type === 'payment.paid') await onLyrpayPaid(message.payment || {});
+  return json(200, { received: true });
+}
+
+// Lyrpay orders still open after their payment's 30 minutes: paid ones go ahead (a callback was missed),
+// expired or cancelled ones give the name back.
+async function sweepLyrpayOrders() {
+  const keys = await getLyrpay();
+  if (!lyrpay.usable(keys)) return 0;
+  const cutoff = new Date(Date.now() - 35 * 60_000).toISOString();
+  const open = (await collect(ScanCommand, {
+    FilterExpression: '#k = :order AND #s = :open',
+    ExpressionAttributeNames: { '#k': 'kind', '#s': 'status' },
+    ExpressionAttributeValues: { ':order': 'order', ':open': 'open' },
+  })).filter((order) => lyrpay.isLyrpay(order.sessionId) && order.createdAt < cutoff);
+  for (const order of open) {
+    try {
+      const payment = await lyrpay.getPayment(keys, order.sessionId);
+      if (payment.status === 'paid') await onLyrpayPaid(payment);
+      else if (['expired', 'cancelled'].includes(payment.status)) await onCheckoutExpired({ metadata: { orderId: order.orderId } });
+    } catch (err) {
+      console.error('Lyrpay order check failed', order.orderId, err.message);
+    }
+  }
+  return open.length;
 }
 
 async function stripeWebhook(event) {
@@ -1099,7 +1177,8 @@ export async function tick() {
       console.error('scheduled work failed for', item.domain, err);
     }
   });
-  return { checked: items.length };
+  const lyrpayOrders = await sweepLyrpayOrders().catch((err) => { console.error('Lyrpay sweep failed', err); return 0; });
+  return { checked: items.length, lyrpayOrders };
 }
 
 
@@ -1610,6 +1689,7 @@ export function resetCaches() {
   pricingCache = { value: null, at: 0 };
   pricesCache = { value: null, at: 0 };
   stripeCache = { value: null, at: 0 };
+  lyrpayCache = { value: null, at: 0 };
   dnaCache = { value: null, at: 0 };
 }
 
@@ -1620,6 +1700,7 @@ export const handler = async (event) => {
   const path = event.requestContext?.http?.path || '';
   try {
     if (path === '/public/stripe/webhook' && method === 'POST') return await stripeWebhook(event);
+    if (path === '/public/lyrpay/callback' && method === 'POST') return await lyrpayCallback(event);
     if (path === '/public/domains/search' && method === 'GET') return await search(event);
     if (path === '/public/domains/prices' && method === 'GET') return await priceList();
     if (path === '/dns-query' && (method === 'GET' || method === 'POST')) return await dnsQuery(event, method);

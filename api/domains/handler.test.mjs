@@ -281,6 +281,7 @@ globalThis.fetch = async (url, { method, body, headers } = {}) => {
     reply[2] |= 0x80; // echo the query back as an empty answer
     return new Response(reply, { status: 200, headers: { 'content-type': 'application/dns-message' } });
   }
+  if (host === 'lyrpay.com') return lyrpayFetch(new URL(url), { method, body, headers });
   if (host === 'dns.google') return new Response(JSON.stringify({ Answer: [{ name: 'target.example.net.', type: 1, TTL: 30, data: '198.51.100.7' }] }), { status: 200 });
   const path = new URL(url).pathname.replace('/v1', '');
   const params = Object.fromEntries(new URLSearchParams(body || new URL(url).search));
@@ -881,4 +882,119 @@ test('anyone signed in can reserve up to three .lyr names for free, first come f
   assert.equal((await call(BOB, 'DELETE', '/domains/lyr-waitlist/wonder')).status, 404);
   assert.equal((await call(ALICE, 'DELETE', '/domains/lyr-waitlist/wonder')).status, 200);
   assert.equal((await call(BOB, 'POST', '/domains/lyr-waitlist', { name: 'wonder' })).status, 200);
+});
+
+
+// ---------------------------------------------------------------- Pay with Lyrpay
+
+const LYRPAY_KEYS = { secret_key: 'lpk_lyrcloud_test_0123456789abcdefghij', webhook_secret: 'lpwh_test' };
+let lyrpayPayments = new Map();
+let lyrpayCalls = [];
+function lyrpayFetch(url, { method, body, headers }) {
+  const reply = (status, data) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
+  const path = url.pathname.replace('/api/v1', '');
+  lyrpayCalls.push({ method, path, body: body ? JSON.parse(body) : null, key: headers.Authorization });
+  if (method === 'POST' && path === '/payments') {
+    const input = JSON.parse(body);
+    const id = `lpp_${String(lyrpayPayments.size + 1).padStart(24, '0')}`;
+    lyrpayPayments.set(id, { id, status: 'pending', reference: input.reference, amount: input.amount, currency: input.currency, metadata: input.metadata });
+    return reply(200, { id, url: `https://lyrpay.com/pay/${id}` });
+  }
+  const match = path.match(/^\/payments\/(lpp_[0-9a-f]{24})(\/refund)?$/);
+  const payment = match && lyrpayPayments.get(match[1]);
+  if (!payment) return reply(404, { detail: 'No such payment.' });
+  if (method === 'GET') return reply(200, payment);
+  if (payment.status !== 'paid') return reply(409, { detail: 'Only a paid payment can be refunded.' });
+  payment.status = 'refunded';
+  return reply(200, payment);
+}
+
+function lyrpayCallback(payment, secretUsed = LYRPAY_KEYS.webhook_secret) {
+  const body = JSON.stringify({ type: 'payment.paid', payment });
+  const t = Math.floor(Date.now() / 1000);
+  const signature = createHmac('sha256', secretUsed).update(`${t}.${body}`).digest('hex');
+  return handler({
+    requestContext: { http: { method: 'POST', path: '/public/lyrpay/callback' } },
+    headers: { 'lyrpay-signature': `t=${t},v1=${signature}` },
+    body,
+  }).then((response) => ({ status: response.statusCode, body: JSON.parse(response.body) }));
+}
+
+async function withLyrpay(run) {
+  process.env.LYRPAY_JSON = JSON.stringify(LYRPAY_KEYS);
+  lyrpayPayments = new Map();
+  lyrpayCalls = [];
+  try {
+    await run();
+  } finally {
+    delete process.env.LYRPAY_JSON;
+  }
+}
+
+test('a domain paid from a Lyrpay balance is registered once, and a forged callback does nothing', () => withLyrpay(async () => {
+  await connectStripe();
+  assert.equal((await call(ALICE, 'GET', '/domains')).body.lyrpayReady, true);
+  const res = await call(ALICE, 'POST', '/domains/checkout', { action: 'register', domain: 'wonder.com', contact: CONTACT, payWith: 'lyrpay' });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.match(res.body.url, /^https:\/\/lyrpay\.com\/pay\/lpp_/);
+  const order = ordersOf()[0];
+  const opened = lyrpayCalls[0].body;
+  assert.deepEqual([opened.amount, opened.currency, opened.reference], [(order.amountCents / 100).toFixed(2), 'USD', order.orderId]);
+  assert.equal(opened.returnUrl, 'https://www.lyrcloud.com/dash/#/domains/wonder.com?paid=1');
+  assert.equal(stripeCalls.filter((item) => item.path === '/checkout/sessions').length, 0, 'no Stripe checkout');
+  assert.equal(domainItem('wonder.com').status, 'awaiting_payment');
+
+  const payment = { ...lyrpayPayments.get(order.sessionId), status: 'paid' };
+  lyrpayPayments.set(payment.id, payment);
+  assert.equal((await lyrpayCallback(payment, 'lpwh_wrong')).status, 400);
+  assert.equal((await lyrpayCallback({ ...payment, amount: '1.00' })).status, 200);
+  assert.equal(called(REGISTER).length, 0, 'a payment for another amount buys nothing');
+  await lyrpayCallback(payment);
+  await lyrpayCallback(payment); // sent again
+  assert.equal(called(REGISTER).length, 1);
+  assert.equal(domainItem('wonder.com').status, 'active');
+  const paid = ordersOf()[0];
+  assert.deepEqual([paid.status, paid.paymentIntentId, paid.paidWith], ['fulfilled', payment.id, 'lyrpay']);
+}));
+
+test('a refused Lyrpay-paid domain is refunded to the Lyrpay balance', () => withLyrpay(async () => {
+  const keys = process.env.DNA_JSON;
+  process.env.DNA_JSON = JSON.stringify({ ...JSON.parse(keys), testApiKey: undefined });
+  try {
+    await connectStripe();
+    await call(ALICE, 'POST', '/domains/checkout', { action: 'register', domain: 'wonder.com', contact: CONTACT, payWith: 'lyrpay' });
+    const order = ordersOf()[0];
+    const payment = { ...lyrpayPayments.get(order.sessionId), status: 'paid' };
+    lyrpayPayments.set(payment.id, payment);
+    await lyrpayCallback(payment);
+    assert.equal(ordersOf()[0].status, 'refunded');
+    assert.equal(lyrpayPayments.get(payment.id).status, 'refunded');
+    assert.equal(stripeCalls.filter((item) => item.path === '/refunds').length, 0, 'nothing refunded through Stripe');
+  } finally {
+    process.env.DNA_JSON = keys;
+  }
+}));
+
+test('the scheduled run finishes a missed Lyrpay callback and frees names nobody paid for', () => withLyrpay(async () => {
+  await connectStripe();
+  await call(ALICE, 'POST', '/domains/checkout', { action: 'register', domain: 'wonder.com', contact: CONTACT, payWith: 'lyrpay' });
+  await call(BOB, 'POST', '/domains/checkout', { action: 'register', domain: 'other.com', contact: CONTACT, payWith: 'lyrpay' });
+  const [paidOrder, unpaidOrder] = ordersOf();
+  for (const order of ordersOf()) order.createdAt = new Date(Date.now() - 40 * 60_000).toISOString();
+  lyrpayPayments.get(paidOrder.sessionId).status = 'paid';
+  lyrpayPayments.get(unpaidOrder.sessionId).status = 'expired';
+  const result = await tick();
+  assert.equal(result.lyrpayOrders, 2);
+  assert.equal(called(REGISTER).length, 1);
+  assert.equal(domainItem('wonder.com').status, 'active');
+  assert.equal(ordersOf().find((o) => o.orderId === unpaidOrder.orderId).status, 'expired');
+  assert.equal(domainItem('other.com'), undefined, 'the hold is released');
+}));
+
+test('without Lyrpay keys the option is hidden and refused', async () => {
+  await connectStripe();
+  assert.equal((await call(ALICE, 'GET', '/domains')).body.lyrpayReady, false);
+  const res = await call(ALICE, 'POST', '/domains/checkout', { action: 'register', domain: 'wonder.com', contact: CONTACT, payWith: 'lyrpay' });
+  assert.equal(res.status, 503);
+  assert.notEqual(domainItem('wonder.com')?.status, 'awaiting_payment');
 });
