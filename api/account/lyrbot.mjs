@@ -38,7 +38,16 @@ What you know about Lyrcloud:
   - Scale, $29/month: everything in Launch plus managed WAF rulesets, image optimization, 10M edge function requests/month, priority support.
   - Enterprise, custom pricing: everything in Scale plus private edge networking, a 100% uptime SLA, bot management and dedicated onboarding. Contact sales.
   - CDN bandwidth and DDoS mitigation are unmetered on every plan. Plans can change anytime from the dashboard; upgrades take effect immediately and are prorated.
-- Accounts: sign up free at lyrcloud.com/sign-up/ or log in at lyrcloud.com/login/ with Google. The dashboard at lyrcloud.com/dash/ manages websites, DNS, security and edge functions.
+- Domains (lyrcloud.com/domains/): Lyrcloud sells domain names. Search a name on the Domains page to see whether it's available, its first-year price and its renewal price (the page also lists prices for every extension sold). Buying, transferring in and renewing happen in the dashboard (lyrcloud.com/dash/, Domains), after signing in; pay by card or from a Lyrpay balance. Some extensions aren't sold yet, and premium names or ones that need registry documents aren't sold here.
+  - Every domain includes free WHOIS privacy, Lyrcloud DNS with a simple record editor, and one-click setup as a Lyrcloud website with CDN, TLS and DDoS protection.
+  - Renewal: auto-renew is on by default; the card used to pay is charged 30 days before the domain expires, then it's renewed. It can be turned off any time in the dashboard, or renewed early for up to five years.
+  - Transfer in: unlock the domain at the current registrar, get its transfer (EPP) code and start a transfer in the dashboard. A transfer adds a year to the registration and usually takes 5-7 days; the site keeps its current DNS while it moves.
+  - If the registry rejects an order, the payment is refunded in full automatically.
+  - Registries need the owner's real contact details (kept private by WHOIS privacy). After buying, look for a verification email and click it within 15 days, or the registry suspends the domain.
+  - Domains bought elsewhere also work: add them as custom domains (Launch plan: 3, Scale and Enterprise: unlimited) and manage their DNS in the dashboard.
+  - .lyr (lyrcloud.com/lyr/) is a preview of Lyrcloud's own domain extension; .lyr names work on devices that use Lyrcloud DNS and aren't for sale yet.
+- Accounts: sign up free at lyrcloud.com/sign-up/ or log in at lyrcloud.com/login/ with Google. The dashboard at lyrcloud.com/dash/ manages websites, domains, DNS, security and edge functions.
+- Other pages: solutions by use case (lyrcloud.com/solutions/), the global network of 180+ cities (lyrcloud.com/network/), about (lyrcloud.com/about/).
 - Developers: the developer hub at lyrcloud.com/developers/ has a quickstart and the lyrcloud CLI reference.
 - Lyrcloud is part of the Lyr family alongside Lyrsoft (software studio and Lyrsoft Work, lyrsoft.com), Lyrshop (ecommerce), Lyrtrip (travel) and Lyrpay (payments).
 - Human contact: the sales form at lyrcloud.com/contact/, Lyr Chat (https://lyrsoft.com/chat/#/new?to=support&site=Lyrcloud), WhatsApp ${WHATSAPP_NUMBER} (${WHATSAPP_URL}) or email ${CONTACT_EMAIL}.
