@@ -80,6 +80,8 @@ const COGNITO_DOMAIN = process.env.COGNITO_DOMAIN || 'lyrcloud-auth.auth.us-east
 const RATE_TABLE_NAME = process.env.RATE_TABLE_NAME;
 // Secrets Manager secret holding the Anthropic API key for Lyrbot; ANTHROPIC_API_KEY wins (local dev).
 const ANTHROPIC_SECRET = process.env.ANTHROPIC_SECRET;
+// Gemini key shared by the Lyr sites (lyrsoft/gemini); GEMINI_API_KEY wins (local dev).
+const GEMINI_SECRET = process.env.GEMINI_SECRET;
 // Secrets Manager secret that signs unsubscribe links and phone codes; APP_SECRET wins (tests).
 const APP_SECRET_NAME = process.env.APP_SECRET_NAME;
 // SES sender, e.g. "Lyrcloud <no-reply@lyrcloud.com>"; without it no email is sent.
@@ -524,17 +526,25 @@ async function countUse(key, period = 'hour') {
   return Attributes.hits;
 }
 
-let anthropicKey;
-async function getAnthropicKey() {
-  if (process.env.ANTHROPIC_API_KEY) return process.env.ANTHROPIC_API_KEY;
-  if (!ANTHROPIC_SECRET) return null;
-  anthropicKey ??= (await new SecretsManagerClient({}).send(new GetSecretValueCommand({ SecretId: ANTHROPIC_SECRET }))).SecretString.trim();
-  return anthropicKey;
+// Lyrbot's AI keys from Secrets Manager (or env vars in local dev). A missing secret just leaves that AI out.
+const aiKeys = {};
+async function readKey(envName, secretId) {
+  if (process.env[envName]) return process.env[envName];
+  if (!secretId) return null;
+  if (!(secretId in aiKeys)) {
+    try {
+      aiKeys[secretId] = (await new SecretsManagerClient({}).send(new GetSecretValueCommand({ SecretId: secretId }))).SecretString.trim() || null;
+    } catch (error) {
+      console.error(`Lyrbot secret ${secretId}:`, error.name);
+      return null; // try again on the next request
+    }
+  }
+  return aiKeys[secretId];
 }
 
 async function lyrbotChat(event) {
-  const apiKey = await getAnthropicKey();
-  if (!apiKey || !RATE_TABLE_NAME) return errorResponse(503, LYRBOT_FALLBACK_REPLY);
+  const [geminiKey, anthropicKey] = await Promise.all([readKey('GEMINI_API_KEY', GEMINI_SECRET), readKey('ANTHROPIC_API_KEY', ANTHROPIC_SECRET)]);
+  if ((!geminiKey && !anthropicKey) || !RATE_TABLE_NAME) return errorResponse(503, LYRBOT_FALLBACK_REPLY);
   const body = parseBody(event);
   if (!body) return errorResponse(400, 'Invalid JSON body.');
   const conversation = cleanLyrbotMessages(body.messages);
@@ -543,7 +553,7 @@ async function lyrbotChat(event) {
     return errorResponse(429, LYRBOT_HOURLY_MESSAGE);
   }
   if ((await countUse('lyrbot#all', 'day')) > LYRBOT_DAILY_LIMIT) return errorResponse(429, LYRBOT_DAILY_MESSAGE);
-  const [status, reply] = await lyrbotReply(apiKey, conversation);
+  const [status, reply] = await lyrbotReply({ geminiKey, anthropicKey }, conversation);
   return jsonResponse(status, reply);
 }
 

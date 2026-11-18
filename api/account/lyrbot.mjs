@@ -1,10 +1,19 @@
 // Lyrbot: the lyrcloud.com help assistant, as on Lyrshop, Lyrtrip and Lyrsoft. Claude answers questions
 // about Lyrcloud's products, plans and account from the facts below and points visitors to sales or
-// support for anything that needs a person. The route is open to every visitor, so the caller caps
+// support for anything that needs a person.
+// Google Gemini answers first because its free tier costs nothing; when Gemini is busy, out of free requests or
+// fails, Claude answers instead, so visitors always get a reply. Either key may be missing. The route is open to every visitor, so the caller caps
 // use per visitor per hour and for the whole site per day (see index.mjs).
 import Anthropic from '@anthropic-ai/sdk';
 
 export const LYRBOT_MODEL = 'claude-opus-5-5';
+// Free-tier Gemini models, tried in order ("-latest" follows Google's newest Flash models); each has its own free quota.
+export const LYRBOT_GEMINI_MODELS = ['gemini-flash-lite-latest', 'gemini-flash-latest'];
+const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
+// API Gateway gives up after 30 seconds: each Gemini model gets a few seconds, Claude gets what is left.
+const TOTAL_BUDGET_MS = 26_000;
+const GEMINI_TIMEOUT_MS = 8_000;
+const CLAUDE_MIN_MS = 8_000;
 export const LYRBOT_HOURLY_LIMIT = 20;
 export const LYRBOT_DAILY_LIMIT = 1500;
 const MAX_TURNS = 12;
@@ -65,12 +74,57 @@ export function cleanLyrbotMessages(messages) {
   return recent.length && recent.at(-1).role === 'user' ? recent : null;
 }
 
+// The Gemini generateContent request for a conversation: Gemini calls the assistant's turns "model".
+export function geminiRequest(system, conversation) {
+  return {
+    systemInstruction: { parts: [{ text: system }] },
+    contents: conversation.map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
+    generationConfig: { maxOutputTokens: 2048, temperature: 0.4 },
+  };
+}
+
+// The answer text from a Gemini response, or null when it was blocked, cut off empty or missing.
+export function geminiText(data) {
+  const candidate = data?.candidates?.[0];
+  if (!candidate || data.promptFeedback?.blockReason) return null;
+  if (!['STOP', 'MAX_TOKENS', undefined].includes(candidate.finishReason)) return null;
+  const text = (candidate.content?.parts || []).filter((p) => !p.thought && typeof p.text === 'string').map((p) => p.text).join('').trim();
+  return text || null;
+}
+
+async function askGemini(apiKey, model, conversation, timeoutMs) {
+  const res = await fetch(`${GEMINI_URL}/${model}:generateContent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+    body: JSON.stringify(geminiRequest(SYSTEM_PROMPT, conversation)),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(`Gemini ${model} ${res.status}: ${data?.error?.message || res.statusText}`);
+  const text = geminiText(data);
+  if (!text) throw new Error(`Gemini ${model} gave no answer (${data?.candidates?.[0]?.finishReason || data?.promptFeedback?.blockReason || 'empty'})`);
+  return text;
+}
+
 let client;
 
-// Returns [status, body] for the chat window. `apiKey` is resolved by the caller.
-export async function lyrbotReply(apiKey, conversation) {
-  // API Gateway gives up after 30 seconds, so fail inside that window rather than retrying.
-  client ??= new Anthropic({ apiKey, timeout: 24_000, maxRetries: 0 });
+// Returns [status, body] for the chat window. The keys are resolved by the caller.
+export async function lyrbotReply({ geminiKey, anthropicKey }, conversation) {
+  const deadline = Date.now() + TOTAL_BUDGET_MS;
+  if (geminiKey) {
+    for (const model of LYRBOT_GEMINI_MODELS) {
+      const left = deadline - Date.now() - (anthropicKey ? CLAUDE_MIN_MS : 0);
+      if (left < 2_000) break;
+      try {
+        return [200, { reply: await askGemini(geminiKey, model, conversation, Math.min(GEMINI_TIMEOUT_MS, left)) }];
+      } catch (err) {
+        // Busy (503), out of free requests (429) or slow: try the next model, then Claude.
+        console.warn('Lyrbot:', err.name === 'TimeoutError' ? `Gemini ${model} timed out` : err.message);
+      }
+    }
+  }
+  if (!anthropicKey) return [503, { error: 'Lyrbot is busy right now. Try again in a minute.' }];
+  client ??= new Anthropic({ apiKey: anthropicKey, maxRetries: 0 });
   let message;
   try {
     message = await client.beta.messages.create({
@@ -82,7 +136,7 @@ export async function lyrbotReply(apiKey, conversation) {
       // Short help-desk answers; low effort keeps replies quick for a chat window.
       output_config: { effort: 'low' },
       messages: conversation,
-    });
+    }, { timeout: Math.max(CLAUDE_MIN_MS, deadline - Date.now()) });
   } catch (err) {
     if (err instanceof Anthropic.RateLimitError) return [503, { error: 'Lyrbot is busy right now. Try again in a minute.' }];
     if (err instanceof Anthropic.AuthenticationError || err instanceof Anthropic.PermissionDeniedError) {

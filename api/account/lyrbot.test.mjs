@@ -29,3 +29,13 @@ test('Lyrbot refuses empty or unanswered conversations and trims long ones', () 
   assert.ok(cleaned.slice(0, -1).every((m) => m.content.length === 1000));
   assert.equal(cleaned.at(-1).content.endsWith('last'), true);
 });
+
+test('Lyrbot builds Gemini requests and reads its answers', async () => {
+  const { geminiRequest, geminiText } = await import('./lyrbot.mjs');
+  const body = geminiRequest('rules', [{ role: 'user', content: 'Hi' }, { role: 'assistant', content: 'Hello' }, { role: 'user', content: 'Plans?' }]);
+  assert.deepEqual(body.contents.map((c) => c.role), ['user', 'model', 'user']);
+  assert.equal(body.systemInstruction.parts[0].text, 'rules');
+  assert.equal(geminiText({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'x', thought: true }, { text: ' Free. ' }] } }] }), 'Free.');
+  assert.equal(geminiText({ candidates: [{ finishReason: 'SAFETY', content: { parts: [{ text: 'x' }] } }] }), null);
+  assert.equal(geminiText(null), null);
+});
