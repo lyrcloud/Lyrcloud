@@ -1,0 +1,26 @@
+{
+  "name": "lyrcloud",
+  "version": "0.1.0",
+  "description": "The Lyrcloud CLI: build and deploy edge functions to <name>.dev.lyr",
+  "type": "module",
+  "bin": {
+    "lyrcloud": "bin/lyrcloud.mjs"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "lyrcloud",
+    "edge",
+    "functions",
+    "serverless",
+    "cli"
+  ],
+  "homepage": "https://www.lyrcloud.com/developers/",
+  "license": "UNLICENSED"
+}

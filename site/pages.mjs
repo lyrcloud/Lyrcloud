@@ -294,14 +294,14 @@ ${ctaBand('Not sure where to start?', 'Our solutions engineers will map your arc
 // ---------------------------------------------------------------- Developers
 
 const cliCommands = [
-  ['lyrcloud login', 'Authenticate the CLI with your Lyrcloud account.'],
-  ['lyrcloud init <name>', 'Scaffold a new edge function project from a template.'],
-  ['lyrcloud dev', 'Run your project locally against a production-identical runtime.'],
-  ['lyrcloud deploy', 'Bundle and deploy to every edge location.'],
-  ['lyrcloud tail', 'Stream live logs from your deployed functions.'],
-  ['lyrcloud dns list <zone>', 'List DNS records for a zone.'],
-  ['lyrcloud cache purge <url>', 'Purge a URL, tag, or prefix from the cache.'],
-  ['lyrcloud secret put <name>', 'Store an encrypted secret for your functions.'],
+  ['lyrcloud login', 'Sign in with your Lyrcloud account in the browser (<code>--email</code> for email and password).'],
+  ['lyrcloud init <name>', 'Create a new edge function project in <code>./&lt;name&gt;</code>.'],
+  ['lyrcloud dev', 'Run the project on <code>localhost:8787</code> with the same runtime as production, reloading on every edit.'],
+  ['lyrcloud deploy', 'Upload the project and make it live at <code>https://&lt;name&gt;.dev.lyr</code>.'],
+  ['lyrcloud list', 'List your functions, their status and addresses.'],
+  ['lyrcloud logs [name] [-f]', 'Show recent logs; <code>-f</code> keeps following, <code>--since 2h</code> looks further back.'],
+  ['lyrcloud delete [name]', 'Take a function offline and free its name.'],
+  ['lyrcloud whoami / logout', 'Show who you’re signed in as, or sign out on this computer.'],
 ];
 
 const developersPage = {
@@ -334,16 +334,20 @@ cd hello-edge</code></pre>
           <li>
             <h3>Write your handler</h3>
             <pre class="snippet"><code>${escape(`export default {
-  fetch(request) {
-    return new Response('Hello from ' + request.geo.city);
+  fetch(request, env) {
+    const url = new URL(request.url);
+    return new Response(env.GREETING + ' from ' + url.hostname);
   },
 };`)}</code></pre>
+            <p>Try it locally with <code class="inline">lyrcloud dev</code>. <code class="inline">env</code> holds the <code class="inline">vars</code> in <code class="inline">lyrcloud.json</code>.</p>
           </li>
           <li>
             <h3>Deploy</h3>
-            <pre class="snippet"><code>lyrcloud deploy
-✓ Deployed hello-edge to 180 locations
-  https://hello-edge.your-team.lyrcloud.dev</code></pre>
+            <pre class="snippet"><code>lyrcloud login
+lyrcloud deploy
+✓ Deployed hello-edge in 4.2s
+  https://hello-edge.dev.lyr</code></pre>
+            <p><code class="inline">.dev.lyr</code> addresses open on devices set up for <a href="/lyr/">Lyr DNS</a>.</p>
           </li>
         </ol>
       </section>

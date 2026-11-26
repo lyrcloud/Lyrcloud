@@ -1,0 +1,330 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lyrcloud Edge Functions - deploy JavaScript fetch handlers from the lyrcloud CLI and serve them at <name>.<FunctionsDomain>.
+# Deploy with scripts/deploy-functions.sh. Lambda source: api/functions/ (plus api/account/roles.mjs and
+# api/domains/lyrca.mjs). Each customer function is a Lambda function named lyrfn-<name> that the API
+# creates; its address is an API Gateway custom domain mapped to IngressApi, and the .lyr registry
+# (in the domains table) gets a CNAME for it.
+
+Parameters:
+  ArtifactsBucketName:
+    Type: String
+    Default: lyrcloud-deploy-artifacts
+  LambdaCodeS3Key:
+    Type: String
+  UserPoolId:
+    Type: String
+  UserPoolClientId:
+    Type: String
+  FunctionsDomain:
+    Type: String
+    Default: dev.lyr
+  DomainsTableName:
+    Type: String
+    Default: lyrcloud-domains
+  LyrCaSecretName:
+    Type: String
+    Default: lyrcloud/lyr-ca
+  UsersTableName:
+    Type: String
+    Default: lyrcloud-users
+  SuperAdminEmail:
+    Type: String
+    Default: lyrclouds@gmail.com
+  AllowedOrigins:
+    Type: CommaDelimitedList
+    Default: 'https://www.lyrcloud.com,http://localhost:5173'
+
+Resources:
+  # ---------------------------------------------------------------- data
+
+  FunctionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: lyrcloud-functions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: ownerId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: byOwner
+          KeySchema:
+            - { AttributeName: ownerId, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+
+  # ---------------------------------------------------------------- customer functions
+
+  # What customer code runs as: it may write its own logs and nothing else.
+  CustomerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OwnLogsOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/lyrfn-*:*'
+
+  # ---------------------------------------------------------------- control API (used by the CLI)
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EdgeFunctions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:Scan]
+                Resource: [!GetAtt FunctionsTable.Arn, !Sub '${FunctionsTable.Arn}/index/*']
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${UsersTableName}'
+              # Only the dev.lyr registry item.
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem]
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DomainsTableName}'
+                Condition:
+                  ForAllValues:StringEquals:
+                    dynamodb:LeadingKeys: [!Sub 'lyr#${FunctionsDomain}']
+              - Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:GetFunctionConfiguration
+                  - lambda:DeleteFunction
+                  - lambda:TagResource
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:lyrfn-*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CustomerFunctionRole.Arn
+                Condition:
+                  StringEquals: { 'iam:PassedToService': lambda.amazonaws.com }
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:PutRetentionPolicy, logs:DeleteLogGroup, logs:FilterLogEvents, logs:TagResource]
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/lyrfn-*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/lyrfn-*:*'
+              - Effect: Allow
+                Action: [apigateway:GET, apigateway:POST, apigateway:PUT, apigateway:PATCH, apigateway:DELETE]
+                Resource:
+                  - !Sub 'arn:aws:apigateway:${AWS::Region}::/domainnames'
+                  - !Sub 'arn:aws:apigateway:${AWS::Region}::/domainnames/*'
+                  - !Sub 'arn:aws:apigateway:${AWS::Region}::/tags/*'
+              - Effect: Allow
+                Action: [acm:ImportCertificate, acm:AddTagsToCertificate, acm:DescribeCertificate]
+                Resource: '*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${LyrCaSecretName}-*'
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lyrcloud-functions
+      Runtime: nodejs22.x
+      Handler: functions/index.handler
+      Role: !GetAtt ApiRole.Arn
+      MemorySize: 512
+      Timeout: 29
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FunctionsTable
+          USERS_TABLE_NAME: !Ref UsersTableName
+          DOMAINS_TABLE_NAME: !Ref DomainsTableName
+          FUNCTIONS_DOMAIN: !Ref FunctionsDomain
+          EXEC_ROLE_ARN: !GetAtt CustomerFunctionRole.Arn
+          INGRESS_API_ID: !Ref IngressApi
+          LYR_CA_SECRET_NAME: !Ref LyrCaSecretName
+          SUPER_ADMIN_EMAIL: !Ref SuperAdminEmail
+      Code:
+        S3Bucket: !Ref ArtifactsBucketName
+        S3Key: !Ref LambdaCodeS3Key
+
+  ControlApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: lyrcloud-functions-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: !Ref AllowedOrigins
+        AllowMethods: [GET, PUT, DELETE, OPTIONS]
+        AllowHeaders: [Authorization, Content-Type]
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref ControlApi
+      AuthorizerType: JWT
+      Name: CognitoJwtAuthorizer
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration:
+        Audience: [!Ref UserPoolClientId]
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}'
+
+  ControlIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ControlApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 30000
+
+  ListRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref ControlApi, RouteKey: 'GET /functions', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  GetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref ControlApi, RouteKey: 'GET /functions/{proxy+}', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  PutRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref ControlApi, RouteKey: 'PUT /functions/{proxy+}', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  DeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref ControlApi, RouteKey: 'DELETE /functions/{proxy+}', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  AdminRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref ControlApi, RouteKey: 'GET /admin/{proxy+}', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+
+  ControlStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref ControlApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+  ControlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ControlApi}/*/*'
+
+  # Keeps the *.dev.lyr certificate (90 days) renewed well before it runs out.
+  CertificateRenewal:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(1 day)
+      Targets:
+        - Arn: !GetAtt ApiFunction.Arn
+          Id: renew-certificate
+          Input: '{"task":"renew-certificate"}'
+  CertificateRenewalPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CertificateRenewal.Arn
+
+  # ---------------------------------------------------------------- serving <name>.dev.lyr
+
+  RouterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeCustomerFunctions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:lyrfn-*'
+
+  RouterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lyrcloud-functions-router
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      Handler: functions/router.handler
+      Role: !GetAtt RouterRole.Arn
+      MemorySize: 256
+      Timeout: 29
+      Environment:
+        Variables:
+          FUNCTIONS_DOMAIN: !Ref FunctionsDomain
+      Code:
+        S3Bucket: !Ref ArtifactsBucketName
+        S3Key: !Ref LambdaCodeS3Key
+
+  # Reached only through the <name>.dev.lyr custom domains, never its execute-api address.
+  IngressApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: lyrcloud-functions-ingress
+      ProtocolType: HTTP
+      DisableExecuteApiEndpoint: true
+
+  IngressIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref IngressApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt RouterFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 30000
+
+  IngressRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref IngressApi, RouteKey: '$default', Target: !Sub 'integrations/${IngressIntegration}' }
+
+  IngressStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref IngressApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 500
+        ThrottlingRateLimit: 200
+
+  IngressInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RouterFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${IngressApi}/*'
+
+Outputs:
+  FunctionsApiBaseUrl:
+    Value: !GetAtt ControlApi.ApiEndpoint
+  IngressApiId:
+    Value: !Ref IngressApi
+  FunctionsDomain:
+    Value: !Ref FunctionsDomain

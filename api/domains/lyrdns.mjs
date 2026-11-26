@@ -11,8 +11,8 @@ export const TYPES = { A: 1, NS: 2, CNAME: 5, SOA: 6, MX: 15, TXT: 16, AAAA: 28,
 const TYPE_NAMES = Object.fromEntries(Object.entries(TYPES).map(([name, code]) => [code, name]));
 export const RCODE = { NOERROR: 0, FORMERR: 1, SERVFAIL: 2, NXDOMAIN: 3, NOTIMP: 4, REFUSED: 5 };
 const NEGATIVE_TTL = 300;
-// Labels people can't hold: they'd be confusing or are kept for Lyrcloud itself.
-export const RESERVED_LYR = ['nic', 'dns', 'www', 'whois', 'registry', 'lyr', 'lyrcloud', 'admin', 'localhost', 'example', 'test', 'invalid'];
+// Labels people can't hold: they'd be confusing or are kept for Lyrcloud itself (dev.lyr serves Edge Functions).
+export const RESERVED_LYR = ['nic', 'dns', 'dev', 'www', 'whois', 'registry', 'lyr', 'lyrcloud', 'admin', 'localhost', 'example', 'test', 'invalid'];
 
 const LYR_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.lyr$/;
 
