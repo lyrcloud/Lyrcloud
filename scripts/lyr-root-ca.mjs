@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Creates the Lyr Root CA once, after the lyrcloud-domains stack exists (bash scripts/deploy-domains.sh):
+// Creates the Lyr Root CA once (and its lyrcloud/lyr-ca secret, if missing):
 //
 //   node scripts/lyr-root-ca.mjs
 //
@@ -25,8 +25,14 @@ let stored = {};
 try {
   stored = JSON.parse(aws('secretsmanager', 'get-secret-value', '--secret-id', SECRET, '--query', 'SecretString', '--output', 'text') || '{}');
 } catch {
-  console.error(`Couldn't read the ${SECRET} secret. Deploy the domains stack first: bash scripts/deploy-domains.sh`);
-  process.exit(1);
+  // First run on this account: make the (empty) secret. The domains stack only reads it.
+  try {
+    aws('secretsmanager', 'create-secret', '--name', SECRET, '--secret-string', '{}',
+      '--description', 'Lyr Root CA key and certificate (.lyr names only). Written by scripts/lyr-root-ca.mjs.');
+  } catch {
+    console.error(`Couldn't read or create the ${SECRET} secret. Check your AWS credentials.`);
+    process.exit(1);
+  }
 }
 
 let certPem = stored.certPem;

@@ -4,6 +4,11 @@ Description: Lyrcloud Domains - search, sell, transfer in and renew domains thro
 # The Lambda uses the AWS SDK that ships with the Node.js runtime; Stripe is called over its REST API.
 
 Parameters:
+  # The Lyr Root CA key lives in this secret, created by scripts/lyr-root-ca.mjs. The stack only reads it and
+  # never creates, overwrites or deletes it, so a deploy or rollback can't lose the key.
+  LyrCaSecretName:
+    Type: String
+    Default: lyrcloud/lyr-ca
   ArtifactsBucketName:
     Type: String
     Default: lyrcloud-deploy-artifacts
@@ -78,15 +83,6 @@ Resources:
   # The Lyr Root CA: { keyPem, certPem }, made once by scripts/lyr-root-ca.mjs. It signs HTTPS certificates for
   # .lyr names only (a critical name constraint). Leave this placeholder unchanged: replacing the key means
   # everyone installs the root again. Retained if the stack is deleted, for the same reason.
-  LyrCaSecret:
-    Type: AWS::SecretsManager::Secret
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      Name: lyrcloud/lyr-ca
-      Description: Lyr Root CA key and certificate (.lyr names only). Written by scripts/lyr-root-ca.mjs.
-      SecretString: '{}'
-
   FunctionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -121,7 +117,7 @@ Resources:
               # Signs certificates for .lyr names their holders run.
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: !Ref LyrCaSecret
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${LyrCaSecretName}-*'
               # Route 53 hosts the name.lyr.cloud zone and the zones of domains bought before the switch
               # to DNA. The API only edits a zone stored on a domain or subdomain the caller owns.
               - Effect: Allow
@@ -143,7 +139,7 @@ Resources:
           USERS_TABLE_NAME: !Ref UsersTableName
           STRIPE_SECRET_NAME: !Ref StripeSecret
           DNA_SECRET_NAME: !Ref DnaSecret
-          LYR_CA_SECRET_NAME: !Ref LyrCaSecret
+          LYR_CA_SECRET_NAME: !Ref LyrCaSecretName
           SUPER_ADMIN_EMAIL: !Ref SuperAdminEmail
           SITE_URL: https://www.lyrcloud.com
           ALLOWED_ORIGINS: !Join [',', !Ref AllowedOrigins]
