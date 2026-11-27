@@ -2534,3 +2534,14 @@ code.inline {
     gap: 4px;
   }
 }
+
+/* Website forms that go to Lyrsoft Marketing (src/lyr-forms.js): footer newsletter and contact sales. */
+.hp { position: absolute !important; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
+.news-form { display: flex; gap: 8px; max-width: 340px; margin-top: 14px; }
+.news-form input[type='email'] { flex: 1; min-width: 0; padding: 9px 12px; border: 1px solid var(--line, #d9e2ef); border-radius: 10px; background: var(--surface, #fff); color: inherit; font: inherit; }
+.news-form .button { padding: 9px 14px; }
+.check-row { display: flex !important; flex-direction: row !important; align-items: center; gap: 8px; font-weight: 500; }
+.check-row input { width: auto !important; }
+.form-ok-text { color: #0a8f5a; }
+.form-error-text { color: #d0263e; }
+.platforms-menu .mega-grid { grid-template-columns: 1fr; }

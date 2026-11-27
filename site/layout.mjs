@@ -48,6 +48,18 @@ function header(active) {
         ${navLink('/network/', 'Network', active)}
         ${navLink('/domains/', 'Domains', active)}
         ${navLink('/pricing/', 'Pricing', active)}
+        <div class="nav-dropdown">
+          <a href="https://lyrsoft.com/">Lyr platforms <span aria-hidden="true">▾</span></a>
+          <div class="mega-menu platforms-menu">
+            <div class="mega-grid">
+              <a class="mega-item" href="/"><span class="mega-icon" aria-hidden="true">☁</span><span><b>Lyrcloud</b><small>Domains, DNS, CDN, security and edge</small></span></a>
+              <a class="mega-item" href="https://lyrsoft.com/"><span class="mega-icon" aria-hidden="true">⌘</span><span><b>Lyrsoft</b><small>Software development and SaaS for your team</small></span></a>
+              <a class="mega-item" href="https://lyrpay.com/"><span class="mega-icon" aria-hidden="true">◈</span><span><b>Lyrpay</b><small>Your wallet: pay for domains and plans</small></span></a>
+              <a class="mega-item" href="https://lyrsoft.com/chat/"><span class="mega-icon" aria-hidden="true">💬</span><span><b>Lyr Chat</b><small>Messages, voice and video calls</small></span></a>
+            </div>
+            <p class="mega-footer">One Lyr account signs in everywhere.</p>
+          </div>
+        </div>
       </nav>
       <div class="header-actions">
         <a class="link-button" href="/login/" id="login-link">Log in</a>
@@ -69,7 +81,13 @@ function footer() {
     <footer class="footer">
       <div class="footer-brand">
         <div class="brand">${logo('footer')}</div>
-        <p>Build, secure, and scale on one global cloud.</p>
+        <p>Domains, DNS, CDN and security on one global cloud.</p>
+        <form class="news-form" id="news-form" novalidate>
+          <input name="email" type="email" required placeholder="you@example.com" aria-label="Email for Lyrcloud product news" autocomplete="email" />
+          <input name="website" class="hp" tabindex="-1" autocomplete="off" aria-hidden="true" />
+          <button class="button primary" type="submit">Get news</button>
+        </form>
+        <p class="form-note" id="news-status" role="status"></p>
       </div>
       <div class="footer-columns">
         ${column('Products', products.map((product) => [`/products/${product.slug}/`, product.name]))}
@@ -79,6 +97,12 @@ function footer() {
           ['/developers/#cli', 'CLI reference'],
           ['/dash/', 'Dashboard'],
         ])}
+        ${column('Lyr platforms', [
+          ['https://lyrsoft.com/', 'Lyrsoft · software & SaaS'],
+          ['https://lyrsoft.com/#plans', 'Lyrsoft plans'],
+          ['https://lyrpay.com/', 'Lyrpay wallet'],
+          ['https://lyrsoft.com/chat/', 'Lyr Chat'],
+        ])}
         ${column('Company', [
           ['/about/', 'About'],
           ['/network/', 'Network'],
@@ -86,7 +110,7 @@ function footer() {
           ['/contact/', 'Contact sales'],
         ])}
       </div>
-      <p class="footer-legal">© ${new Date().getFullYear()} Lyrcloud. All rights reserved.</p>
+      <p class="footer-legal">© ${new Date().getFullYear()} Lyrcloud. One Lyr account for Lyrcloud, Lyrsoft and Lyrpay.</p>
     </footer>`;
 }
 

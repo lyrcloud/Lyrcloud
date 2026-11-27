@@ -2,6 +2,9 @@ import { isLoggedIn, logout } from './auth.js';
 import { avatarHtml, cachedProfile } from './avatar.js';
 import { getSession } from './session.js';
 import './lyrbot.js';
+import { wireNewsletter } from './lyr-forms.js';
+
+wireNewsletter();
 
 const menuButton = document.querySelector('.menu-button');
 const header = document.querySelector('.site-header');

@@ -1,16 +1,27 @@
-const form = document.querySelector('#contact-form');
+// lyrcloud.com contact sales form: sent to the "lyrcloud.com · Contact sales" form in Lyrsoft Marketing
+// (lyrsoft.com/app/#/w/rTdTaUcI9YJo/marketing/forms), which keeps the message, files it in the
+// support@lyrcloud.com inbox in Lyrsoft Mail and adds people who opt in to the audience.
+import { sendToLyrForm, LYR_FORMS } from './lyr-forms.js';
 
-form.addEventListener('submit', (event) => {
+const form = document.querySelector('#contact-form');
+const status = document.querySelector('#contact-status');
+
+form.addEventListener('submit', async (event) => {
   event.preventDefault();
-  const data = Object.fromEntries(new FormData(form));
-  const subject = `Sales inquiry from ${data.company || data.name}`;
-  const body = [
-    `Name: ${data.name}`,
-    `Email: ${data.email}`,
-    `Company: ${data.company || '—'}`,
-    `Monthly traffic: ${data.traffic}`,
-    '',
-    data.message,
-  ].join('\n');
-  location.href = `mailto:support@lyrcloud.com?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  if (!form.reportValidity()) return;
+  const button = form.querySelector('button[type="submit"]');
+  button.disabled = true;
+  status.classList.remove('form-error-text', 'form-ok-text');
+  status.textContent = 'Sending…';
+  try {
+    const result = await sendToLyrForm(LYR_FORMS.contact, Object.fromEntries(new FormData(form)));
+    form.reset();
+    status.classList.add('form-ok-text');
+    status.textContent = result.message || 'Thanks! We’ll reply within one business day.';
+  } catch (error) {
+    status.classList.add('form-error-text');
+    status.textContent = error instanceof TypeError ? 'Can’t reach us right now. Email support@lyrcloud.com instead.' : error.message;
+  } finally {
+    button.disabled = false;
+  }
 });

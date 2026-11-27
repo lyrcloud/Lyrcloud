@@ -877,11 +877,22 @@ const contactPage = {
             <li>✓ Security and compliance reviews</li>
           </ul>
           <p>Prefer email? <a class="text-link" href="mailto:support@lyrcloud.com">support@lyrcloud.com</a></p>
+          <p class="muted-note">Need custom software, a SaaS product or tools for your team? That’s <a class="text-link" href="https://lyrsoft.com/#contact">Lyrsoft</a>, our sister company — same Lyr account.</p>
         </div>
-        <form class="form-card glass-card" id="contact-form">
-          <label>Full name<input name="name" required autocomplete="name" /></label>
-          <label>Work email<input name="email" type="email" required autocomplete="email" /></label>
-          <label>Company<input name="company" autocomplete="organization" /></label>
+        <form class="form-card glass-card" id="contact-form" novalidate>
+          <label>Full name<input name="name" required maxlength="120" autocomplete="name" /></label>
+          <label>Work email<input name="email" type="email" required maxlength="254" autocomplete="email" /></label>
+          <label>Company<input name="company" maxlength="120" autocomplete="organization" /></label>
+          <label>I’m interested in
+            <select name="interest">
+              <option>Domains &amp; DNS</option>
+              <option>CDN &amp; performance</option>
+              <option>Security &amp; DDoS protection</option>
+              <option>Edge Functions &amp; storage</option>
+              <option>Cloud clusters</option>
+              <option>Enterprise plan</option>
+            </select>
+          </label>
           <label>Monthly traffic
             <select name="traffic">
               <option>Under 1 TB</option>
@@ -890,9 +901,11 @@ const contactPage = {
               <option>500 TB+</option>
             </select>
           </label>
-          <label>How can we help?<textarea name="message" rows="4" required></textarea></label>
+          <label>How can we help?<textarea name="message" rows="4" required maxlength="5000"></textarea></label>
+          <label class="check-row"><input type="checkbox" name="subscribe" value="yes" /> Email me Lyrcloud product news (optional)</label>
+          <input name="website" class="hp" tabindex="-1" autocomplete="off" aria-hidden="true" />
           <button class="button primary large" type="submit">Send message</button>
-          <p class="form-note">Opens your email app with the message pre-filled to support@lyrcloud.com.</p>
+          <p class="form-note" id="contact-status" role="status">Goes straight to the Lyrcloud team at support@lyrcloud.com.</p>
         </form>
       </section>
     </main>`,
