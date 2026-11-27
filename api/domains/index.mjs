@@ -66,6 +66,7 @@ import {
   zoneStruct,
 } from './dna.mjs';
 import { isStaff, planFor, roleFor } from '../account/roles.mjs';
+import { createSites, SiteError } from './sites.mjs';
 import { issueCertificate, LEAF_DAYS, publicKeyFrom } from './lyrca.mjs';
 import {
   answerLyr,
@@ -202,6 +203,12 @@ const itemsOf = (ownerId) => collect(QueryCommand, {
   KeyConditionExpression: 'ownerId = :o',
   ExpressionAttributeValues: { ':o': ownerId },
   ScanIndexForward: false,
+});
+
+// DNS, CDN and HTTPS for any domain (sites.mjs).
+const sites = createSites({
+  ddb, TABLE, FUNCTIONS_TABLE: env.FUNCTIONS_TABLE_NAME || '', PROXY_DISTRIBUTION_ID: env.PROXY_DISTRIBUTION_ID || '',
+  FUNCTION_DISTRIBUTION_ID: env.FUNCTION_DISTRIBUTION_ID || '', itemsOf, isStaff, json: (...a) => json(...a), error: (...a) => error(...a), parseJson: (e) => parseJson(e),
 });
 
 // Runs `work` over `items`, `limit` at a time.
@@ -876,6 +883,18 @@ async function changeDnaRecord(event, item, method) {
 
 async function changeRecord(event, item, method) {
   if (item.status === 'active' && dnaZones(item)) return changeDnaRecord(event, item, method);
+  // On Lyrcloud DNS (a site): the site's rules apply, so records the CDN serves stay protected.
+  const site = item.hostedZoneId && (await sites.getSite(item.domain));
+  if (site && site.zoneId === item.hostedZoneId) {
+    try {
+      if (method === 'PUT') await sites.putRecord(site, parseJson(event));
+      else await sites.deleteRecord(site, event.queryStringParameters?.type, event.queryStringParameters?.name);
+    } catch (err) {
+      if (err instanceof SiteError) return error(err.status, err.message);
+      throw err;
+    }
+    return json(200, method === 'PUT' ? { saved: true } : { deleted: true });
+  }
   if (item.status !== 'active' || !item.hostedZoneId) return error(409, 'DNS records can be edited once the domain is active on Lyrcloud DNS.');
   if (method === 'PUT') {
     const record = parseJson(event);
@@ -905,6 +924,7 @@ async function domainRoutes(event, method, path, who) {
   if (path === '/domains' && method === 'GET') return myDomains(who);
   if (path === '/domains/checkout' && method === 'POST') return checkout(event, who);
   if (path === '/domains/subdomains' || path.startsWith('/domains/subdomains/')) return subdomainRoutes(event, method, path, who);
+  if (path === '/domains/sites' || path.startsWith('/domains/sites/')) return sites.routes(event, method, path, who);
   if (path === '/domains/lyr-waitlist' || path.startsWith('/domains/lyr-waitlist/')) return waitlistRoutes(event, method, path, who);
   if (path.startsWith('/domains/lyr/')) return lyrOwnerRoutes(event, method, path, who);
   const match = path.match(/^\/domains\/([^/]+)(\/records|\/verify-email)?$/);
@@ -960,16 +980,35 @@ async function startOperation(order, registrarEnv) {
     const started = await dna('POST', 'domains/transfer', { body: { domainName, authCode: order.authCode, period: 1 } }, registrarEnv);
     return `dna-transfer:${started?.domainId || ''}`;
   }
+  const nameServers = registrarEnv === 'live' ? await lyrcloudNameservers(order) : DNA_NAMESERVERS;
   const registered = await dna('POST', 'domains/register-with-contacts', {
     body: {
       domainName,
       period: order.years,
-      nameServers: DNA_NAMESERVERS,
+      nameServers,
       // One contact fills all four roles (DNA copies it to Admin, Tech and Billing).
       contacts: [{ contactType: 'Registrant', ...dnaContact(order.contact) }],
     },
   }, registrarEnv);
   return `dna-register:${registered?.domainId || ''}`;
+}
+
+// A live registration goes straight onto Lyrcloud DNS: the buyer's site (a Route 53 zone with the shared
+// name servers), made now. If that can't be done, the domain falls back to DNA's DNS rather than failing.
+async function lyrcloudNameservers(order) {
+  try {
+    let site = await sites.getSite(order.domain);
+    if (site && site.ownerId !== order.ownerId) {
+      console.error('site for a newly bought domain belongs to someone else; using DNA DNS', order.domain);
+      return DNA_NAMESERVERS;
+    }
+    if (site) site = await sites.save(site, { source: 'registered' });
+    else site = await sites.addSite({ domain: order.domain, ownerId: order.ownerId, ownerEmail: order.contact?.email, source: 'registered', importRecords: false });
+    return site.nameservers;
+  } catch (err) {
+    console.error('could not make the Lyrcloud DNS zone; using DNA DNS', order.domain, err.name, err.message);
+    return DNA_NAMESERVERS;
+  }
 }
 
 // After a registration goes live: WHOIS privacy where the registry offers it, and DNA's DNS. Neither may
@@ -980,7 +1019,7 @@ async function afterRegistration(item) {
     await dna('POST', 'domains/privacy', { body: { domainName: item.domain, privacyStatus: true } }, item.registrarEnv)
       .catch((err) => console.error('privacy failed', item.domain, err.code || err.name, err.message));
   }
-  if (item.registrarEnv !== 'test') {
+  if (item.registrarEnv !== 'test' && item.dnsProvider === 'dna') {
     // Delegates to DNA's name servers if the registry didn't take them at registration; safe to repeat.
     await dna('POST', 'domains/zones/apply', { query: { domainName: item.domain } })
       .catch((err) => console.error('zones/apply failed', item.domain, err.code || err.name, err.message));
@@ -1048,7 +1087,7 @@ async function fulfil(order) {
   } else {
     await update(domainKey(order.domain), {
       status: order.action === 'register' ? 'registering' : 'transferring',
-      registrar: 'dna', registrarEnv, ...(order.action === 'register' ? { dnsProvider: 'dna' } : {}),
+      registrar: 'dna', registrarEnv, ...(order.action === 'register' ? await dnsFor(order, registrarEnv) : {}),
       operationId, orderId: order.orderId, paidAt: now(), contact: order.contact,
       stripeCustomerId: order.stripeCustomerId, paymentMethodId: order.paymentMethodId,
       ...(reconcile ? { operationMessage: 'The registry is confirming this order.' } : {}),
@@ -1062,6 +1101,14 @@ async function fulfil(order) {
       console.error('immediate follow-up failed', order.domain, err.code || err.name, err.message);
     }
   }
+}
+
+// Which DNS a new registration ended up on: its Lyrcloud site's zone, or DNA's.
+async function dnsFor(order, registrarEnv) {
+  const site = registrarEnv === 'live' ? await sites.getSite(order.domain) : null;
+  return site && site.ownerId === order.ownerId && site.source === 'registered'
+    ? { dnsProvider: 'route53', hostedZoneId: site.zoneId, nameservers: site.nameservers }
+    : { dnsProvider: 'dna' };
 }
 
 async function onCheckoutCompleted(session) {
@@ -1219,12 +1266,14 @@ async function chargeRenewal(item) {
 }
 
 export async function tick() {
-  const items = await collect(ScanCommand, { FilterExpression: '#k IN (:d, :s)', ExpressionAttributeNames: { '#k': 'kind' }, ExpressionAttributeValues: { ':d': 'domain', ':s': 'subdomain' } });
+  const items = await collect(ScanCommand, { FilterExpression: '#k IN (:d, :s, :w)', ExpressionAttributeNames: { '#k': 'kind' }, ExpressionAttributeValues: { ':d': 'domain', ':s': 'subdomain', ':w': 'site' } });
   const day = 86_400_000;
   await pool(items, 2, async (item) => {
     try {
       if (item.kind === 'subdomain') {
         await subdomainTick(item);
+      } else if (item.kind === 'site') {
+        await sites.tickSite(item);
       } else if (item.registrar !== 'dna' && item.status !== 'awaiting_payment') {
         // Bought from Route 53 before the switch to DNA: no automatic follow-up or renewal charges.
       } else if ((['registering', 'transferring'].includes(item.status) && item.operationId) || (item.renewing && item.renewOperationId)) {

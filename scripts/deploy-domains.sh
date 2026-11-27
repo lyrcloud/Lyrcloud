@@ -14,7 +14,7 @@ STACK="${STACK:-lyrcloud-domains}"
 SUBDOMAIN_ZONE="${SUBDOMAIN_ZONE:-lyr.cloud}"
 ARTIFACTS_BUCKET="${ARTIFACTS_BUCKET:-lyrcloud-deploy-artifacts}"
 
-node --test api/domains/rules.test.mjs api/domains/lyrdns.test.mjs api/domains/lyrca.test.mjs api/domains/handler.test.mjs
+node --test api/domains/rules.test.mjs api/domains/lyrdns.test.mjs api/domains/lyrca.test.mjs api/domains/handler.test.mjs api/domains/sites.test.mjs
 
 param() {
   aws cloudformation describe-stacks --stack-name lyrcloud-account-api \
@@ -33,13 +33,21 @@ else
   echo "name.$SUBDOMAIN_ZONE subdomains are on (hosted zone $zone_id)."
 fi
 
+# The CDN for sites (scripts/deploy-sites.sh); blank IDs keep it switched off.
+sites_output() {
+  aws cloudformation describe-stacks --stack-name lyrcloud-sites --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue | [0]" --output text 2>/dev/null || true
+}
+proxy_dist="$(sites_output ProxyDistributionId)"; [[ "$proxy_dist" == None ]] && proxy_dist=""
+function_dist="$(sites_output FunctionDistributionId)"; [[ "$function_dist" == None ]] && function_dist=""
+[[ -n "$proxy_dist" ]] && echo "CDN for sites is on (proxy $proxy_dist, functions $function_dist)." || echo "No lyrcloud-sites stack: the CDN for sites stays off."
+
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 python3 - "$work/code.zip" <<'PY'
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED) as z:
-    for name in ['index', 'rules', 'lyrdns', 'lyrca', 'dna']:
+    for name in ['index', 'rules', 'lyrdns', 'lyrca', 'dna', 'sites']:
         z.write(f'api/domains/{name}.mjs', f'domains/{name}.mjs')
     for name in ['roles', 'phone']:
         z.write(f'api/account/{name}.mjs', f'account/{name}.mjs')
@@ -53,7 +61,8 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_IAM \
   --no-fail-on-empty-changeset \
   --parameter-overrides "LambdaCodeS3Key=$key" "ArtifactsBucketName=$ARTIFACTS_BUCKET" "UserPoolId=$pool" "UserPoolClientId=$client" \
-    "SubdomainZone=$sub_zone" "SubdomainZoneId=$zone_id"
+    "SubdomainZone=$sub_zone" "SubdomainZoneId=$zone_id" \
+    "ProxyDistributionId=$proxy_dist" "FunctionDistributionId=$function_dist"
 
 if [[ -n "${DNA_API_KEY:-}" && -n "${DNA_RESELLER_ID:-}" ]]; then
   # Read from the environment by Python, so the keys never appear in a command line or the shell history.

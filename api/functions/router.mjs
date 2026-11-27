@@ -12,7 +12,7 @@ import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-sec
 import {
   ACCESS_HEADER, cookieValue, isProtected, REQUEST_SECONDS, safeReturn, SESSION_COOKIE, SESSION_SECONDS, sign, TICKET_SECONDS, verify,
 } from './access.mjs';
-import { CACHE_MAX_BODY, CACHE_MAX_SECONDS, FUNCTIONS_DOMAIN_DEFAULT, lambdaName, nameFromHost } from './rules.mjs';
+import { CACHE_MAX_BODY, CACHE_MAX_SECONDS, FUNCTIONS_DOMAIN_DEFAULT, fromCdn, lambdaName, nameFromHost } from './rules.mjs';
 import {
   CHALLENGE_SECONDS, challengePage, HUMAN_COOKIE, HUMAN_SECONDS, ipMatches, looksAutomated, solves, underPath, wafMatch, withSecureHeaders,
 } from './security.mjs';
@@ -219,15 +219,28 @@ async function acceptTicket(event, name) {
   return redirect(safeReturn(ticket.ret), [sessionCookie(session, SESSION_SECONDS)]);
 }
 
-export const handler = async (event) => {
-  const name = nameFromHost(event.requestContext?.domainName || event.headers?.host, DOMAIN);
+// The router's own function URL is only for the Lyrcloud CDN (a customer's domain pointed at a function).
+const viaFunctionUrl = (event) => /\.lambda-url\./.test(String(event.requestContext?.domainName || ''));
+
+export const handler = async (incoming) => {
+  let event = incoming;
+  let name;
+  const cdn = viaFunctionUrl(incoming);
+  if (cdn) {
+    const routed = fromCdn(incoming, await platformSecret());
+    if (!routed) return page(404, 'Not found', 'There’s no Lyrcloud function at this address.');
+    ({ name, event } = routed);
+  } else {
+    name = nameFromHost(event.requestContext?.domainName || event.headers?.host, DOMAIN);
+  }
   if (!name) return page(404, 'Not found', 'There’s no Lyrcloud function at this address.');
   const path = event.rawPath || '/';
 
-  // Nobody outside Lyrcloud may claim to be a signed-in visitor.
+  // Nobody outside Lyrcloud may claim to be a signed-in visitor, or claim CloudFront's viewer details.
   const headers = {};
   for (const [key, value] of Object.entries(event.headers || {})) {
-    if (!key.toLowerCase().startsWith('lyr-access-')) headers[key] = value;
+    const lower = key.toLowerCase();
+    if (!lower.startsWith('lyr-access-') && (cdn || !lower.startsWith('cloudfront-viewer-'))) headers[key] = value;
   }
   const forwarded = { ...event, headers };
 

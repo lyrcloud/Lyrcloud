@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Lyrcloud CDN for customer domains. Two multi-tenant CloudFront distributions; every customer domain is a
+  distribution tenant on one of them, with a CloudFront-managed (free, auto-renewing) ACM certificate and
+  AWS Shield Standard. The domains API (api/domains/sites.mjs) creates and removes the tenants.
+    - Proxy: the tenant's "origin" parameter is the customer's own HTTPS server. Host is forwarded, so the
+      origin keeps serving the site under its own name and certificate.
+    - Function: a Lyrcloud Edge Function. The origin is the functions router's URL, the tenant's "fn"
+      parameter becomes the origin path, and a secret header proves the request came through CloudFront.
+  Both cache only what the origin marks cacheable (Cache-Control), and always redirect HTTP to HTTPS.
+
+Parameters:
+  RouterUrlHost:
+    Type: String
+    Description: Host of the functions router's Lambda function URL (lyrcloud-functions output RouterUrl).
+  OriginSecret:
+    Type: String
+    NoEcho: true
+    Description: The router's CDN origin secret (cdnOriginSecret in api/functions/rules.mjs).
+
+Resources:
+  # Copies the visitor's host and IP into headers, because the router's URL needs its own Host header.
+  ViewerFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: lyrcloud-sites-viewer
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Copy the visitor's host and IP for the functions router
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var host = request.headers.host ? request.headers.host.value : '';
+          request.headers['x-lyr-host'] = { value: host };
+          request.headers['x-lyr-viewer-ip'] = { value: event.viewer.ip };
+          return request;
+        }
+
+  # Like UseOriginCacheControlHeaders-QueryStrings, but keyed by the visitor's host (x-lyr-host) instead of
+  # Host, which must stay the router URL's own.
+  FunctionCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: lyrcloud-sites-function-cache
+        Comment: Origin Cache-Control decides; keyed by visitor host and query string
+        DefaultTTL: 0
+        MinTTL: 0
+        MaxTTL: 31536000
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          HeadersConfig:
+            HeaderBehavior: whitelist
+            Headers: [x-lyr-host, origin]
+          CookiesConfig:
+            CookieBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: all
+
+  ProxyDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: Lyrcloud CDN - customer origins
+        ConnectionMode: tenant-only
+        Enabled: true
+        HttpVersion: http2and3
+        TenantConfig:
+          ParameterDefinitions:
+            - Name: origin
+              Definition:
+                StringSchema:
+                  Required: true
+                  Comment: Host name of the customer's HTTPS origin server
+        Origins:
+          - Id: customer
+            DomainName: '{{origin}}'
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              HTTPSPort: 443
+              HTTPPort: 80
+              OriginReadTimeout: 30
+        DefaultCacheBehavior:
+          TargetOriginId: customer
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 4cc15a8a-d715-48a4-82b8-cc0b614638fe # UseOriginCacheControlHeaders-QueryStrings
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3 # Managed-AllViewer
+        # Each tenant brings its own certificate; the distribution only sets how it's served.
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+
+  FunctionDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: Lyrcloud CDN - Edge Functions
+        ConnectionMode: tenant-only
+        Enabled: true
+        HttpVersion: http2and3
+        TenantConfig:
+          ParameterDefinitions:
+            - Name: fn
+              Definition:
+                StringSchema:
+                  Required: true
+                  Comment: The Edge Function that serves this domain
+        Origins:
+          - Id: router
+            DomainName: !Ref RouterUrlHost
+            OriginPath: '/{{fn}}'
+            OriginCustomHeaders:
+              - HeaderName: x-lyr-origin-secret
+                HeaderValue: !Ref OriginSecret
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              HTTPSPort: 443
+              HTTPPort: 80
+              OriginReadTimeout: 30
+        DefaultCacheBehavior:
+          TargetOriginId: router
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: !Ref FunctionCachePolicy
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # Managed-AllViewerExceptHostHeader
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt ViewerFunction.FunctionMetadata.FunctionARN
+        # Each tenant brings its own certificate; the distribution only sets how it's served.
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+
+Outputs:
+  ProxyDistributionId:
+    Value: !Ref ProxyDistribution
+  FunctionDistributionId:
+    Value: !Ref FunctionDistribution

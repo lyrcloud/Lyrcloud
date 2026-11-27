@@ -258,9 +258,11 @@ export function toRequest(event) {
     body: hasBody ? (event.isBase64Encoded ? Buffer.from(event.body, 'base64') : event.body) : undefined,
     duplex: 'half',
   });
-  // Lyrcloud's .lyr addresses are served without a CDN in front, so only the visitor's IP is known.
+  // On .lyr addresses only the visitor's IP is known; through the Lyrcloud CDN (a customer's own domain)
+  // CloudFront adds the viewer's location. The router drops these headers from anyone else.
+  const viewer = (key) => event.headers?.[`cloudfront-viewer-${key}`] || null;
   Object.defineProperty(request, 'geo', {
-    value: Object.freeze({ ip: event.requestContext?.http?.sourceIp || null, city: null, region: null, country: null }),
+    value: Object.freeze({ ip: event.requestContext?.http?.sourceIp || null, city: viewer('city'), region: viewer('country-region'), country: viewer('country') }),
     enumerable: true,
   });
   return request;

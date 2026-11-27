@@ -39,6 +39,17 @@ Parameters:
     Type: String
     Default: ''
     Description: The Route 53 hosted zone ID of SubdomainZone.
+  FunctionsTableName:
+    Type: String
+    Default: lyrcloud-functions
+  ProxyDistributionId:
+    Type: String
+    Default: ''
+    Description: The lyrcloud-sites proxy distribution. Blank keeps the CDN for sites switched off.
+  FunctionDistributionId:
+    Type: String
+    Default: ''
+    Description: The lyrcloud-sites Edge Functions distribution.
 
 Resources:
   DomainsTable:
@@ -129,8 +140,36 @@ Resources:
               # Route 53 hosts the name.lyr.cloud zone and the zones of domains bought before the switch
               # to DNA. The API only edits a zone stored on a domain or subdomain the caller owns.
               - Effect: Allow
-                Action: [route53:ListResourceRecordSets, route53:ChangeResourceRecordSets, route53:GetHostedZone]
+                Action: [route53:ListResourceRecordSets, route53:ChangeResourceRecordSets, route53:GetHostedZone, route53:DeleteHostedZone]
                 Resource: 'arn:aws:route53:::hostedzone/*'
+              # Sites (sites.mjs): a zone per customer domain on one shared delegation set.
+              - Effect: Allow
+                Action: [route53:CreateHostedZone, route53:CreateReusableDelegationSet, route53:ListReusableDelegationSets, route53:GetReusableDelegationSet]
+                Resource: '*'
+              # The CDN: ACM certificates for customer domains, and tenants on the two sites distributions.
+              - Effect: Allow
+                Action: [acm:RequestCertificate, acm:DescribeCertificate, acm:DeleteCertificate, acm:AddTagsToCertificate]
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudfront:CreateDistributionTenant
+                  - cloudfront:GetDistributionTenant
+                  - cloudfront:UpdateDistributionTenant
+                  - cloudfront:DeleteDistributionTenant
+                  - cloudfront:CreateInvalidationForDistributionTenant
+                  - cloudfront:TagResource
+                  - cloudfront:ListConnectionGroups
+                  - cloudfront:GetConnectionGroup
+                  - cloudfront:GetDistribution
+                Resource: '*'
+              # A tenant's certificate must be readable by CloudFront through the caller.
+              - Effect: Allow
+                Action: [acm:ListCertificates]
+                Resource: '*'
+              # An Edge Function behind a site must be the site owner's; purges bump its router cache.
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${FunctionsTableName}'
 
   DomainsFunction:
     Type: AWS::Lambda::Function
@@ -154,6 +193,9 @@ Resources:
           ALLOWED_ORIGINS: !Join [',', !Ref AllowedOrigins]
           SUBDOMAIN_ZONE: !Ref SubdomainZone
           SUBDOMAIN_ZONE_ID: !Ref SubdomainZoneId
+          FUNCTIONS_TABLE_NAME: !Ref FunctionsTableName
+          PROXY_DISTRIBUTION_ID: !Ref ProxyDistributionId
+          FUNCTION_DISTRIBUTION_ID: !Ref FunctionDistributionId
       Code:
         S3Bucket: !Ref ArtifactsBucketName
         S3Key: !Ref LambdaCodeS3Key

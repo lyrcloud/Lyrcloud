@@ -500,7 +500,33 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${IngressApi}/*'
 
+  # The origin for customer domains on the Lyrcloud CDN (infra/aws/sites.yml). Public, but the router answers
+  # it only when CloudFront's secret origin header is present; the function comes from the origin path.
+  RouterUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt RouterFunction.Arn
+      AuthType: NONE
+
+  RouterUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !Ref RouterFunction
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  RouterUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RouterFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
 Outputs:
+  RouterUrl:
+    Value: !GetAtt RouterUrl.FunctionUrl
   FunctionsApiBaseUrl:
     Value: !GetAtt ControlApi.ApiEndpoint
   IngressApiId:

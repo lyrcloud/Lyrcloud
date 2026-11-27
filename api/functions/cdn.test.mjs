@@ -189,3 +189,43 @@ test('purges: one path, a prefix, or everything', async () => {
   // Only the owner may purge.
   assert.equal((await api({ requestContext: { http: { method: 'POST', path: '/functions/blog/purge' }, authorizer: { jwt: { claims: { sub: 'someone' } } } } })).statusCode, 404);
 });
+
+// ---------------------------------------------------------------- customer domains through the CDN
+
+const { cdnOriginSecret, viewerIp } = await import('./rules.mjs');
+const URL_HOST = 'abc123.lambda-url.us-east-1.on.aws';
+const viaCdn = (rawPath, headers = {}) => router.handler({
+  rawPath, rawQueryString: '', headers: { host: URL_HOST, ...headers }, requestContext: { domainName: URL_HOST, http: { method: 'GET', sourceIp: '130.176.0.1' } },
+});
+
+test('the router URL answers only CloudFront, and maps the origin path and host back', async () => {
+  let seen;
+  answer = () => ({ statusCode: 200, headers: {}, body: 'ok' });
+  LambdaClient.prototype.send = async function send(command) {
+    invocations += 1;
+    seen = JSON.parse(Buffer.from(command.input.Payload).toString());
+    return { Payload: Buffer.from(JSON.stringify(answer())) };
+  };
+  // No secret, a wrong one, or no function name: nothing runs.
+  assert.equal((await viaCdn('/blog/about')).statusCode, 404);
+  assert.equal((await viaCdn('/blog/about', { 'x-lyr-origin-secret': 'nope', 'x-lyr-host': 'shop.example.com' })).statusCode, 404);
+  assert.equal((await viaCdn('/', { 'x-lyr-origin-secret': cdnOriginSecret('test-secret'), 'x-lyr-host': 'shop.example.com' })).statusCode, 404);
+  assert.equal(invocations, 0);
+
+  const res = await viaCdn('/blog/about', {
+    'x-lyr-origin-secret': cdnOriginSecret('test-secret'), 'x-lyr-host': 'Shop.Example.com',
+    'x-lyr-viewer-ip': '2001:db8::7', 'cloudfront-viewer-country': 'TR',
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(seen.rawPath, '/about');
+  assert.equal(seen.headers.host, 'shop.example.com');
+  assert.equal(seen.requestContext.domainName, 'shop.example.com');
+  assert.equal(seen.requestContext.http.sourceIp, '2001:db8::7');
+  assert.equal(seen.headers['cloudfront-viewer-country'], 'TR');
+  assert.equal(seen.headers['x-lyr-origin-secret'], undefined);
+
+  // On a .lyr address nobody may pretend to be CloudFront.
+  await visit('/x', { headers: { 'cloudfront-viewer-country': 'US' } });
+  assert.equal(seen.headers['cloudfront-viewer-country'], undefined);
+  assert.equal(viewerIp('203.0.113.9:51234'), '203.0.113.9');
+});

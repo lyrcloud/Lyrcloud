@@ -1,3 +1,4 @@
+import { createHmac, timingSafeEqual } from 'node:crypto';
 // Edge Functions: the pure rules (names, plan limits, code and variable checks). index.mjs does the AWS work.
 
 export const FUNCTIONS_DOMAIN_DEFAULT = 'dev.lyr';
@@ -95,6 +96,42 @@ export function nameFromHost(host, domain = FUNCTIONS_DOMAIN_DEFAULT) {
   if (!clean.endsWith(`.${domain}`)) return null;
   const name = clean.slice(0, -(domain.length + 1));
   return NAME_RE.test(name) ? name : null;
+}
+
+// The secret header CloudFront sends with every request to the router through the Lyrcloud CDN (customer
+// domains, infra/aws/sites.yml). Derived from the platform secret, so nothing else needs storing.
+export const cdnOriginSecret = (platformSecret) => createHmac('sha256', platformSecret).update('lyr-cdn-origin').digest('hex');
+
+// CloudFront-Viewer-Address is "ip:port" (IPv6 unbracketed): the address without its port.
+export const viewerIp = (address) => {
+  const raw = String(address || '');
+  const cut = raw.lastIndexOf(':');
+  return cut > 0 ? raw.slice(0, cut) : raw;
+};
+
+// A CDN request: the tenant's origin path puts the function's name first ("/<name>/rest"), and the
+// viewer-request function copies the visitor's host and IP into x-lyr-host and x-lyr-viewer-ip. Returns the request as if it had
+// come to the function's own address, or null if it isn't a valid CDN request.
+export function fromCdn(event, secret) {
+  const headers = event.headers || {};
+  const given = Buffer.from(String(headers['x-lyr-origin-secret'] || ''));
+  const expected = Buffer.from(cdnOriginSecret(secret));
+  if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
+  const [, name = '', ...rest] = String(event.rawPath || '/').split('/');
+  const host = String(headers['x-lyr-host'] || '').toLowerCase();
+  if (!NAME_RE.test(name) || !host) return null;
+  const clean = {};
+  for (const [key, value] of Object.entries(headers)) if (!key.toLowerCase().startsWith('x-lyr-')) clean[key] = value;
+  clean.host = host;
+  const ip = String(headers['x-lyr-viewer-ip'] || '') || viewerIp(headers['cloudfront-viewer-address']);
+  const context = event.requestContext || {};
+  return {
+    name,
+    event: {
+      ...event, headers: clean, rawPath: `/${rest.join('/')}`,
+      requestContext: { ...context, domainName: host, http: { ...(context.http || {}), path: `/${rest.join('/')}`, ...(ip ? { sourceIp: ip } : {}) } },
+    },
+  };
 }
 
 // The certificate is renewed when it has less than this long left (it's issued for 90 days).
