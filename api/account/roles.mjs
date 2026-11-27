@@ -88,6 +88,8 @@ export function selfUpdateError(changes) {
   const unknown = keys.find((key) => !SELF_FIELDS.includes(key));
   if (unknown) return [400, `Unknown field "${unknown}".`];
   if ('plan' in changes && !PLANS.includes(changes.plan)) return [400, `Plan must be one of ${PLANS.join(', ')}.`];
+  // Paid plans are bought with Lyrpay (domains API, plans.mjs) or set by staff; anyone can go back to Launch.
+  if ('plan' in changes && changes.plan !== DEFAULT_PLAN) return [402, 'Upgrade on the Plans page: Scale is paid with Lyrpay, Enterprise through Contact sales.'];
   if ('name' in changes) {
     const name = typeof changes.name === 'string' ? changes.name.trim() : '';
     if (!name || name.length > 120) return [400, 'Name must be 1 to 120 characters.'];

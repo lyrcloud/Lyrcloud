@@ -87,6 +87,7 @@ test('profile photos: uploads win, "initials" hides the photo, otherwise the pro
   assert.equal(selfUpdateError({ avatar: upload }), null);
   assert.equal(selfUpdateError({ avatar: 'data:image/svg+xml;base64,PHN2Zz4=' })?.[0], 400);
   assert.equal(selfUpdateError({ avatar: `data:image/jpeg;base64,${'A'.repeat(70_000)}` })?.[0], 400);
-  assert.equal(selfUpdateError({ plan: 'scale', name: 'Ada' }), null);
+  assert.equal(selfUpdateError({ plan: 'launch', name: 'Ada' }), null);
+  assert.equal(selfUpdateError({ plan: 'scale' })?.[0], 402); // paid plans are bought with Lyrpay
   assert.equal(selfUpdateError({ role: 'admin' })?.[0], 400);
 });

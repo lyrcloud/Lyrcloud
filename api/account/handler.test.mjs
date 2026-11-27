@@ -120,9 +120,10 @@ test('/me reports the super admin, the plan and the announcement', async () => {
   assert.equal(me.body.announcement, '');
 });
 
-test('anyone can change their own plan, and it sticks', async () => {
-  assert.equal((await call(USER, 'PUT', '/me', { plan: 'scale' })).body.plan, 'scale');
-  assert.equal((await call(USER, 'GET', '/me')).body.plan, 'scale');
+test('people can go back to Launch themselves, but paid plans are bought with Lyrpay', async () => {
+  assert.equal((await call(USER, 'PUT', '/me', { plan: 'scale' })).status, 402);
+  assert.equal((await call(USER, 'PUT', '/me', { plan: 'launch' })).body.plan, 'launch');
+  assert.equal((await call(USER, 'GET', '/me')).body.plan, 'launch');
   assert.equal((await call(USER, 'PUT', '/me', { plan: 'gold' })).status, 400);
 });
 

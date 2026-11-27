@@ -5,6 +5,7 @@
 //   GET    /public/domains/prices            the price list for every TLD Lyrcloud sells
 //   POST   /public/stripe/webhook            Stripe events: payment done -> register/transfer/renew
 //   POST   /public/lyrpay/callback           Lyrpay: paid from a Lyrpay balance -> register/transfer/renew (lyrpay.mjs)
+//   GET|POST /domains/plan[/checkout|/orders/{id}/check]   Lyrcloud plans paid with Lyrpay (plans.mjs)
 //   GET    /domains                          your domains, your saved registrant contact, payments status
 //   POST   /domains/checkout                 { action, domain, years?, autoRenew?, contact?, authCode?, payWith? } -> Stripe
 //                                            URL, or the Lyrpay page with payWith: 'lyrpay'
@@ -71,6 +72,7 @@ import { isStaff, planFor, roleFor } from '../account/roles.mjs';
 import { createSites, SiteError } from './sites.mjs';
 import { issueCertificate, LEAF_DAYS, publicKeyFrom } from './lyrca.mjs';
 import * as lyrpay from './lyrpay.mjs';
+import { extendPlan, PAID_PLANS, PERIODS as PLAN_PERIODS, planLapsed, planOrderFrom, planPriceCents, planReference } from './plans.mjs';
 import {
   answerLyr,
   buildResponse,
@@ -1179,6 +1181,7 @@ async function onCheckoutExpired(session) {
 
 // A Lyrpay payment for an order was paid: claim the order once, then buy the domain (as onCheckoutCompleted does).
 async function onLyrpayPaid(payment) {
+  if (planOrderFrom(payment.reference)) return onPlanPaid(payment);
   const order = payment.reference && (await getItem(orderKey(payment.reference)));
   if (!order || order.sessionId !== payment.id || payment.status !== 'paid') return;
   if (lyrpay.paidCents(payment) !== order.amountCents || payment.currency !== 'USD') {
@@ -1224,6 +1227,118 @@ async function sweepLyrpayOrders() {
     }
   }
   return open.length;
+}
+
+// ---------------------------------------------------------------- plans paid with Lyrpay (plans.mjs)
+
+const planOrderKey = (id) => ({ pk: `planorder#${id}`, sk: 'planorder' });
+const planOrderOut = ({ pk, sk, ...o }) => o;
+
+async function onPlanPaid(payment) {
+  const order = await getItem(planOrderKey(planOrderFrom(payment.reference)));
+  if (!order || order.sessionId !== payment.id || payment.status !== 'paid') return;
+  if (lyrpay.paidCents(payment) !== order.amountCents || payment.currency !== 'USD') {
+    console.error('plan amount mismatch', order.orderId, payment.amount, payment.currency);
+    return;
+  }
+  try {
+    await update(planOrderKey(order.orderId), { status: 'paid', paidAt: now() }, [], ['#st = :open', { '#st': 'status' }, { ':open': 'open' }]);
+  } catch (err) {
+    if (isConditionFailure(err)) return;
+    throw err;
+  }
+  const profile = (await ddb.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId: order.userId } }))).Item || {};
+  await ddb.send(new UpdateCommand({
+    TableName: USERS_TABLE,
+    Key: { userId: order.userId },
+    UpdateExpression: 'SET #p = :p, planPaidThrough = :t, planSource = :s, planUpdatedAt = :now',
+    ExpressionAttributeNames: { '#p': 'plan' },
+    ExpressionAttributeValues: { ':p': order.plan, ':t': extendPlan(profile, order.plan, order.period), ':s': 'lyrpay', ':now': now() },
+  }));
+}
+
+async function planRoutes(event, method, path, who) {
+  if (path === '/domains/plan' && method === 'GET') {
+    const orders = (await itemsOf(who.userId)).filter((item) => item.kind === 'planorder');
+    return json(200, {
+      plan: who.plan,
+      planPaidThrough: who.profile.planPaidThrough || null,
+      planSource: who.profile.planSource || null,
+      prices: Object.fromEntries(Object.keys(PAID_PLANS).map((id) => [id, { month: planPriceCents(id, 'month'), year: planPriceCents(id, 'year') }])),
+      lyrpayReady: lyrpay.usable(await getLyrpay()),
+      orders: orders.map(planOrderOut).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, 20),
+    });
+  }
+  if (path === '/domains/plan/checkout' && method === 'POST') {
+    const body = parseBody(event);
+    const plan = body?.plan;
+    const period = PLAN_PERIODS[body?.period] ? body.period : null;
+    const amountCents = period && planPriceCents(plan, period);
+    if (!amountCents) return error(400, 'Choose Scale, monthly or yearly.');
+    if (who.plan === 'enterprise') return error(409, 'You’re on Enterprise already.');
+    const keys = await getLyrpay();
+    if (!lyrpay.usable(keys)) return error(503, 'Pay with Lyrpay isn’t switched on yet.');
+    const orderId = randomUUID();
+    const back = `${SITE_URL}/dash/#/plans`;
+    let payment;
+    try {
+      payment = await lyrpay.openPayment(keys, {
+        orderId: planReference(orderId), amountCents,
+        title: `Lyrcloud ${PAID_PLANS[plan].name} plan, ${period === 'year' ? '1 year' : '1 month'}`,
+        returnUrl: `${back}?order=${orderId}`, cancelUrl: back,
+        metadata: { kind: 'plan', plan, period }, email: who.email,
+      });
+    } catch (err) {
+      if (err instanceof lyrpay.LyrpayError) return error(502, `Lyrpay: ${err.message}`);
+      throw err;
+    }
+    await ddb.send(new PutCommand({ TableName: TABLE, Item: { ...planOrderKey(orderId), kind: 'planorder', orderId, ownerId: who.userId, userId: who.userId, plan, period, amountCents, status: 'open', sessionId: payment.id, createdAt: now() } }));
+    return json(201, { url: payment.url, orderId });
+  }
+  const check = path.match(/^\/domains\/plan\/orders\/([a-f0-9-]{8,40})\/check$/);
+  if (check && method === 'POST') {
+    const order = await getItem(planOrderKey(check[1]));
+    if (!order || order.userId !== who.userId) return error(404, 'Order not found.');
+    if (order.status === 'open') {
+      const payment = await lyrpay.getPayment(await getLyrpay(), order.sessionId).catch(() => null);
+      if (payment?.status === 'paid') await onLyrpayPaid(payment);
+      else if (payment && ['expired', 'cancelled'].includes(payment.status)) await update(planOrderKey(order.orderId), { status: 'failed' }, [], ['#st = :open', { '#st': 'status' }, { ':open': 'open' }]).catch(() => {});
+    }
+    const fresh = await getItem(planOrderKey(check[1]));
+    const profile = (await ddb.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId: who.userId } }))).Item || {};
+    return json(200, { order: planOrderOut(fresh), plan: profile.plan || 'launch', planPaidThrough: profile.planPaidThrough || null });
+  }
+  return error(404, 'not_found');
+}
+
+// Scheduled: open plan orders whose callback was missed, and Lyrpay plans that ran out.
+async function sweepPlans() {
+  const keys = await getLyrpay();
+  if (lyrpay.usable(keys)) {
+    const cutoff = new Date(Date.now() - 35 * 60_000).toISOString();
+    const open = (await collect(ScanCommand, {
+      FilterExpression: '#k = :k AND #s = :open',
+      ExpressionAttributeNames: { '#k': 'kind', '#s': 'status' },
+      ExpressionAttributeValues: { ':k': 'planorder', ':open': 'open' },
+    })).filter((order) => order.createdAt < cutoff);
+    for (const order of open) {
+      const payment = await lyrpay.getPayment(keys, order.sessionId).catch(() => null);
+      if (payment?.status === 'paid') await onLyrpayPaid(payment);
+      else if (payment && ['expired', 'cancelled'].includes(payment.status)) await update(planOrderKey(order.orderId), { status: 'failed' }, [], ['#st = :open', { '#st': 'status' }, { ':open': 'open' }]).catch(() => {});
+    }
+  }
+  let lapsed = 0;
+  let ExclusiveStartKey;
+  do {
+    const page = await ddb.send(new ScanCommand({ TableName: USERS_TABLE, FilterExpression: 'planSource = :l', ExpressionAttributeValues: { ':l': 'lyrpay' }, ExclusiveStartKey }));
+    for (const profile of page.Items || []) {
+      if (!planLapsed(profile)) continue;
+      await ddb.send(new UpdateCommand({ TableName: USERS_TABLE, Key: { userId: profile.userId }, UpdateExpression: 'SET #p = :launch, planUpdatedAt = :now', ExpressionAttributeNames: { '#p': 'plan' }, ExpressionAttributeValues: { ':launch': 'launch', ':now': now() } }));
+      lapsed += 1;
+    }
+    ExclusiveStartKey = page.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  return lapsed;
 }
 
 async function stripeWebhook(event) {
@@ -1370,7 +1485,8 @@ export async function tick() {
   });
   await checkRegistrarBalance().catch((err) => console.error('registrar balance check failed', err));
   const lyrpayOrders = await sweepLyrpayOrders().catch((err) => { console.error('Lyrpay sweep failed', err); return 0; });
-  return { checked: items.length, lyrpayOrders };
+  const lapsedPlans = await sweepPlans().catch((err) => { console.error('plan sweep failed', err); return 0; });
+  return { checked: items.length, lyrpayOrders, lapsedPlans };
 }
 
 
@@ -1997,6 +2113,7 @@ export const handler = async (event) => {
     if (!who) return error(401, 'unauthorized');
     if (who.profile.disabled === true && who.role !== 'superadmin') return error(403, 'This account has been disabled.');
     if (path.startsWith('/admin/')) return await adminRoutes(event, method, path, who);
+    if (path === '/domains/plan' || path.startsWith('/domains/plan/')) return await planRoutes(event, method, path, who);
     if (path === '/domains' || path.startsWith('/domains/')) return await domainRoutes(event, method, path, who);
     return error(404, 'not_found');
   } catch (err) {

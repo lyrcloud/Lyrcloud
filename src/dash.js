@@ -582,33 +582,54 @@ const views = {
         ${settingRow('Signed in with', 'Your identity provider.', '<span id="profile-provider" class="muted">Loading…</span>')}
         ${settingRow('Role', 'What you can manage in Lyrcloud.', '<span id="profile-role" class="muted">Loading…</span>')}
         ${settingRow('Member since', 'When your Lyrcloud account was created.', '<span id="profile-created" class="muted">Loading…</span>')}
-        ${settingRow('Plan', 'Your account plan, used for new websites. <a href="#/plans">Compare plans</a>', planSelect('account-plan', state.plan))}
+        ${settingRow('Plan', 'Your account plan, used for new websites.', `<a class="btn" href="#/plans">${esc(planName(state.plan))} · Change plan</a>`)}
         ${settingRow('Sign out', 'End your session in this browser.', '<button class="btn" data-action="sign-out">Sign out</button>')}
         ${settingRow('Reset preview data', 'Delete all websites and functions stored in this browser.', '<button class="btn danger" data-action="reset">Reset</button>')}
       </section>`;
   },
 
-  plans() {
+  plans(route) {
     const current = state.plan;
+    const pb = planBilling;
+    if (!pb.data && !pb.loading && !pb.error && DOMAINS_ENABLED) loadPlanBilling();
+    const order = route?.params?.get('order');
+    if (order && pb.data && !pb.checked.has(order)) checkPlanOrder(order);
+    const prices = pb.data?.prices?.scale;
+    const money = (cents) => `$${(cents / 100).toFixed(cents % 100 ? 2 : 0)}`;
     const cards = PLAN_IDS.map((id) => {
       const plan = PLAN_INFO[id];
       const isCurrent = id === current;
+      let price = plan.price;
+      if (id === 'scale' && prices) price = pb.period === 'year' ? `${money(prices.year)}/yr` : `${money(prices.month)}/mo`;
+      let action;
+      if (id === 'enterprise') action = isCurrent ? '<button class="btn" disabled>Your plan</button>' : '<a class="btn" href="/contact/">Contact sales</a>';
+      else if (id === 'launch') action = isCurrent ? '<button class="btn" disabled>Your plan</button>' : '<button class="btn" data-action="set-account-plan" data-plan="launch">Switch to Launch</button>';
+      else if (current === 'enterprise') action = '<button class="btn" disabled>Included in Enterprise</button>';
+      else if (!pb.data) action = `<button class="btn" disabled>${pb.error ? 'Payments unavailable' : 'Loading…'}</button>`;
+      else if (!pb.data.lyrpayReady) action = '<a class="btn" href="/contact/">Contact sales to upgrade</a>';
+      else action = `<button class="btn primary" data-action="plan-pay" data-plan="scale">${isCurrent ? 'Add time' : 'Upgrade'} · Pay with Lyrpay</button>`;
       return `
         <section class="panel plan-card${isCurrent ? ' is-current' : ''}">
           <div class="plan-card-head"><h2>${plan.name}</h2>${isCurrent ? '<span class="status ok">● Current plan</span>' : ''}</div>
-          <strong class="plan-price">${plan.price}</strong>
+          <strong class="plan-price">${price}</strong>
           <p class="muted">${plan.blurb}</p>
           <ul class="plan-features">${plan.features.map((feature) => `<li>${feature}</li>`).join('')}</ul>
-          ${isCurrent
-            ? '<button class="btn" disabled>Your plan</button>'
-            : `<button class="btn${PLAN_IDS.indexOf(id) > PLAN_IDS.indexOf(current) ? ' primary' : ''}" data-action="set-account-plan" data-plan="${id}">${PLAN_IDS.indexOf(id) > PLAN_IDS.indexOf(current) ? 'Upgrade' : 'Switch'} to ${plan.name}</button>`}
+          ${action}
         </section>`;
     }).join('');
+    const paidThrough = pb.data?.planPaidThrough && pb.data.planSource === 'lyrpay' ? new Date(pb.data.planPaidThrough) : null;
+    const orders = (pb.data?.orders || []).filter((o) => o.status !== 'open' || Date.now() - Date.parse(o.createdAt) < 3600e3);
     return `
-      ${pageHead('Plans', 'Your plan is saved to your Lyrcloud account.')}
+      ${pageHead('Plans', 'Pay for Scale from your Lyrpay balance, with the same Lyr account you sign in with.')}
       ${profileFailed ? '<p class="form-error">Couldn’t reach your account, so plan changes can’t be saved right now. Reload to try again.</p>' : ''}
+      <div class="row" role="group" aria-label="Billing period" style="gap:8px;margin-bottom:14px">
+        <button class="btn${pb.period === 'month' ? ' primary' : ''}" data-action="plan-period" data-period="month">Monthly</button>
+        <button class="btn${pb.period === 'year' ? ' primary' : ''}" data-action="plan-period" data-period="year">Yearly · 2 months free</button>
+      </div>
+      ${paidThrough ? `<p class="muted">Scale is paid through ${esc(paidThrough.toLocaleDateString())}. Paying again adds more time; it doesn’t renew by itself.</p>` : ''}
       <div class="grid-3 plan-grid">${cards}</div>
-      <p class="muted">Billing isn’t connected yet, so every plan is free during the preview.</p>`;
+      ${orders.length ? `<section class="panel"><div class="panel-head"><h2>Payments</h2></div><ul class="plain-list">${orders.map((o) => `<li>${esc(new Date(o.createdAt).toLocaleDateString())} · ${esc(planName(o.plan))} ${o.period === 'year' ? 'yearly' : 'monthly'} · ${money(o.amountCents)} · ${o.status === 'paid' ? 'Paid with Lyrpay' : o.status === 'open' ? `<button class="btn" data-action="plan-check" data-order="${esc(o.orderId)}">Check payment</button>` : 'Not paid'}</li>`).join('')}</ul></section>` : ''}
+      <p class="muted">No Lyrpay balance? You can add money by card on the Lyrpay payment page. Need software built or tools for your team? See <a href="https://lyrsoft.com/#plans">Lyrsoft plans</a>.</p>`;
   },
 
   users(route) {
@@ -3058,6 +3079,39 @@ async function adminAction(target, request, message) {
   }
 }
 
+// Plans paid with Lyrpay (domains API, api/domains/plans.mjs).
+const planBilling = { data: null, loading: false, error: '', period: 'month', checked: new Set() };
+async function loadPlanBilling() {
+  planBilling.loading = true;
+  try {
+    planBilling.data = await domainsApi('/domains/plan');
+    planBilling.error = '';
+  } catch (error) {
+    planBilling.error = error.message;
+  }
+  planBilling.loading = false;
+  render();
+}
+async function checkPlanOrder(orderId) {
+  planBilling.checked.add(orderId);
+  try {
+    const result = await domainsApi(`/domains/plan/orders/${encodeURIComponent(orderId)}/check`, { method: 'POST' });
+    if (result.order.status === 'paid') {
+      profile = { ...profile, plan: result.plan };
+      state.plan = result.plan;
+      save();
+      sites.list = null;
+      toast(`Thanks! You’re on the ${planName(result.plan)} plan.`);
+    } else if (result.order.status === 'open') toast('Payment not finished yet. If you paid, it shows up here in a minute.');
+    else toast('That payment didn’t go through. You can try again.');
+  } catch (error) {
+    toast(error.message);
+  }
+  history.replaceState(null, '', '#/plans');
+  planBilling.data = null;
+  loadPlanBilling();
+}
+
 async function setAccountPlan(plan) {
   try {
     profile = { ...profile, ...(await api('/me', { method: 'PUT', body: JSON.stringify({ plan }) })) };
@@ -3162,6 +3216,21 @@ const clickActions = {
     save();
     render();
   },
+  'plan-period': (target) => {
+    planBilling.period = target.dataset.period;
+    render();
+  },
+  'plan-pay': async (target) => {
+    target.disabled = true;
+    try {
+      const { url } = await domainsApi('/domains/plan/checkout', { method: 'POST', body: JSON.stringify({ plan: target.dataset.plan, period: planBilling.period }) });
+      location.href = url;
+    } catch (error) {
+      toast(error.message);
+      target.disabled = false;
+    }
+  },
+  'plan-check': (target) => checkPlanOrder(target.dataset.order),
   'set-account-plan': (target) => {
     target.disabled = true;
     setAccountPlan(target.dataset.plan);

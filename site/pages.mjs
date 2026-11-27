@@ -646,7 +646,8 @@ const comparison = [
 const faqs = [
   ['Is the Launch plan really free?', 'Yes. Launch is free forever for personal and hobby projects. You only pay when you upgrade.'],
   ['Do you charge for bandwidth?', 'No. CDN bandwidth and DDoS mitigation are unmetered on every plan.'],
-  ['Can I change plans later?', 'Anytime, from the dashboard. Upgrades take effect immediately and are prorated.'],
+  ['Can I change plans later?', 'Anytime, from the Plans page in the dashboard. Scale is paid from your Lyrpay balance (add money by card on the payment page) and starts at once. It doesn’t renew by itself: pay again to add more time.'],
+  ['How do I pay?', 'With Lyrpay, the Lyr wallet: the same account you sign in to Lyrcloud with. Domains can also be paid by card.'],
   ['Do you offer annual billing?', 'Yes — annual billing on Scale saves two months. Enterprise contracts are annual.'],
 ];
 
