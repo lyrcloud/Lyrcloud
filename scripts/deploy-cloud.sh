@@ -23,10 +23,18 @@ trap 'rm -rf "$work"' EXIT
 
 # Keeps the repo layout (api/cloud -> ../account, ../../src) so the same imports work locally and in Lambda.
 python3 - "$work/code.zip" <<'PY'
-import sys, zipfile
+import glob, os, re, sys, zipfile
+# Every module in api/cloud (not the tests) plus what they import, so a new file can't be left out.
+paths = sorted(p for p in glob.glob('api/cloud/*.mjs') if not p.endswith('.test.mjs'))
+paths += ['api/account/roles.mjs', 'api/account/phone.mjs', 'src/clouds.js', 'src/cloud-pricing.js']
+for path in paths:
+    for dep in re.findall(r"from '(\.{1,2}/[^']+)'", open(path).read()):
+        target = os.path.normpath(os.path.join(os.path.dirname(path), dep))
+        if target not in paths:
+            sys.exit(f'{path} imports {dep}, which is not packaged')
 with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED) as z:
     z.writestr('package.json', '{"type": "module"}\n')
-    for path in ['api/cloud/index.mjs', 'api/cloud/rules.mjs', 'api/account/roles.mjs', 'api/account/phone.mjs', 'src/clouds.js', 'src/cloud-pricing.js']:
+    for path in paths:
         z.write(path, path)
 PY
 key="cloud/$(sha256sum "$work/code.zip" | cut -d' ' -f1).zip"

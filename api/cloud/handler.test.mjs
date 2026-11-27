@@ -142,7 +142,7 @@ test('connecting needs the role to trust Lyrcloud with this customer’s Externa
 test('a Kubernetes cluster is built in the customer’s account, in EKS-capable zones', async () => {
   assert.equal((await call(ALICE, 'POST', '/cloud/clusters', { name: 'prod', provider: 'aws', region: 'us-east-1', kind: 'kubernetes', adminArn: ADMIN_ARN })).status, 409, 'not connected');
   await connect(ALICE);
-  assert.equal((await call(ALICE, 'POST', '/cloud/clusters', { name: 'prod', provider: 'azure', region: 'eastus', kind: 'kubernetes' })).status, 400);
+  assert.equal((await call(ALICE, 'POST', '/cloud/clusters', { name: 'prod', provider: 'azure', region: 'eastus', kind: 'kubernetes' })).status, 409, 'Azure not connected');
   assert.equal((await call(ALICE, 'POST', '/cloud/clusters', { name: 'prod', provider: 'aws', region: 'mars-1', kind: 'kubernetes' })).status, 400);
   assert.match((await call(ALICE, 'POST', '/cloud/clusters', { name: 'prod', provider: 'aws', region: 'us-east-1', kind: 'kubernetes' })).body.error, /administer/);
   const res = await call(ALICE, 'POST', '/cloud/clusters', { name: 'prod', provider: 'aws', region: 'us-east-1', kind: 'kubernetes', nodeType: 't3.large', nodes: 3, adminArn: ADMIN_ARN });

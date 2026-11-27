@@ -610,7 +610,7 @@ ${pageHero({
       <section class="section" id="cloud-regions">
         <div class="section-heading compact">
           <h2>Every major cloud, on one map</h2>
-          <p>${REGIONS.length} data center regions from ${PROVIDERS.length} providers. Connect your own cloud account and Lyrcloud builds Kubernetes or serverless container clusters in the region you pick — AWS today, the others next.</p>
+          <p>${REGIONS.length} data center regions from ${PROVIDERS.length} providers. Connect your own cloud account and Lyrcloud builds Kubernetes or serverless container clusters in the region you pick — on AWS, Google Cloud and Azure today, the others next.</p>
         </div>
         <div class="provider-filter" role="group" aria-label="Show providers">
           ${PROVIDERS.map((provider) => `<label class="provider-chip"><input type="checkbox" value="${provider.id}" checked /><i style="background:${provider.color}"></i>${provider.name} <small>${provider.regions.length}${provider.provisioning ? ' · clusters' : ''}</small></label>`).join('\n          ')}

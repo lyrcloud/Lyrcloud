@@ -48,7 +48,7 @@ export const PROVIDERS = [
     ],
   },
   {
-    id: 'azure', name: 'Azure', fullName: 'Microsoft Azure', color: '#0078d4', provisioning: false,
+    id: 'azure', name: 'Azure', fullName: 'Microsoft Azure', color: '#0078d4', provisioning: true,
     regions: [
     ['eastus', "Virginia", 'US', 37.4, -79.0],
     ['eastus2', "Virginia", 'US', 36.7, -78.4],
@@ -98,7 +98,7 @@ export const PROVIDERS = [
     ],
   },
   {
-    id: 'gcp', name: 'Google Cloud', fullName: 'Google Cloud', color: '#34a853', provisioning: false,
+    id: 'gcp', name: 'Google Cloud', fullName: 'Google Cloud', color: '#34a853', provisioning: true,
     regions: [
     ['us-east1', "South Carolina", 'US', 33.2, -80.0],
     ['us-east4', "N. Virginia", 'US', 39.0, -77.5],

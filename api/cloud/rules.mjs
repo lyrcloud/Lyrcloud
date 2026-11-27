@@ -2,6 +2,7 @@
 // Lyrcloud deploys into the customer's own AWS account (they own and pay for everything it creates).
 
 export const CLUSTER_KINDS = ['kubernetes', 'serverless'];
+export const PROVISIONED = ['aws', 'gcp', 'azure'];
 export const MAX_CLUSTERS = 5;
 export const MAX_SERVICES_PER_CLUSTER = 10;
 // The role customers create in their account (access-role template) and the prefix for everything
@@ -9,7 +10,7 @@ export const MAX_SERVICES_PER_CLUSTER = 10;
 export const ACCESS_ROLE_NAME = 'LyrcloudAccess';
 export const IAM_PREFIX = 'lyrcloud-';
 
-import { clusterEstimate, NODE_TYPES, serviceEstimate, SERVICE_SIZES } from '../../src/cloud-pricing.js';
+import { AKS_VM_SIZES, clusterEstimate, NODE_TYPES, serviceEstimate, SERVICE_SIZES } from '../../src/cloud-pricing.js';
 
 export { clusterEstimate, NODE_TYPES, serviceEstimate, SERVICE_SIZES };
 // Availability zones where EKS can't place a control plane (by zone ID, the same in every account).
@@ -37,10 +38,15 @@ const PRINCIPAL_RE = /^arn:aws:(iam|sts)::\d{12}:(user|role|assumed-role)\/[\w+=
 export function clusterError(body, region) {
   if (!body || typeof body !== 'object') return [400, 'Invalid JSON body.'];
   if (!cleanName(body.name)) return [400, 'Name the cluster with 3–32 lowercase letters, digits and hyphens, starting with a letter.'];
-  if (body.provider !== 'aws') return [400, 'Only AWS clusters can be created right now.'];
-  if (!region || region.provider !== 'aws') return [400, 'Pick an AWS region.'];
+  if (!PROVISIONED.includes(body.provider)) return [400, 'Clusters can be created on AWS, Google Cloud and Azure.'];
+  if (!region || region.provider !== body.provider) return [400, 'Pick a region of that cloud.'];
   if (!CLUSTER_KINDS.includes(body.kind)) return [400, 'Kind must be kubernetes or serverless.'];
-  if (body.kind === 'kubernetes') {
+  if (body.kind === 'kubernetes' && body.provider === 'azure') {
+    if (!AKS_VM_SIZES[body.nodeType || 'Standard_B2s']) return [400, `Node size must be one of ${Object.keys(AKS_VM_SIZES).join(', ')}.`];
+    const nodes = body.nodes ?? 2;
+    if (!Number.isInteger(nodes) || nodes < 1 || nodes > 20) return [400, 'Use 1 to 20 nodes.'];
+  }
+  if (body.kind === 'kubernetes' && body.provider === 'aws') {
     if (!NODE_TYPES[body.nodeType || 't3.medium']) return [400, `Node type must be one of ${Object.keys(NODE_TYPES).join(', ')}.`];
     const nodes = body.nodes ?? 2;
     if (!Number.isInteger(nodes) || nodes < 1 || nodes > 20) return [400, 'Use 1 to 20 worker nodes.'];

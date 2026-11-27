@@ -4,7 +4,7 @@
 // preview kept in localStorage; real functions are deployed with the lyrcloud CLI.
 import { authFetch, CLOUD_API_BASE, DOMAINS_API_BASE, FUNCTIONS_API_BASE, PROJECTS_API_BASE, redirectToLogin, SITES_DOMAIN } from './auth.js';
 import { worldMapSvg } from './cloud-map.js';
-import { clusterEstimate, NODE_TYPES, serviceEstimate, SERVICE_SIZES } from './cloud-pricing.js';
+import { clusterEstimate, defaultNodeType, nodeTypesFor, serviceEstimate, SERVICE_SIZES } from './cloud-pricing.js';
 import { CATALOG_DATE, CONTINENT_NAMES, continentOf, findRegion, PROVIDERS, REGIONS } from './clouds.js';
 import { avatarHtml, cacheProfile, imageFileToAvatar } from './avatar.js';
 import { logo } from './logo.js';
@@ -2537,12 +2537,96 @@ function cloudAfterRender(route) {
   updateClusterEstimate();
 }
 
-function regionOptions() {
-  const aws = REGIONS.filter((region) => region.provider === 'aws');
+const DEFAULT_REGION = { aws: 'us-east-1', gcp: 'us-central1', azure: 'eastus' };
+const CLOUD_NAMES = { aws: 'AWS', gcp: 'Google Cloud', azure: 'Azure' };
+const CLOUD_KINDS = {
+  aws: { serverless: ['Serverless containers', 'ECS on Fargate. Pay only for running containers; Lyrcloud deploys your images with a load balancer.'], kubernetes: ['Kubernetes', 'Amazon EKS with worker nodes. Full Kubernetes; you deploy with kubectl or Helm.'] },
+  gcp: { serverless: ['Serverless containers', 'Cloud Run. Scales to zero, HTTPS address included; Lyrcloud deploys your images.'], kubernetes: ['Kubernetes', 'GKE Autopilot. Google runs the nodes and bills per pod; deploy with kubectl or Helm.'] },
+  azure: { serverless: ['Serverless containers', 'Azure Container Apps. Scales to zero, HTTPS address included; Lyrcloud deploys your images.'], kubernetes: ['Kubernetes', 'AKS with a node pool you size. Deploy with kubectl or Helm.'] },
+};
+
+function regionOptions(provider = 'aws') {
+  const list = REGIONS.filter((region) => region.provider === provider);
   return CONTINENT_NAMES.map((continent) => {
-    const here = aws.filter((region) => continentOf(region.country) === continent);
-    return here.length ? `<optgroup label="${esc(continent)}">${here.map((region) => `<option value="${region.code}"${region.code === 'us-east-1' ? ' selected' : ''}>${esc(region.city)} (${region.code})${region.optIn ? ' · opt-in' : ''}</option>`).join('')}</optgroup>` : '';
+    const here = list.filter((region) => continentOf(region.country) === continent);
+    return here.length ? `<optgroup label="${esc(continent)}">${here.map((region) => `<option value="${region.code}"${region.code === DEFAULT_REGION[provider] ? ' selected' : ''}>${esc(region.city)} (${region.code})${region.optIn ? ' · opt-in' : ''}</option>`).join('')}</optgroup>` : '';
   }).join('');
+}
+
+const nodeOptions = (provider) => Object.entries(nodeTypesFor(provider)).map(([type, spec]) => `<option value="${type}"${type === defaultNodeType(provider) ? ' selected' : ''}>${type} · ${spec.vcpu} vCPU · ${spec.memory} GB</option>`).join('');
+
+// Google Cloud and Azure: a setup script for the provider's Cloud Shell, then paste back what it prints.
+function federatedPanel(provider, connection) {
+  const name = CLOUD_NAMES[provider];
+  if (!connection) {
+    return `
+      <div class="cloud-connect-card">
+        <h3>${name}</h3>
+        <p class="muted small">${provider === 'gcp' ? 'Cloud Run and GKE Autopilot in your own project.' : 'Container Apps and AKS in your own subscription.'} No keys are shared: your cloud trusts Lyrcloud’s signed sign-in, for your connection only.</p>
+        <button class="btn primary" data-action="cloud-connect" data-provider="${provider}">Connect ${name}</button>
+      </div>`;
+  }
+  if (connection.status === 'connected') {
+    const id = provider === 'gcp' ? connection.projectId : connection.subscriptionId;
+    return `
+      <div class="cloud-connect-card">
+        <h3>${name} <span class="status ok">● Connected</span></h3>
+        <p class="muted small">${provider === 'gcp' ? 'Project' : 'Subscription'} <span class="mono">${esc(id)}</span>${provider === 'azure' ? ` · resource group <span class="mono">lyrcloud-${esc(connection.connectionId)}</span>` : ''}</p>
+        <button class="btn small" data-action="cloud-disconnect" data-provider="${provider}">Disconnect</button>
+      </div>`;
+  }
+  const shell = provider === 'gcp' ? 'https://shell.cloud.google.com/?show=terminal' : 'https://shell.azure.com/bash';
+  return `
+    <div class="cloud-connect-card wide">
+      <h3>Connect ${name} <span class="status pending">◌ Waiting for you</span></h3>
+      <ol class="steps-list">
+        <li><b>Open ${provider === 'gcp' ? 'Google Cloud Shell in the project to use' : 'Azure Cloud Shell (Bash) in the subscription to use'}.</b> <a class="btn small primary" href="${shell}" target="_blank" rel="noopener">Open Cloud Shell ↗</a>
+          ${provider === 'gcp' ? '<br><span class="muted small">Pick the project first: <code>gcloud config set project YOUR-PROJECT</code>. You need Owner (or IAM Admin) on it.</span>' : '<br><span class="muted small">You need Owner on the subscription and permission to create app registrations.</span>'}</li>
+        <li><b>Paste and run this script.</b> <button class="btn small" data-action="cloud-copy-script" data-provider="${provider}">Copy script</button>
+          <pre class="preview-output setup-script">${esc(connection.setupScript || '')}</pre></li>
+        <li><b>Paste what it printed.</b>
+          <form class="stack" data-form="cloud-connect-finish" data-provider="${provider}">
+            ${provider === 'gcp'
+              ? `<div class="field-grid"><label class="field">Project ID<input name="projectId" class="mono" required placeholder="my-project" autocomplete="off" /></label><label class="field">Project number<input name="projectNumber" class="mono" required inputmode="numeric" placeholder="123456789012" autocomplete="off" /></label></div>`
+              : `<div class="field-grid"><label class="field">Tenant ID<input name="tenantId" class="mono" required autocomplete="off" /></label><label class="field">Subscription ID<input name="subscriptionId" class="mono" required autocomplete="off" /></label><label class="field">Client ID<input name="clientId" class="mono" required autocomplete="off" /></label></div>`}
+            <div class="row"><button class="btn primary" type="submit">Connect</button><button class="btn ghost" type="button" data-action="cloud-disconnect" data-provider="${provider}">Cancel</button></div>
+          </form></li>
+      </ol>
+      <p class="muted small">${provider === 'gcp'
+        ? 'The script makes a workload identity provider that only accepts Lyrcloud sign-ins carrying your connection ID, and a service account <span class="mono">lyrcloud-access</span> with Cloud Run and GKE admin roles. Delete either to cut access.'
+        : `The script makes the resource group <span class="mono">lyrcloud-${esc(connection.connectionId)}</span> and an app that trusts Lyrcloud’s sign-in, with Contributor on that group only. Delete the app to cut access.`}</p>
+    </div>`;
+}
+
+function connectionsPanel(data) {
+  const all = data.connections || {};
+  const connected = ['aws', 'gcp', 'azure'].filter((p) => all[p]?.status === 'connected');
+  return `
+    <section class="panel">
+      <div class="panel-head"><h2>Your clouds</h2><span class="muted">${connected.length ? `${connected.map((p) => CLOUD_NAMES[p]).join(', ')} connected` : 'Connect at least one'}</span></div>
+      <p class="muted">Lyrcloud builds in <b>your</b> accounts: you own everything, and each cloud bills you directly.</p>
+      <div class="cloud-connect-grid">
+        ${awsCard(all.aws || data.connection)}
+        ${federatedPanel('gcp', all.gcp)}
+        ${federatedPanel('azure', all.azure)}
+      </div>
+    </section>`;
+}
+
+function awsCard(connection) {
+  if (connection && connection.status !== 'connected') return `<div class="cloud-connect-card wide">${connectionPanel(connection).replace(/<\/?section[^>]*>/g, '')}</div>`;
+  if (connection) return `
+      <div class="cloud-connect-card">
+        <h3>AWS <span class="status ok">● Connected</span></h3>
+        <p class="muted small">Account <span class="mono">${esc(connection.accountId)}</span> · signs in through the <span class="mono">LyrcloudAccess</span> role.</p>
+        <button class="btn small" data-action="cloud-disconnect" data-provider="aws">Disconnect</button>
+      </div>`;
+  return `
+      <div class="cloud-connect-card">
+        <h3>AWS</h3>
+        <p class="muted small">ECS Fargate and EKS in your own account, through one role you create (and can delete) to let Lyrcloud in.</p>
+        <button class="btn primary" data-action="cloud-connect" data-provider="aws">Connect AWS</button>
+      </div>`;
 }
 
 function connectionPanel(connection) {
@@ -2579,32 +2663,37 @@ function connectionPanel(connection) {
     </section>`;
 }
 
-function clusterForm() {
+function clusterForm(connections) {
+  const ready = ['aws', 'gcp', 'azure'].filter((p) => connections?.[p]?.status === 'connected');
+  const provider = ready.includes(cloud.formProvider) ? cloud.formProvider : ready[0];
+  const kinds = CLOUD_KINDS[provider];
   return `
     <section class="panel">
       <div class="panel-head"><h2>Create a cluster</h2></div>
       <form class="stack" data-form="cloud-create-cluster" id="cluster-form">
         <div class="field-grid">
           <label class="field">Name<input name="name" placeholder="prod" required pattern="[a-z][a-z0-9-]{1,30}[a-z0-9]" maxlength="32" autocomplete="off" /></label>
-          <label class="field">Provider<select name="provider">${PROVIDERS.map((provider) => `<option value="${provider.id}"${provider.provisioning ? '' : ' disabled'}>${esc(provider.name)}${provider.provisioning ? '' : ' (coming soon)'}</option>`).join('')}</select></label>
-          <label class="field">Region<select name="region">${regionOptions()}</select></label>
+          <label class="field">Cloud<select name="provider" data-action="cloud-provider">${ready.map((p) => `<option value="${p}"${p === provider ? ' selected' : ''}>${CLOUD_NAMES[p]}</option>`).join('')}</select></label>
+          <label class="field">Region<select name="region">${regionOptions(provider)}</select></label>
         </div>
         <div class="plan-options cluster-kinds">
-          <label class="plan-option"><input type="radio" name="kind" value="serverless" checked data-action="cloud-estimate" /><span><b>Serverless containers</b><small>ECS on Fargate. Pay only for running containers; Lyrcloud deploys your images with a load balancer.</small></span></label>
-          <label class="plan-option"><input type="radio" name="kind" value="kubernetes" data-action="cloud-estimate" /><span><b>Kubernetes</b><small>Amazon EKS with worker nodes. Full Kubernetes; you deploy with kubectl or Helm.</small></span></label>
+          <label class="plan-option"><input type="radio" name="kind" value="serverless" checked data-action="cloud-estimate" /><span><b>${kinds.serverless[0]}</b><small>${kinds.serverless[1]}</small></span></label>
+          <label class="plan-option"><input type="radio" name="kind" value="kubernetes" data-action="cloud-estimate" /><span><b>${kinds.kubernetes[0]}</b><small>${kinds.kubernetes[1]}</small></span></label>
         </div>
         <fieldset class="contact-fields kube-only" hidden>
           <legend>Kubernetes</legend>
+          ${provider === 'gcp' ? '<p class="muted small">Autopilot has no nodes to pick: Google sizes the cluster to your pods. Anyone with Kubernetes Engine access in your project can use it.</p>' : `
           <div class="field-grid">
-            <label class="field">Worker size<select name="nodeType" data-action="cloud-estimate">${Object.entries(NODE_TYPES).map(([type, spec]) => `<option value="${type}"${type === 't3.medium' ? ' selected' : ''}>${type} · ${spec.vcpu} vCPU · ${spec.memory} GB</option>`).join('')}</select></label>
-            <label class="field">Workers<input name="nodes" type="number" min="1" max="20" value="2" data-action="cloud-estimate" /></label>
-          </div>
-          <label class="field">Cluster admin (your IAM user or role ARN)<input name="adminArn" class="mono" placeholder="arn:aws:iam::123456789012:user/you" autocomplete="off" /></label>
-          <p class="muted small">Find it with <code>aws sts get-caller-identity</code>. This identity gets kubectl admin access.</p>
+            <label class="field">${provider === 'azure' ? 'Node size' : 'Worker size'}<select name="nodeType" data-action="cloud-estimate">${nodeOptions(provider)}</select></label>
+            <label class="field">${provider === 'azure' ? 'Nodes' : 'Workers'}<input name="nodes" type="number" min="1" max="20" value="2" data-action="cloud-estimate" /></label>
+          </div>`}
+          ${provider === 'aws' ? `<label class="field">Cluster admin (your IAM user or role ARN)<input name="adminArn" class="mono" placeholder="arn:aws:iam::123456789012:user/you" autocomplete="off" /></label>
+          <p class="muted small">Find it with <code>aws sts get-caller-identity</code>. This identity gets kubectl admin access.</p>` : ''}
+          ${provider === 'azure' ? '<p class="muted small">Anyone with access to the lyrcloud resource group can get kubectl credentials.</p>' : ''}
         </fieldset>
         <div class="estimate" id="cluster-estimate"></div>
         <p class="form-error" hidden></p>
-        <div class="row"><button class="btn primary" type="submit">Create cluster</button><span class="muted small">Takes 1 minute for serverless, about 15 for Kubernetes. AWS bills your account.</span></div>
+        <div class="row"><button class="btn primary" type="submit">Create cluster</button><span class="muted small">Serverless is ready in a minute; Kubernetes takes about 5–15. ${CLOUD_NAMES[provider]} bills your account.</span></div>
       </form>
     </section>`;
 }
@@ -2614,11 +2703,14 @@ function updateClusterEstimate() {
   const box = document.getElementById('cluster-estimate');
   if (!form || !box) return;
   const kind = form.elements.kind.value;
+  const provider = form.elements.provider?.value || 'aws';
   form.querySelector('.kube-only').hidden = kind !== 'kubernetes';
-  const estimate = clusterEstimate({ kind, nodeType: form.elements.nodeType.value, nodes: Math.max(1, Math.min(20, Number(form.elements.nodes.value) || 1)) });
+  const estimate = clusterEstimate({ provider, kind, nodeType: form.elements.nodeType?.value, nodes: Math.max(1, Math.min(20, Number(form.elements.nodes?.value) || 1)) });
   box.innerHTML = kind === 'serverless'
-    ? `<p class="muted small">The cluster itself is free. Each service costs about ${usd(serviceEstimate({ size: 'small', count: 1 }).monthly)}/month at the smallest size (one container plus its load balancer).</p>`
-    : `${estimateLines(estimate)}<p class="muted small">Estimate for us-east-1; other regions cost up to about 40% more. Data transfer is extra.</p>`;
+    ? (provider === 'aws'
+      ? `<p class="muted small">The cluster itself is free. Each service costs about ${usd(serviceEstimate({ size: 'small', count: 1 }).monthly)}/month at the smallest size (one container plus its load balancer).</p>`
+      : '<p class="muted small">The region itself is free. Services that scale to zero cost only for requests; one always-on small copy is about ' + usd(serviceEstimate({ provider, size: 'small', count: 1 }).monthly) + '/month.</p>')
+    : `${estimateLines(estimate)}<p class="muted small">List prices in the cheapest US regions; others cost more. Data transfer is extra.</p>`;
 }
 
 function cloudView() {
@@ -2635,7 +2727,7 @@ function cloudView() {
       <div class="provider-legend">${PROVIDERS.map((p) => `<span><i style="background:${p.color}"></i>${esc(p.name)} <small>${p.regions.length}${p.provisioning ? '' : ' · soon'}</small></span>`).join('')}</div>
     </section>
     ${!data ? '<section class="panel"><p class="muted">Loading…</p></section>' : `
-      ${connectionPanel(data.connection)}
+      ${connectionsPanel(data)}
       <section class="panel">
         <div class="panel-head"><h2>Your clusters</h2>${clusters.length ? `<span class="muted">${clusters.length}</span>` : ''}</div>
         ${clusters.length ? `<div class="table-scroll"><table class="table">
@@ -2643,15 +2735,15 @@ function cloudView() {
           <tbody>${clusters.map((c) => `<tr>
             <td><a class="link mono" href="#/cloud/clusters/${c.id}">${esc(c.name)}</a></td>
             <td>${regionLabel(c.provider, c.region)}</td>
-            <td>${c.kind === 'kubernetes' ? `Kubernetes · ${c.nodes} × ${esc(c.nodeType)}` : 'Serverless'}</td>
+            <td>${CLOUD_NAMES[c.provider] || c.provider} · ${c.kind === 'kubernetes' ? (c.nodes ? `Kubernetes · ${c.nodes} × ${esc(c.nodeType)}` : 'Kubernetes (Autopilot)') : 'Serverless'}</td>
             <td>${cloudStatus(c.status)}</td>
             <td>${usd(c.estimate.monthly)}${c.kind === 'serverless' ? ' + services' : ''}</td>
           </tr>`).join('')}</tbody></table></div>` : '<p class="muted">No clusters yet.</p>'}
       </section>
-      ${data.connection?.status === 'connected' ? clusterForm() : ''}
+      ${Object.values(data.connections || {}).some((c) => c?.status === 'connected') || data.connection?.status === 'connected' ? clusterForm(data.connections || { aws: data.connection }) : ''}
       <section class="panel">
         <div class="panel-head"><h2>Other clouds</h2></div>
-        <p class="muted">Their regions are on the map now. Connecting an account and building clusters there is next.</p>
+        <p class="muted">Their regions are on the map. Clusters there come later.</p>
         <div class="provider-legend">${PROVIDERS.filter((p) => !p.provisioning).map((p) => `<span><i style="background:${p.color}"></i>${esc(p.fullName)} <small>coming soon</small></span>`).join('')}</div>
       </section>`}`;
 }
@@ -2672,6 +2764,16 @@ function serviceRow(service) {
     </li>`;
 }
 
+const KIND_LABELS = {
+  aws: { kubernetes: 'Kubernetes (EKS)', serverless: 'Serverless (ECS Fargate)' },
+  gcp: { kubernetes: 'Kubernetes (GKE Autopilot)', serverless: 'Serverless (Cloud Run)' },
+  azure: { kubernetes: 'Kubernetes (AKS)', serverless: 'Serverless (Container Apps)' },
+};
+const IMAGE_HELP = {
+  aws: 'Public images (Docker Hub, GHCR, ECR Public) and private ECR images in your account work.',
+  gcp: 'Docker Hub and Artifact Registry images work (Cloud Run doesn’t pull from GHCR).',
+  azure: 'Public images from Docker Hub, GHCR and other registries work.',
+};
 const envText = (env) => Object.entries(env || {}).map(([key, value]) => `${key}=${value}`).join('\n');
 
 function serviceForm(service) {
@@ -2687,7 +2789,7 @@ function serviceForm(service) {
         <label class="field">Health check path<input name="healthPath" value="${esc(service?.healthPath || '/')}" /></label>
       </div>
       <label class="field">Environment variables (NAME=value, one per line)<textarea name="env" rows="3" class="mono">${esc(envText(service?.env))}</textarea></label>
-      <div class="row"><button class="btn primary" type="submit">${edit ? 'Redeploy' : 'Deploy'}</button><span class="muted small">Public images (Docker Hub, GHCR, ECR Public) and private ECR images in your account work.</span></div>
+      <div class="row"><button class="btn primary" type="submit">${edit ? 'Redeploy' : 'Deploy'}</button><span class="muted small">${IMAGE_HELP[cloud.detail?.cluster?.provider || 'aws']}</span></div>
     </form>`;
 }
 
@@ -2701,23 +2803,25 @@ function cloudClusterView(route) {
   const ready = cluster.status === 'ready';
   const kube = cluster.kind === 'kubernetes';
   return `
-    ${pageHead(`<span class="mono">${esc(cluster.name)}</span>`, `${cloudStatus(cluster.status)} · ${kube ? 'Kubernetes (EKS)' : 'Serverless (ECS Fargate)'} · ${regionLabel(cluster.provider, cluster.region)}`, '<a class="btn" href="#/cloud">All clusters</a>')}
-    ${cluster.status === 'creating' ? `<section class="panel callout"><p>Building in your AWS account… ${kube ? 'Kubernetes clusters take about 15 minutes.' : 'This takes about a minute.'} This page updates by itself.</p></section>` : ''}
+    ${pageHead(`<span class="mono">${esc(cluster.name)}</span>`, `${cloudStatus(cluster.status)} · ${KIND_LABELS[cluster.provider]?.[cluster.kind] || cluster.kind} · ${regionLabel(cluster.provider, cluster.region)}`, '<a class="btn" href="#/cloud">All clusters</a>')}
+    ${cluster.status === 'creating' ? `<section class="panel callout"><p>Building in your ${CLOUD_NAMES[cluster.provider]} account… ${kube ? 'Kubernetes clusters take about 5–15 minutes.' : 'This takes about a minute.'} This page updates by itself.</p></section>` : ''}
     ${cluster.failureReason ? `<section class="panel"><p class="form-error">${esc(cluster.failureReason)}</p>${cluster.status === 'failed' ? '<p class="muted small">Nothing keeps running from a failed cluster; delete it to try again with the same name.</p>' : ''}</section>` : ''}
     <div class="grid-2">
       <section class="panel">
         <div class="panel-head"><h2>Cost estimate</h2></div>
         ${estimateLines(cluster.estimate)}
         ${services.length ? `<p class="muted small">Plus services: about ${usd(services.reduce((sum, s) => sum + s.estimate.monthly, 0))}/month.</p>` : ''}
-        <p class="muted small">AWS bills your account directly. us-east-1 prices; data transfer extra.</p>
+        <p class="muted small">${CLOUD_NAMES[cluster.provider]} bills your account directly. Rough list prices; data transfer extra.</p>
       </section>
       <section class="panel">
         <div class="panel-head"><h2>Details</h2></div>
         <dl class="facts">
-          <dt>Stack</dt><dd class="mono">${esc(cluster.stackName)}</dd>
+          ${cluster.stackName ? `<dt>Stack</dt><dd class="mono">${esc(cluster.stackName)}</dd>` : ''}
+          ${cluster.outputs.Project ? `<dt>Project</dt><dd class="mono">${esc(cluster.outputs.Project)}</dd>` : ''}
+          ${cluster.outputs.ResourceGroup ? `<dt>Resource group</dt><dd class="mono">${esc(cluster.outputs.ResourceGroup)}</dd>` : ''}
           ${cluster.outputs.ClusterName ? `<dt>Cluster</dt><dd class="mono">${esc(cluster.outputs.ClusterName)}</dd>` : ''}
           ${cluster.outputs.VpcId ? `<dt>VPC</dt><dd class="mono">${esc(cluster.outputs.VpcId)}</dd>` : ''}
-          ${kube ? `<dt>Admin</dt><dd class="mono wrap">${esc(cluster.adminArn)}</dd>` : ''}
+          ${kube && cluster.adminArn ? `<dt>Admin</dt><dd class="mono wrap">${esc(cluster.adminArn)}</dd>` : ''}
           <dt>Created</dt><dd>${formatDate(cluster.createdAt)}</dd>
         </dl>
       </section>
@@ -2725,10 +2829,10 @@ function cloudClusterView(route) {
     ${kube && ready ? `
       <section class="panel">
         <div class="panel-head"><h2>Use it with kubectl</h2></div>
-        <pre class="preview-output">aws eks update-kubeconfig --region ${esc(cluster.region)} --name ${esc(cluster.outputs.ClusterName || `lyrcloud-${cluster.name}`)}
-kubectl get nodes</pre>
-        <p class="muted small">Run these as <span class="mono">${esc(cluster.adminArn)}</span>. Services of type LoadBalancer get a public AWS load balancer.</p>
-        <form class="row" data-form="cloud-resize"><label class="inline-check">Workers <input name="nodes" type="number" min="1" max="20" value="${cluster.nodes}" /></label><button class="btn" type="submit">Resize</button></form>
+        <pre class="preview-output">${cluster.provider === 'aws' ? `aws eks update-kubeconfig --region ${esc(cluster.region)} --name ${esc(cluster.outputs.ClusterName || `lyrcloud-${cluster.name}`)}
+kubectl get nodes` : esc(detail.kubectl || '')}</pre>
+        <p class="muted small">${cluster.provider === 'aws' ? `Run these as <span class="mono">${esc(cluster.adminArn)}</span>. Services of type LoadBalancer get a public AWS load balancer.` : `Run these in ${cluster.provider === 'gcp' ? 'Google' : 'Azure'} Cloud Shell, or anywhere their CLI is signed in to your account.`}</p>
+        ${cluster.provider === 'gcp' ? '' : `<form class="row" data-form="cloud-resize"><label class="inline-check">${cluster.provider === 'azure' ? 'Nodes' : 'Workers'} <input name="nodes" type="number" min="1" max="20" value="${cluster.nodes}" /></label><button class="btn" type="submit">Resize</button></form>`}
       </section>` : ''}
     ${!kube && ready ? `
       <section class="panel">
@@ -2736,7 +2840,7 @@ kubectl get nodes</pre>
         ${services.length ? `<ul class="service-list">${services.map(serviceRow).join('')}</ul>` : '<p class="muted">No services yet. Deploy a container image below.</p>'}
       </section>
       <section class="panel">
-        <div class="panel-head"><h2>Deploy a container</h2><span class="muted small">≈ ${usd(serviceEstimate({ size: 'small', count: 1 }).monthly)}/month at the smallest size</span></div>
+        <div class="panel-head"><h2>Deploy a container</h2><span class="muted small">${cluster.provider === 'aws' ? `≈ ${usd(serviceEstimate({ size: 'small', count: 1 }).monthly)}/month at the smallest size` : 'Copies 0 = scale to zero: pay only when it’s used'}</span></div>
         ${serviceForm(null)}
       </section>` : ''}
     <section class="panel">
@@ -2822,10 +2926,21 @@ const cloudClickActions = {
     cloud.data = null;
     render();
   },
-  'cloud-connect': (target) => cloudRun(target, () => cloudApi('/cloud/connections/aws', { method: 'POST' }), '', loadCloud),
+  'cloud-connect': (target) => cloudRun(target, () => cloudApi(`/cloud/connections/${target.dataset.provider || 'aws'}`, { method: 'POST' }), '', loadCloud),
   'cloud-disconnect': (target) => {
-    if (!confirmed(target, 'Disconnect your AWS account from Lyrcloud?')) return;
-    cloudRun(target, () => cloudApi('/cloud/connections/aws', { method: 'DELETE' }), 'Disconnected. Delete the lyrcloud-access stack in AWS to remove the role.', loadCloud);
+    const provider = target.dataset.provider || 'aws';
+    if (!confirmed(target, `Disconnect ${CLOUD_NAMES[provider]} from Lyrcloud?`)) return;
+    const after = { aws: 'Delete the lyrcloud-access stack in AWS to remove the role.', gcp: 'Delete the lyrcloud workload identity provider in Google Cloud to remove access.', azure: 'Delete the Lyrcloud app registration in Azure to remove access.' }[provider];
+    cloudRun(target, () => cloudApi(`/cloud/connections/${provider}`, { method: 'DELETE' }), `Disconnected. ${after}`, loadCloud);
+  },
+  'cloud-copy-script': async (target) => {
+    const script = cloud.data?.connections?.[target.dataset.provider]?.setupScript || '';
+    try {
+      await navigator.clipboard.writeText(script);
+      toast('Script copied. Paste it into Cloud Shell and press Enter.');
+    } catch {
+      toast('Couldn’t copy. Select the script and copy it yourself.');
+    }
   },
   'cloud-delete-cluster': (target) => {
     if (!confirmed(target, `Delete ${cloud.detail.cluster.name}? Everything Lyrcloud built for it in your AWS account is removed.`)) return;
@@ -2844,16 +2959,24 @@ const cloudClickActions = {
 
 const cloudChangeActions = {
   'cloud-estimate': () => updateClusterEstimate(),
+  'cloud-provider': (target) => {
+    cloud.formProvider = target.value;
+    render();
+  },
 };
 
 const cloudFormActions = {
-  'cloud-connect-finish': (form, data) => cloudRun(form.querySelector('[type="submit"]'),
-    () => cloudApi('/cloud/connections/aws', { method: 'PUT', body: JSON.stringify({ roleArn: String(data.get('roleArn')).trim() }) }), 'AWS account connected', loadCloud),
+  'cloud-connect-finish': (form, data) => {
+    const provider = form.dataset.provider || 'aws';
+    const body = provider === 'aws' ? { roleArn: String(data.get('roleArn')).trim() } : Object.fromEntries([...data.entries()].map(([k, v]) => [k, String(v).trim()]));
+    cloudRun(form.querySelector('[type="submit"]'), () => cloudApi(`/cloud/connections/${provider}`, { method: 'PUT', body: JSON.stringify(body) }), `${CLOUD_NAMES[provider]} connected`, loadCloud);
+  },
   'cloud-create-cluster': (form, data) => {
     const kind = String(data.get('kind'));
     const body = {
       name: String(data.get('name')).trim().toLowerCase(), provider: String(data.get('provider')), region: String(data.get('region')), kind,
-      ...(kind === 'kubernetes' ? { nodeType: String(data.get('nodeType')), nodes: Number(data.get('nodes')), adminArn: String(data.get('adminArn') || '').trim() } : {}),
+      ...(kind === 'kubernetes' && data.get('nodeType') ? { nodeType: String(data.get('nodeType')), nodes: Number(data.get('nodes')) } : {}),
+      ...(kind === 'kubernetes' && data.get('adminArn') !== null ? { adminArn: String(data.get('adminArn') || '').trim() } : {}),
     };
     const button = form.querySelector('[type="submit"]');
     button.disabled = true;

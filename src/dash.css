@@ -1993,3 +1993,38 @@ a.stat:hover {
   max-width: none;
   margin-bottom: 0;
 }
+
+/* Cloud: connect AWS, Google Cloud and Azure */
+.cloud-connect-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+.cloud-connect-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.cloud-connect-card.wide {
+  grid-column: 1 / -1;
+}
+.cloud-connect-card h3 {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 0;
+}
+.cloud-connect-card .panel-head {
+  margin: 0;
+}
+.setup-script {
+  max-height: 260px;
+  margin-top: 8px;
+  overflow: auto;
+  font-size: 0.78rem;
+  white-space: pre;
+}

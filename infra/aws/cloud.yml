@@ -98,6 +98,10 @@ Resources:
               - Effect: Allow
                 Action: sts:AssumeRole
                 Resource: 'arn:aws:iam::*:role/LyrcloudAccess'
+              # Google Cloud and Azure: a short-lived signed token that customers' clouds trust (federation.mjs).
+              - Effect: Allow
+                Action: [sts:GetWebIdentityToken, sts:TagGetWebIdentityToken]
+                Resource: '*'
 
   CloudFunction:
     Type: AWS::Lambda::Function

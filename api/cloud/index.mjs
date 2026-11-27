@@ -8,6 +8,11 @@
 //   POST   /cloud/connections/aws                 start connecting: your ExternalId and the one-click setup link
 //   PUT    /cloud/connections/aws                 { roleArn | accountId } finish connecting (Lyrcloud checks it can sign in)
 //   DELETE /cloud/connections/aws                 forget the connection (no clusters left)
+//   POST   /cloud/connections/{gcp|azure}         start connecting: connection ID and the Cloud Shell setup script
+//   PUT    /cloud/connections/gcp                 { projectId, projectNumber }        finish (Lyrcloud signs in to check)
+//   PUT    /cloud/connections/azure               { tenantId, subscriptionId, clientId }
+//   DELETE /cloud/connections/{gcp|azure}         forget it (no clusters left on that cloud)
+// Google Cloud and Azure are keyless (federation.mjs) and built over their REST APIs (providers.mjs).
 //   POST   /cloud/clusters                        { name, provider: "aws", region, kind, nodeType?, nodes?, adminArn? }
 //   GET    /cloud/clusters/{id}                   a cluster, refreshed from CloudFormation
 //   PUT    /cloud/clusters/{id}                   { nodes } resize a Kubernetes cluster
@@ -42,6 +47,8 @@ import {
   serviceTemplate,
   stackState,
 } from './rules.mjs';
+import { azureAccessToken, azureSetupScript, CONNECTION_RE, FederationError, gcpAccessToken, gcpSetupScript, identity } from './federation.mjs';
+import { PROVIDER_OPS, ProviderError } from './providers.mjs';
 
 const env = process.env;
 const TABLE = env.TABLE_NAME;
@@ -56,6 +63,7 @@ export const clients = {
   cloudformation: (region, credentials) => new CloudFormationClient({ region, credentials }),
   ec2: (region, credentials) => new EC2Client({ region, credentials }),
   iam: (credentials) => new IAMClient({ region: 'us-east-1', credentials }),
+  fetch: (...args) => fetch(...args),
 };
 
 // ---------------------------------------------------------------- helpers
@@ -71,7 +79,7 @@ function parseJson(event) {
   }
 }
 
-const connectionKey = (userId) => ({ pk: `conn#${userId}`, sk: 'aws' });
+const connectionKey = (userId, provider = 'aws') => ({ pk: `conn#${userId}`, sk: provider });
 const clusterKey = (id) => ({ pk: `cluster#${id}`, sk: 'cluster' });
 const serviceKey = (id) => ({ pk: `service#${id}`, sk: 'service' });
 const getItem = async (key) => (await ddb.send(new GetCommand({ TableName: TABLE, Key: key }))).Item;
@@ -171,7 +179,17 @@ const outputsOf = (stack) => Object.fromEntries((stack?.Outputs || []).map((o) =
 
 // ---------------------------------------------------------------- shapes
 
-const publicConnection = (item) => item && ({
+const publicConnection = (item) => item && item.provider && item.provider !== 'aws' ? ({
+  provider: item.provider,
+  status: item.connectedAt ? 'connected' : 'pending',
+  connectionId: item.connectionId,
+  projectId: item.projectId || null,
+  subscriptionId: item.subscriptionId || null,
+  tenantId: item.tenantId || null,
+  clientId: item.clientId || null,
+  connectedAt: item.connectedAt || null,
+  setupScript: item.connectedAt ? null : item.setupScript || null,
+}) : item && ({
   provider: 'aws',
   status: item.roleArn ? 'connected' : 'pending',
   externalId: item.externalId,
@@ -191,6 +209,7 @@ const publicCluster = (item) => ({
 });
 
 const publicService = (item) => ({
+  provider: item.provider || 'aws',
   id: item.id, clusterId: item.clusterId, name: item.name, image: item.image, port: item.port, size: item.size, count: item.count,
   env: item.env || {}, healthPath: item.healthPath, status: item.status, failureReason: item.failureReason || null,
   url: item.outputs?.Url || null, estimate: serviceEstimate(item), createdAt: item.createdAt, updatedAt: item.updatedAt || null,
@@ -215,6 +234,79 @@ async function refresh(item, key, credentials) {
   else set.failureReason = null;
   if (stack?.StackStatus === 'UPDATE_ROLLBACK_COMPLETE') set.failureReason = `The last change didn’t work and was undone: ${(await failureReason(cf, stackName(item))) || 'see CloudFormation in your account.'}`;
   return update(key, set);
+}
+
+// ---------------------------------------------------------------- Google Cloud and Azure
+
+// A token for the customer's Google Cloud or Azure account, and the operations for that provider.
+async function providerContext(connection) {
+  if (!connection?.connectedAt) throw new CloudError(409, `Connect your ${connection?.provider === 'azure' ? 'Azure subscription' : 'Google Cloud project'} first.`);
+  const deps = { sts, fetchImpl: clients.fetch };
+  const token = connection.provider === 'gcp' ? await gcpAccessToken(deps, connection) : await azureAccessToken(deps, connection);
+  return { token, connection, fetchImpl: clients.fetch, ops: PROVIDER_OPS[connection.provider] };
+}
+
+// Brings a Google Cloud / Azure cluster or service row up to date. Gone resources remove the row.
+async function refreshRemote(item, key, ctx, cluster) {
+  if (['ready', 'failed'].includes(item.status) && Date.now() - Date.parse(item.checkedAt || 0) < 60_000) return item;
+  const state = cluster ? await ctx.ops.refreshService(ctx, cluster, item) : await ctx.ops.refreshCluster(ctx, item);
+  if (state.status === 'deleted') {
+    await remove(key);
+    return { ...item, status: 'deleted' };
+  }
+  return update(key, {
+    status: state.status, checkedAt: now(), outputs: state.outputs || item.outputs || {}, failureReason: state.failureReason ?? null,
+    ...(state.public ? { public: true } : {}),
+  });
+}
+
+let ourIdentity;
+const setupScriptFor = async (provider, connectionId) => {
+  ourIdentity ||= await identity(sts);
+  return provider === 'gcp' ? gcpSetupScript({ connectionId, issuer: ourIdentity.issuer }) : azureSetupScript({ connectionId, ...ourIdentity });
+};
+
+const GCP_PROJECT_RE = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function federatedConnectionRoutes(event, method, who, provider) {
+  const key = connectionKey(who.userId, provider);
+  const existing = await getItem(key);
+  if (method === 'POST') {
+    if (existing) return json(200, { connection: publicConnection(existing) });
+    const connectionId = `lyr${randomBytes(5).toString('hex')}`;
+    const item = { ...key, row: 'connection', ownerId: who.userId, ownerEmail: who.email, provider, connectionId, setupScript: await setupScriptFor(provider, connectionId), createdAt: now() };
+    await put(item);
+    return json(200, { connection: publicConnection(item) });
+  }
+  if (method === 'PUT') {
+    if (!existing) return error(409, 'Start connecting first.');
+    const body = parseJson(event) || {};
+    let fields;
+    if (provider === 'gcp') {
+      const projectId = String(body.projectId || '').trim().toLowerCase();
+      const projectNumber = String(body.projectNumber || '').trim();
+      if (!GCP_PROJECT_RE.test(projectId) || !/^\d{6,20}$/.test(projectNumber)) return error(400, 'Paste the project ID and project number the setup script printed.');
+      fields = { projectId, projectNumber };
+    } else {
+      const ids = Object.fromEntries(['tenantId', 'subscriptionId', 'clientId'].map((name) => [name, String(body[name] || '').trim().toLowerCase()]));
+      if (!Object.values(ids).every((id) => UUID_RE.test(id))) return error(400, 'Paste the tenant, subscription and client IDs the setup script printed.');
+      fields = ids;
+    }
+    const trial = { ...existing, ...fields, connectedAt: 'checking' };
+    const ctx = await providerContext(trial);
+    await ctx.ops.verify(ctx);
+    const saved = { ...existing, ...fields, connectedAt: now() };
+    await put(saved);
+    return json(200, { connection: publicConnection(saved) });
+  }
+  if (method === 'DELETE') {
+    const clusters = (await itemsOf(who.userId)).filter((item) => item.row === 'cluster' && item.provider === provider);
+    if (clusters.length) return error(409, 'Delete your clusters on this cloud first; Lyrcloud needs the connection to take them down.');
+    await remove(key);
+    return json(200, { disconnected: true });
+  }
+  return error(404, 'not_found');
 }
 
 // ---------------------------------------------------------------- connection
@@ -295,7 +387,8 @@ async function createCluster(event, who) {
   const clusters = items.filter((item) => item.row === 'cluster');
   if (clusters.length >= MAX_CLUSTERS) return error(409, `You can have up to ${MAX_CLUSTERS} clusters.`);
   if (clusters.some((item) => item.name === name && item.region === region.code)) return error(409, `You already have a cluster called ${name} in ${region.city}.`);
-  const connection = items.find((item) => item.row === 'connection');
+  if (body.provider !== 'aws') return createRemoteCluster(body, region, name, items, who);
+  const connection = items.find((item) => item.row === 'connection' && (item.provider || 'aws') === 'aws');
   const credentials = await credentialsFor(connection);
   const config = {
     kind: body.kind,
@@ -327,6 +420,18 @@ async function createCluster(event, who) {
   return json(200, { cluster: publicCluster(item) });
 }
 
+async function createRemoteCluster(body, region, name, items, who) {
+  const connection = items.find((item) => item.row === 'connection' && item.provider === body.provider);
+  const ctx = await providerContext(connection);
+  const id = shortId();
+  const config = body.kind === 'kubernetes' && body.provider === 'azure' ? { nodeType: body.nodeType || 'Standard_B2s', nodes: body.nodes ?? 2 } : {};
+  const item = { ...clusterKey(id), row: 'cluster', id, ownerId: who.userId, ownerEmail: who.email, provider: body.provider, region: region.code, name, kind: body.kind, ...config, status: 'creating', createdAt: now() };
+  const state = await ctx.ops.createCluster(ctx, item);
+  const saved = { ...item, status: state.status, outputs: state.outputs || {} };
+  await put(saved);
+  return json(200, { cluster: publicCluster(saved) });
+}
+
 async function ownedCluster(id, who) {
   const item = /^[a-f0-9]{8}$/.test(id) && (await getItem(clusterKey(id)));
   if (!item || (item.ownerId !== who.userId && !isStaff(who.role))) return null;
@@ -340,6 +445,7 @@ async function clusterRoutes(event, method, path, who) {
   const item = await ownedCluster(match[1], who);
   if (!item) return error(404, 'That cluster isn’t in your account.');
   if (item.ownerId !== who.userId && method !== 'GET') return error(403, 'Only the owner can change this cluster.');
+  if (item.provider !== 'aws') return remoteClusterRoutes(event, method, match, item, who);
   const connection = await getItem(connectionKey(item.ownerId));
   const credentials = await credentialsFor(connection);
   if (match[2]) return method === 'POST' ? createService(event, item, who, credentials) : error(404, 'not_found');
@@ -372,6 +478,58 @@ async function clusterRoutes(event, method, path, who) {
     return json(200, { cluster: publicCluster(await update(clusterKey(item.id), { status: 'deleting', updatedAt: now() })) });
   }
   return error(404, 'not_found');
+}
+
+async function remoteClusterRoutes(event, method, match, item, who) {
+  const ctx = await providerContext(await getItem(connectionKey(item.ownerId, item.provider)));
+  if (match[2]) return method === 'POST' ? createRemoteService(event, item, who, ctx) : error(404, 'not_found');
+  if (method === 'GET') {
+    const fresh = await refreshRemote(item, clusterKey(item.id), ctx);
+    const rows = (await itemsOf(item.ownerId)).filter((row) => row.row === 'service' && row.clusterId === item.id);
+    const services = [];
+    for (const row of rows) services.push(publicService(CLOUD_BUSY_REMOTE.includes(row.status) ? await refreshRemote(row, serviceKey(row.id), ctx, item).catch(() => row) : row));
+    return json(200, { cluster: publicCluster(fresh), services: services.filter((s) => s.status !== 'deleted'), kubectl: item.kind === 'kubernetes' ? ctx.ops.kubectl(item, ctx.connection) : null });
+  }
+  if (method === 'PUT') {
+    if (item.kind !== 'kubernetes') return error(400, 'Serverless clusters grow with their services; there’s nothing to resize.');
+    const nodes = parseJson(event)?.nodes;
+    if (!Number.isInteger(nodes) || nodes < 1 || nodes > 20) return error(400, 'Use 1 to 20 nodes.');
+    if (item.status !== 'ready') return error(409, 'Wait until the cluster is ready.');
+    const state = await ctx.ops.resizeCluster(ctx, item, nodes);
+    return json(200, { cluster: publicCluster(await update(clusterKey(item.id), { nodes, status: state.status, updatedAt: now() })) });
+  }
+  if (method === 'DELETE') {
+    const services = (await itemsOf(item.ownerId)).filter((row) => row.row === 'service' && row.clusterId === item.id);
+    if (services.length) return error(409, 'Remove this cluster’s services first.');
+    const state = await ctx.ops.deleteCluster(ctx, item);
+    if (state.status === 'deleted') {
+      await remove(clusterKey(item.id));
+      return json(200, { cluster: publicCluster({ ...item, status: 'deleted' }) });
+    }
+    return json(200, { cluster: publicCluster(await update(clusterKey(item.id), { status: 'deleting', updatedAt: now() })) });
+  }
+  return error(404, 'not_found');
+}
+
+const CLOUD_BUSY_REMOTE = ['creating', 'updating', 'deleting'];
+
+async function createRemoteService(event, cluster, who, ctx) {
+  if (cluster.kind !== 'serverless') return error(400, 'Lyrcloud deploys services to serverless clusters. On Kubernetes, deploy with kubectl (see the cluster page).');
+  const fresh = await refreshRemote(cluster, clusterKey(cluster.id), ctx);
+  if (fresh.status !== 'ready') return error(409, 'Wait until the cluster is ready.');
+  const body = parseJson(event);
+  const refused = serviceError(body);
+  if (refused) return error(...refused);
+  const name = cleanName(body.name);
+  const siblings = (await itemsOf(who.userId)).filter((row) => row.row === 'service' && row.clusterId === cluster.id);
+  if (siblings.length >= MAX_SERVICES_PER_CLUSTER) return error(409, `A cluster can run up to ${MAX_SERVICES_PER_CLUSTER} services.`);
+  if (siblings.some((row) => row.name === name)) return error(409, `This cluster already has a service called ${name}.`);
+  const id = shortId();
+  const item = { ...serviceKey(id), row: 'service', id, clusterId: cluster.id, ownerId: who.userId, provider: cluster.provider, region: cluster.region, name, ...serviceConfig(body), status: 'creating', createdAt: now() };
+  const state = await ctx.ops.deployService(ctx, fresh, item, { create: true });
+  const saved = { ...item, status: state.status };
+  await put(saved);
+  return json(200, { service: publicService(saved) });
 }
 
 // ---------------------------------------------------------------- services
@@ -426,6 +584,7 @@ async function serviceRoutes(event, method, path, who) {
   const item = id && (await getItem(serviceKey(id)));
   if (!item || (item.ownerId !== who.userId && !isStaff(who.role))) return error(404, 'That service isn’t in your account.');
   if (item.ownerId !== who.userId && method !== 'GET') return error(403, 'Only the owner can change this service.');
+  if ((item.provider || 'aws') !== 'aws') return remoteServiceRoutes(event, method, item);
   const credentials = await credentialsFor(await getItem(connectionKey(item.ownerId)));
   if (method === 'GET') return json(200, { service: publicService(await refresh(item, serviceKey(item.id), credentials)) });
   if (method === 'PUT') {
@@ -453,12 +612,34 @@ async function serviceRoutes(event, method, path, who) {
   return error(404, 'not_found');
 }
 
+async function remoteServiceRoutes(event, method, item) {
+  const ctx = await providerContext(await getItem(connectionKey(item.ownerId, item.provider)));
+  const cluster = await getItem(clusterKey(item.clusterId));
+  if (method === 'GET') return json(200, { service: publicService(await refreshRemote(item, serviceKey(item.id), ctx, cluster)) });
+  if (method === 'PUT') {
+    const body = parseJson(event);
+    const refused = serviceError(body, { partial: true });
+    if (refused) return error(...refused);
+    if (!['ready', 'failed'].includes(item.status)) return error(409, 'Wait until the last change finishes.');
+    const next = { ...item, ...serviceConfig(body, item) };
+    const state = await ctx.ops.deployService(ctx, cluster, next, { create: false });
+    const { image, port, size, count, env: vars, healthPath } = next;
+    return json(200, { service: publicService(await update(serviceKey(item.id), { image, port, size, count, env: vars, healthPath, status: state.status, updatedAt: now() })) });
+  }
+  if (method === 'DELETE') {
+    await ctx.ops.deleteService(ctx, cluster, item);
+    return json(200, { service: publicService(await update(serviceKey(item.id), { status: 'deleting', updatedAt: now() })) });
+  }
+  return error(404, 'not_found');
+}
+
 // ---------------------------------------------------------------- overview and admin
 
 async function overview(who) {
   const items = await itemsOf(who.userId);
   return json(200, {
-    connection: publicConnection(items.find((item) => item.row === 'connection')) || null,
+    connection: publicConnection(items.find((item) => item.row === 'connection' && (item.provider || 'aws') === 'aws')) || null,
+    connections: Object.fromEntries(items.filter((item) => item.row === 'connection').map((item) => [item.provider || 'aws', publicConnection(item)])),
     clusters: items.filter((item) => item.row === 'cluster').map(publicCluster),
     services: items.filter((item) => item.row === 'service').map(publicService),
     accessRoleName: ACCESS_ROLE_NAME,
@@ -476,7 +657,7 @@ async function admin(who) {
   } while (ExclusiveStartKey);
   const byKind = (row) => items.filter((item) => item.row === row);
   return json(200, {
-    connections: byKind('connection').map((item) => ({ ownerEmail: item.ownerEmail || null, accountId: item.accountId || null, status: item.roleArn ? 'connected' : 'pending', createdAt: item.createdAt })),
+    connections: byKind('connection').map((item) => ({ provider: item.provider || 'aws', ownerEmail: item.ownerEmail || null, accountId: item.accountId || item.projectId || item.subscriptionId || null, status: item.roleArn || item.connectedAt ? 'connected' : 'pending', createdAt: item.createdAt })),
     clusters: byKind('cluster').map((item) => ({ ...publicCluster(item), ownerEmail: item.ownerEmail || null })),
     services: byKind('service').map(publicService),
   });
@@ -494,11 +675,12 @@ export const handler = async (event) => {
     if (path === '/admin/cloud' && method === 'GET') return await admin(who);
     if (path === '/cloud' && method === 'GET') return await overview(who);
     if (path === '/cloud/connections/aws') return await connectionRoutes(event, method, who);
+    if (path === '/cloud/connections/gcp' || path === '/cloud/connections/azure') return await federatedConnectionRoutes(event, method, who, path.split('/').pop());
     if (path === '/cloud/clusters' || path.startsWith('/cloud/clusters/')) return await clusterRoutes(event, method, path, who);
     if (path.startsWith('/cloud/services/')) return await serviceRoutes(event, method, path, who);
     return error(404, 'not_found');
   } catch (err) {
-    if (err instanceof CloudError) return error(err.status, err.message);
+    if (err instanceof CloudError || err instanceof FederationError || err instanceof ProviderError) return error(err.status, err.message);
     const message = awsMessage(err);
     if (message) return error(400, message);
     console.error('Cloud API failed', err);
