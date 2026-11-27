@@ -21,15 +21,20 @@
 //   GET    /cloud/services/{id}                   a service, refreshed
 //   PUT    /cloud/services/{id}                   { image?, port?, size?, count?, env?, healthPath? } redeploy with changes
 //   DELETE /cloud/services/{id}                   remove it
+//   POST   /cloud/clusters/{id}/pay               open a Lyrpay payment for a month of Kubernetes management (fees.mjs)
+//   POST   /cloud/clusters/{id}/payment           check that payment; a paid new cluster gets built
 //   GET    /admin/cloud                           every connection, cluster and service (staff)
 import { randomBytes } from 'node:crypto';
 import { CloudFormationClient, CreateStackCommand, DeleteStackCommand, DescribeStackEventsCommand, DescribeStacksCommand, UpdateStackCommand } from '@aws-sdk/client-cloudformation';
 import { DescribeAvailabilityZonesCommand, EC2Client } from '@aws-sdk/client-ec2';
 import { CreateServiceLinkedRoleCommand, IAMClient } from '@aws-sdk/client-iam';
 import { AssumeRoleCommand, STSClient } from '@aws-sdk/client-sts';
+import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DeleteCommand, DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
-import { isStaff, roleFor } from '../account/roles.mjs';
+import { isStaff, planFor, roleFor } from '../account/roles.mjs';
+import * as lyrpay from '../domains/lyrpay.mjs';
+import { addMonth, clusterLimitError, feeReference, feeState, KUBERNETES_FEE_CENTS, serviceLimitError } from './fees.mjs';
 import { findRegion } from '../../src/clouds.js';
 import {
   ACCESS_ROLE_NAME,
@@ -54,6 +59,7 @@ const env = process.env;
 const TABLE = env.TABLE_NAME;
 const USERS_TABLE = env.USERS_TABLE_NAME;
 const SUPER_ADMIN_EMAIL = env.SUPER_ADMIN_EMAIL || 'lyrclouds@gmail.com';
+const SITE_URL = env.SITE_URL || 'https://www.lyrcloud.com';
 const ACCESS_TEMPLATE_URL = env.ACCESS_TEMPLATE_URL;
 
 export const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -64,6 +70,7 @@ export const clients = {
   ec2: (region, credentials) => new EC2Client({ region, credentials }),
   iam: (credentials) => new IAMClient({ region: 'us-east-1', credentials }),
   fetch: (...args) => fetch(...args),
+  secrets: () => new SecretsManagerClient({}),
 };
 
 // ---------------------------------------------------------------- helpers
@@ -114,7 +121,8 @@ async function caller(event) {
   const userId = event.requestContext?.authorizer?.jwt?.claims?.sub;
   if (!userId) return null;
   const profile = (await ddb.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId } }))).Item || { userId };
-  return { userId, profile, role: roleFor(profile, SUPER_ADMIN_EMAIL), email: profile.email || null };
+  const role = roleFor(profile, SUPER_ADMIN_EMAIL);
+  return { userId, profile, role, staff: isStaff(role), plan: planFor(profile), email: profile.email || null };
 }
 
 export class CloudError extends Error {
@@ -122,6 +130,23 @@ export class CloudError extends Error {
     super(message);
     this.status = status;
   }
+}
+
+// Pay with Lyrpay keys (the lyrcloud/lyrpay secret, shared with the domains API). Re-read every minute.
+let lyrpayCache = { value: null, at: 0 };
+async function getLyrpay() {
+  if (env.LYRPAY_JSON) return JSON.parse(env.LYRPAY_JSON);
+  if (!env.LYRPAY_SECRET_NAME) return {};
+  if (!lyrpayCache.value || Date.now() - lyrpayCache.at > 60_000) {
+    let value = {};
+    try {
+      value = JSON.parse((await clients.secrets().send(new GetSecretValueCommand({ SecretId: env.LYRPAY_SECRET_NAME }))).SecretString || '{}');
+    } catch (err) {
+      if (err.name !== 'ResourceNotFoundException') console.error('Lyrpay keys unreadable', err.name);
+    }
+    lyrpayCache = { value, at: Date.now() };
+  }
+  return lyrpayCache.value;
 }
 
 // Signs in to the customer's account through their LyrcloudAccess role.
@@ -205,7 +230,9 @@ const publicCluster = (item) => ({
   nodeType: item.nodeType || null, nodes: item.nodes ?? null, adminArn: item.adminArn || null,
   status: item.status, failureReason: item.failureReason || null, outputs: item.outputs || {},
   estimate: clusterEstimate(item), createdAt: item.createdAt, updatedAt: item.updatedAt || null,
-  stackName: item.stackName,
+  stackName: item.stackName || null,
+  fee: feeState(item),
+  payUrl: item.pendingPayment?.url || null,
 });
 
 const publicService = (item) => ({
@@ -387,50 +414,124 @@ async function createCluster(event, who) {
   const clusters = items.filter((item) => item.row === 'cluster');
   if (clusters.length >= MAX_CLUSTERS) return error(409, `You can have up to ${MAX_CLUSTERS} clusters.`);
   if (clusters.some((item) => item.name === name && item.region === region.code)) return error(409, `You already have a cluster called ${name} in ${region.city}.`);
-  if (body.provider !== 'aws') return createRemoteCluster(body, region, name, items, who);
-  const connection = items.find((item) => item.row === 'connection' && (item.provider || 'aws') === 'aws');
-  const credentials = await credentialsFor(connection);
-  const config = {
-    kind: body.kind,
-    ...(body.kind === 'kubernetes' ? { nodeType: body.nodeType || 't3.medium', nodes: body.nodes ?? 2, adminArn: body.adminArn.trim() } : {}),
-  };
+  const overLimit = clusterLimitError(who.plan, clusters, body.kind, who.staff);
+  if (overLimit) return error(...overLimit);
+  const connection = items.find((item) => item.row === 'connection' && (item.provider || 'aws') === body.provider);
+  if (body.provider === 'aws') await credentialsFor(connection); // fail now, not after payment
+  else await providerContext(connection);
   const id = shortId();
-  await ensureLinkedRoles(body.kind, credentials);
-  const zones = await zonesFor(region.code, body.kind, credentials);
-  const template = clusterTemplate({ id, name, zones, ...config });
+  const config = body.kind !== 'kubernetes' ? {}
+    : body.provider === 'aws' ? { nodeType: body.nodeType || 't3.medium', nodes: body.nodes ?? 2, adminArn: body.adminArn.trim() }
+    : body.provider === 'azure' ? { nodeType: body.nodeType || 'Standard_B2s', nodes: body.nodes ?? 2 } : {};
   const item = {
-    ...clusterKey(id), row: 'cluster', id, ownerId: who.userId, ownerEmail: who.email, provider: 'aws', region: region.code, name, zones,
-    ...config, stackName: `lyrcloud-cluster-${name}`, status: 'creating', createdAt: now(),
+    ...clusterKey(id), row: 'cluster', id, ownerId: who.userId, ownerEmail: who.email, provider: body.provider, region: region.code, name, kind: body.kind, ...config,
+    status: 'creating', createdAt: now(), ...(who.staff ? { feeExempt: true } : {}),
   };
+  // Kubernetes is built once its first month of management is paid.
+  if (feeState(item).needsFee) {
+    const pendingPayment = await openFeePayment(item, who);
+    const saved = { ...item, status: 'awaiting_payment', pendingPayment };
+    await put(saved);
+    return json(200, { cluster: publicCluster(saved), payUrl: pendingPayment.url });
+  }
+  const built = await buildCluster(item);
+  if (built.statusCode) return built;
+  await put(built);
+  return json(200, { cluster: publicCluster(built) });
+}
+
+// Starts building a cluster row in the customer's cloud; returns the row to save (or an error response).
+async function buildCluster(item) {
+  const connection = await getItem(connectionKey(item.ownerId, item.provider));
+  if (item.provider !== 'aws') {
+    const ctx = await providerContext(connection);
+    const state = await ctx.ops.createCluster(ctx, item);
+    return { ...item, status: state.status, outputs: state.outputs || {} };
+  }
+  const credentials = await credentialsFor(connection);
+  await ensureLinkedRoles(item.kind, credentials);
+  const zones = await zonesFor(item.region, item.kind, credentials);
+  const built = { ...item, zones, stackName: `lyrcloud-cluster-${item.name}`, status: 'creating' };
   try {
-    const { StackId } = await clients.cloudformation(region.code, credentials).send(new CreateStackCommand({
-      StackName: item.stackName,
-      TemplateBody: JSON.stringify(template),
+    const { StackId } = await clients.cloudformation(item.region, credentials).send(new CreateStackCommand({
+      StackName: built.stackName,
+      TemplateBody: JSON.stringify(clusterTemplate({ ...built })),
       Capabilities: ['CAPABILITY_NAMED_IAM'],
       OnFailure: 'ROLLBACK',
-      Tags: [{ Key: 'lyrcloud', Value: 'managed' }, { Key: 'lyrcloud:cluster', Value: name }],
+      Tags: [{ Key: 'lyrcloud', Value: 'managed' }, { Key: 'lyrcloud:cluster', Value: item.name }],
     }));
-    item.stackId = StackId;
+    built.stackId = StackId;
   } catch (err) {
     const message = awsMessage(err);
     if (message) return error(400, message);
     throw err;
   }
-  await put(item);
-  return json(200, { cluster: publicCluster(item) });
+  return built;
 }
 
-async function createRemoteCluster(body, region, name, items, who) {
-  const connection = items.find((item) => item.row === 'connection' && item.provider === body.provider);
-  const ctx = await providerContext(connection);
-  const id = shortId();
-  const config = body.kind === 'kubernetes' && body.provider === 'azure' ? { nodeType: body.nodeType || 'Standard_B2s', nodes: body.nodes ?? 2 } : {};
-  const item = { ...clusterKey(id), row: 'cluster', id, ownerId: who.userId, ownerEmail: who.email, provider: body.provider, region: region.code, name, kind: body.kind, ...config, status: 'creating', createdAt: now() };
-  const state = await ctx.ops.createCluster(ctx, item);
-  const saved = { ...item, status: state.status, outputs: state.outputs || {} };
-  await put(saved);
-  return json(200, { cluster: publicCluster(saved) });
+// ---------------------------------------------------------------- Kubernetes management fee (fees.mjs)
+
+async function openFeePayment(cluster, who) {
+  const keys = await getLyrpay();
+  if (!lyrpay.usable(keys)) throw new CloudError(503, 'Paying for Kubernetes clusters isn’t switched on yet. Contact sales.');
+  const n = (cluster.payments || 0) + 1;
+  try {
+    const payment = await lyrpay.openPayment(keys, {
+      orderId: feeReference(cluster.id, n), amountCents: KUBERNETES_FEE_CENTS,
+      title: `Lyrcloud Kubernetes management: ${cluster.name}, 1 month`,
+      returnUrl: `${SITE_URL}/dash/#/cloud/clusters/${cluster.id}?paid=1`, cancelUrl: `${SITE_URL}/dash/#/cloud`,
+      metadata: { kind: 'cloud-kubernetes', cluster: cluster.id }, email: who.email,
+    });
+    return { id: payment.id, url: payment.url, n, openedAt: now() };
+  } catch (err) {
+    if (err instanceof lyrpay.LyrpayError) throw new CloudError(502, `Lyrpay: ${err.message}`);
+    throw err;
+  }
 }
+
+// Checks a cluster's open payment: paid adds a month (and builds a new cluster); expired drops it.
+async function settleFee(item) {
+  const pending = item.pendingPayment;
+  if (!pending) return item;
+  const payment = await lyrpay.getPayment(await getLyrpay(), pending.id).catch(() => null);
+  if (payment?.status === 'paid' && lyrpay.paidCents(payment) === KUBERNETES_FEE_CENTS && payment.currency === 'USD') {
+    let next = { ...item, paidThrough: addMonth(item.paidThrough), payments: pending.n, pendingPayment: null, updatedAt: now() };
+    if (item.status === 'awaiting_payment') {
+      next = { ...next, status: 'creating' };
+      const built = await buildCluster(next).catch((err) => error(err.status || 500, err.message));
+      if (built.statusCode) {
+        // Couldn't even start: give the money back rather than charge for nothing.
+        const refunded = await lyrpay.refundPayment(await getLyrpay(), pending.id).then(() => true, (err) => (console.error('fee refund failed', item.id, err.message), false));
+        next = { ...next, status: 'failed', paidThrough: item.paidThrough || null, failureReason: `${JSON.parse(built.body).error}${refunded ? ' Your payment was refunded to your Lyrpay balance.' : ' Contact support for a refund.'}` };
+      } else next = built;
+    }
+    await put(next);
+    return next;
+  }
+  if (payment && ['expired', 'cancelled'].includes(payment.status)) {
+    if (item.status === 'awaiting_payment') {
+      await remove(clusterKey(item.id));
+      return { ...item, status: 'deleted' };
+    }
+    return update(clusterKey(item.id), { pendingPayment: null });
+  }
+  return item;
+}
+
+async function feeRoutes(method, kind, item, who) {
+  if (method !== 'POST') return error(404, 'not_found');
+  if (kind === '/payment') return json(200, { cluster: publicCluster(await settleFee(item)) });
+  if (!feeState(item).needsFee) return error(400, 'This cluster has no management fee.');
+  if (item.pendingPayment && Date.now() - Date.parse(item.pendingPayment.openedAt) < 25 * 60_000) return json(200, { payUrl: item.pendingPayment.url });
+  const pendingPayment = await openFeePayment(item, who);
+  await update(clusterKey(item.id), { pendingPayment });
+  return json(200, { payUrl: pendingPayment.url });
+}
+
+const feeBlocked = (item, who) => {
+  const fee = feeState(item, new Date(), who.staff);
+  return fee.needsFee && !fee.active ? error(402, 'This cluster’s Kubernetes management isn’t paid. Renew it on the cluster page to make changes (it keeps running in your account meanwhile).') : null;
+};
 
 async function ownedCluster(id, who) {
   const item = /^[a-f0-9]{8}$/.test(id) && (await getItem(clusterKey(id)));
@@ -440,11 +541,21 @@ async function ownedCluster(id, who) {
 
 async function clusterRoutes(event, method, path, who) {
   if (path === '/cloud/clusters' && method === 'POST') return createCluster(event, who);
-  const match = path.match(/^\/cloud\/clusters\/([^/]+)(\/services)?$/);
+  const match = path.match(/^\/cloud\/clusters\/([^/]+)(\/services|\/pay|\/payment)?$/);
   if (!match) return error(404, 'not_found');
   const item = await ownedCluster(match[1], who);
   if (!item) return error(404, 'That cluster isn’t in your account.');
   if (item.ownerId !== who.userId && method !== 'GET') return error(403, 'Only the owner can change this cluster.');
+  if (match[2] === '/pay' || match[2] === '/payment') return feeRoutes(method, match[2], item, who);
+  if (item.status === 'awaiting_payment') {
+    if (method === 'GET') return json(200, { cluster: publicCluster(await settleFee(item)), services: [] });
+    if (method === 'DELETE') {
+      await remove(clusterKey(item.id));
+      return json(200, { cluster: publicCluster({ ...item, status: 'deleted' }) });
+    }
+    return error(409, 'Pay for the cluster first; Lyrcloud builds it once Lyrpay confirms.');
+  }
+  if ((method === 'PUT' || (method === 'POST' && match[2] === '/services')) && feeBlocked(item, who)) return feeBlocked(item, who);
   if (item.provider !== 'aws') return remoteClusterRoutes(event, method, match, item, who);
   const connection = await getItem(connectionKey(item.ownerId));
   const credentials = await credentialsFor(connection);
@@ -521,7 +632,10 @@ async function createRemoteService(event, cluster, who, ctx) {
   const refused = serviceError(body);
   if (refused) return error(...refused);
   const name = cleanName(body.name);
-  const siblings = (await itemsOf(who.userId)).filter((row) => row.row === 'service' && row.clusterId === cluster.id);
+  const allServices = (await itemsOf(who.userId)).filter((row) => row.row === 'service');
+  const overLimit = serviceLimitError(who.plan, allServices, who.staff);
+  if (overLimit) return error(...overLimit);
+  const siblings = allServices.filter((row) => row.clusterId === cluster.id);
   if (siblings.length >= MAX_SERVICES_PER_CLUSTER) return error(409, `A cluster can run up to ${MAX_SERVICES_PER_CLUSTER} services.`);
   if (siblings.some((row) => row.name === name)) return error(409, `This cluster already has a service called ${name}.`);
   const id = shortId();
@@ -556,7 +670,10 @@ async function createService(event, cluster, who, credentials) {
   const refused = serviceError(body);
   if (refused) return error(...refused);
   const name = cleanName(body.name);
-  const siblings = (await itemsOf(who.userId)).filter((row) => row.row === 'service' && row.clusterId === cluster.id);
+  const allServices = (await itemsOf(who.userId)).filter((row) => row.row === 'service');
+  const overLimit = serviceLimitError(who.plan, allServices, who.staff);
+  if (overLimit) return error(...overLimit);
+  const siblings = allServices.filter((row) => row.clusterId === cluster.id);
   if (siblings.length >= MAX_SERVICES_PER_CLUSTER) return error(409, `A cluster can run up to ${MAX_SERVICES_PER_CLUSTER} services.`);
   if (siblings.some((row) => row.name === name)) return error(409, `This cluster already has a service called ${name}.`);
   const id = shortId();
@@ -636,13 +753,21 @@ async function remoteServiceRoutes(event, method, item) {
 // ---------------------------------------------------------------- overview and admin
 
 async function overview(who) {
-  const items = await itemsOf(who.userId);
+  let items = await itemsOf(who.userId);
+  const pending = items.filter((item) => item.row === 'cluster' && item.pendingPayment);
+  if (pending.length) {
+    for (const item of pending) await settleFee(item).catch((err) => console.error('fee check', item.id, err.message));
+    items = await itemsOf(who.userId);
+  }
   return json(200, {
     connection: publicConnection(items.find((item) => item.row === 'connection' && (item.provider || 'aws') === 'aws')) || null,
     connections: Object.fromEntries(items.filter((item) => item.row === 'connection').map((item) => [item.provider || 'aws', publicConnection(item)])),
     clusters: items.filter((item) => item.row === 'cluster').map(publicCluster),
     services: items.filter((item) => item.row === 'service').map(publicService),
     accessRoleName: ACCESS_ROLE_NAME,
+    plan: who.plan,
+    limits: who.staff ? null : (await import('./fees.mjs')).limitsFor(who.plan),
+    kubernetesFeeCents: KUBERNETES_FEE_CENTS,
   });
 }
 

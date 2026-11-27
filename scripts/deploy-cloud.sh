@@ -26,7 +26,7 @@ python3 - "$work/code.zip" <<'PY'
 import glob, os, re, sys, zipfile
 # Every module in api/cloud (not the tests) plus what they import, so a new file can't be left out.
 paths = sorted(p for p in glob.glob('api/cloud/*.mjs') if not p.endswith('.test.mjs'))
-paths += ['api/account/roles.mjs', 'api/account/phone.mjs', 'src/clouds.js', 'src/cloud-pricing.js']
+paths += ['api/account/roles.mjs', 'api/account/phone.mjs', 'api/domains/lyrpay.mjs', 'src/clouds.js', 'src/cloud-pricing.js']
 for path in paths:
     for dep in re.findall(r"from '(\.{1,2}/[^']+)'", open(path).read()):
         target = os.path.normpath(os.path.join(os.path.dirname(path), dep))

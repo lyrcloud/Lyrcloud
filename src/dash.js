@@ -225,8 +225,8 @@ const canManage = (actorRole, targetRole) =>
   targetRole === 'user' ? isStaff(actorRole) : targetRole === 'admin' ? actorRole === 'superadmin' : false;
 
 const PLAN_INFO = {
-  launch: { name: 'Launch', price: '$0', blurb: 'CDN, TLS and DDoS protection for every site.', features: ['Global CDN', 'Free TLS certificates', 'Unmetered DDoS protection', '5 custom firewall rules'] },
-  scale: { name: 'Scale', price: '$29/mo', blurb: 'Adds the managed WAF and image optimization.', features: ['Everything in Launch', 'Managed WAF rules', 'Image optimization', 'Priority email support'] },
+  launch: { name: 'Launch', price: '$0', blurb: 'CDN, TLS and DDoS protection for every site.', features: ['Global CDN', 'Free TLS certificates', 'Unmetered DDoS protection', '5 custom firewall rules', '1 serverless cloud cluster, 2 services'] },
+  scale: { name: 'Scale', price: '$29/mo', blurb: 'Adds the managed WAF, image optimization and more cloud clusters.', features: ['Everything in Launch', 'Managed WAF rules', 'Image optimization', '3 cloud clusters, 10 services', 'Kubernetes clusters at $49/month each', 'Priority email support'] },
   enterprise: { name: 'Enterprise', price: 'Custom', blurb: 'SLAs, bot management and dedicated support.', features: ['Everything in Scale', '100% uptime SLA', 'Advanced bot management', 'Dedicated support engineer'] },
 };
 const PLAN_IDS = Object.keys(PLAN_INFO);
@@ -2480,6 +2480,7 @@ const CLOUD_BUSY = ['creating', 'updating', 'deleting'];
 const CLOUD_STATUS = {
   creating: ['pending', 'Creating…'], updating: ['pending', 'Updating…'], deleting: ['pending', 'Deleting…'],
   ready: ['ok', 'Ready'], failed: ['bad', 'Failed'], delete_failed: ['bad', 'Couldn’t delete'], deleted: ['bad', 'Deleted'],
+  awaiting_payment: ['pending', 'Waiting for payment'],
 };
 const cloudStatus = (status) => {
   const [cls, label] = CLOUD_STATUS[status] || ['pending', status];
@@ -2730,6 +2731,7 @@ function cloudView() {
       ${connectionsPanel(data)}
       <section class="panel">
         <div class="panel-head"><h2>Your clusters</h2>${clusters.length ? `<span class="muted">${clusters.length}</span>` : ''}</div>
+        ${data.limits ? `<p class="muted small">Your ${esc(planName(data.plan))} plan: Lyrcloud manages up to ${data.limits.clusters} cluster${data.limits.clusters === 1 ? '' : 's'} and ${data.limits.services} services${data.limits.kubernetes ? `, Kubernetes at ${usd(data.kubernetesFeeCents / 100)}/month per cluster (paid with Lyrpay)` : '; Kubernetes needs Scale'}. <a class="link" href="#/plans">Plans</a></p>` : ''}
         ${clusters.length ? `<div class="table-scroll"><table class="table">
           <thead><tr><th>Name</th><th>Region</th><th>Type</th><th>Status</th><th>About / month</th></tr></thead>
           <tbody>${clusters.map((c) => `<tr>
@@ -2802,8 +2804,25 @@ function cloudClusterView(route) {
   const { cluster, services } = detail;
   const ready = cluster.status === 'ready';
   const kube = cluster.kind === 'kubernetes';
+  if (route.params.get('paid') && !cloud.paidChecked?.has(id)) {
+    (cloud.paidChecked ||= new Set()).add(id);
+    cloudApi(`/cloud/clusters/${id}/payment`, { method: 'POST' }).then(() => { history.replaceState(null, '', `#/cloud/clusters/${id}`); loadCloudCluster(id); }, (error) => toast(error.message));
+  }
+  const fee = cluster.fee || {};
+  const feePanel = !fee.needsFee ? '' : cluster.status === 'awaiting_payment' ? `
+    <section class="panel callout">
+      <p><b>Waiting for payment.</b> Kubernetes management is ${usd(fee.monthlyCents / 100)}/month, paid with Lyrpay. Lyrcloud builds the cluster as soon as the first month is paid; an unpaid order is dropped after 30 minutes.</p>
+      <div class="row"><button class="btn primary" data-action="cloud-pay">Pay with Lyrpay</button><button class="btn" data-action="cloud-payment-check">I’ve paid</button></div>
+    </section>` : `
+    <section class="panel${fee.active ? '' : ' callout'}">
+      ${settingRow('Kubernetes management', fee.active
+        ? `${usd(fee.monthlyCents / 100)}/month, paid through ${formatDate(fee.paidThrough)}. It doesn’t renew by itself.`
+        : '<b>Not paid.</b> The cluster keeps running in your account, but Lyrcloud won’t change it until you renew. You can still delete it.',
+        `<button class="btn${fee.active && !fee.renewSoon ? '' : ' primary'}" data-action="cloud-pay">${fee.active ? 'Add a month' : 'Renew'} · Lyrpay</button>`)}
+    </section>`;
   return `
     ${pageHead(`<span class="mono">${esc(cluster.name)}</span>`, `${cloudStatus(cluster.status)} · ${KIND_LABELS[cluster.provider]?.[cluster.kind] || cluster.kind} · ${regionLabel(cluster.provider, cluster.region)}`, '<a class="btn" href="#/cloud">All clusters</a>')}
+    ${feePanel}
     ${cluster.status === 'creating' ? `<section class="panel callout"><p>Building in your ${CLOUD_NAMES[cluster.provider]} account… ${kube ? 'Kubernetes clusters take about 5–15 minutes.' : 'This takes about a minute.'} This page updates by itself.</p></section>` : ''}
     ${cluster.failureReason ? `<section class="panel"><p class="form-error">${esc(cluster.failureReason)}</p>${cluster.status === 'failed' ? '<p class="muted small">Nothing keeps running from a failed cluster; delete it to try again with the same name.</p>' : ''}</section>` : ''}
     <div class="grid-2">
@@ -2933,6 +2952,12 @@ const cloudClickActions = {
     const after = { aws: 'Delete the lyrcloud-access stack in AWS to remove the role.', gcp: 'Delete the lyrcloud workload identity provider in Google Cloud to remove access.', azure: 'Delete the Lyrcloud app registration in Azure to remove access.' }[provider];
     cloudRun(target, () => cloudApi(`/cloud/connections/${provider}`, { method: 'DELETE' }), `Disconnected. ${after}`, loadCloud);
   },
+  'cloud-pay': (target) => cloudRun(target, () => cloudApi(`/cloud/clusters/${currentRoute.clusterId}/pay`, { method: 'POST' }), '', ({ payUrl }) => { location.href = payUrl; }),
+  'cloud-payment-check': (target) => cloudRun(target, () => cloudApi(`/cloud/clusters/${currentRoute.clusterId}/payment`, { method: 'POST' }), '', ({ cluster }) => {
+    if (cluster.status === 'awaiting_payment') toast('Lyrpay hasn’t confirmed the payment yet. Try again in a moment.');
+    cloud.data = null;
+    return cluster.status === 'deleted' ? go('#/cloud') : loadCloudCluster(currentRoute.clusterId);
+  }),
   'cloud-copy-script': async (target) => {
     const script = cloud.data?.connections?.[target.dataset.provider]?.setupScript || '';
     try {
@@ -2980,8 +3005,13 @@ const cloudFormActions = {
     };
     const button = form.querySelector('[type="submit"]');
     button.disabled = true;
-    cloudApi('/cloud/clusters', { method: 'POST', body: JSON.stringify(body) }).then(({ cluster }) => {
+    cloudApi('/cloud/clusters', { method: 'POST', body: JSON.stringify(body) }).then(({ cluster, payUrl }) => {
       cloud.data = null;
+      if (payUrl) {
+        toast('Pay the first month of Kubernetes management in Lyrpay; Lyrcloud builds the cluster as soon as it’s paid.');
+        location.href = payUrl;
+        return;
+      }
       toast(`Building ${cluster.name}…`);
       go(`#/cloud/clusters/${cluster.id}`);
     }, (error) => {

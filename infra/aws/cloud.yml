@@ -102,6 +102,10 @@ Resources:
               - Effect: Allow
                 Action: [sts:GetWebIdentityToken, sts:TagGetWebIdentityToken]
                 Resource: '*'
+              # Kubernetes management fees paid with Lyrpay (fees.mjs); the same keys the domains API uses.
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:lyrcloud/lyrpay-*'
 
   CloudFunction:
     Type: AWS::Lambda::Function
@@ -118,6 +122,8 @@ Resources:
           USERS_TABLE_NAME: !Ref UsersTableName
           SUPER_ADMIN_EMAIL: !Ref SuperAdminEmail
           ACCESS_TEMPLATE_URL: !Sub 'https://${PublicBucket}.s3.amazonaws.com/cloud/access-role.json'
+          LYRPAY_SECRET_NAME: lyrcloud/lyrpay
+          SITE_URL: https://www.lyrcloud.com
       Code:
         S3Bucket: !Ref ArtifactsBucketName
         S3Key: !Ref LambdaCodeS3Key

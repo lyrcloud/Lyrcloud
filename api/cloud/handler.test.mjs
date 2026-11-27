@@ -7,6 +7,29 @@ import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 process.env.TABLE_NAME = 'cloud';
 process.env.USERS_TABLE_NAME = 'users';
 process.env.ACCESS_TEMPLATE_URL = 'https://lyrcloud-public.s3.amazonaws.com/cloud/access-role.json';
+process.env.LYRPAY_JSON = JSON.stringify({ secret_key: 'lpk_test', webhook_secret: 'lpwh_test' });
+
+// Lyrpay: payments the customer "approves" by setting their status.
+let lyrpayments;
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (url, init = {}) => {
+  const u = new URL(url);
+  if (u.host !== 'lyrpay.com') return realFetch(url, init);
+  const respond = (body) => ({ ok: true, status: 200, json: async () => body });
+  if (init.method === 'POST' && u.pathname.endsWith('/refund')) {
+    const p = lyrpayments.get(u.pathname.split('/').at(-2));
+    p.status = 'refunded';
+    return respond(p);
+  }
+  if (init.method === 'POST') {
+    const body = JSON.parse(init.body);
+    const id = `lpp_${String(lyrpayments.size + 1).padStart(24, '0')}`;
+    lyrpayments.set(id, { id, status: 'pending', amount: body.amount, currency: body.currency, reference: body.reference });
+    return respond({ ...lyrpayments.get(id), url: `https://lyrpay.com/pay/${id}` });
+  }
+  return respond(lyrpayments.get(u.pathname.split('/').pop()));
+};
+const payAll = () => lyrpayments.forEach((p) => { p.status = 'paid'; });
 const { clients, handler } = await import('./index.mjs');
 
 const SUPER = { userId: 'sub-super', email: 'lyrclouds@gmail.com', provider: 'GoogleOIDC' };
@@ -117,7 +140,8 @@ const cloudRows = () => [...tables.cloud.values()];
 
 beforeEach(() => {
   tables = { users: new Map(), cloud: new Map() };
-  for (const person of [SUPER, ALICE, BOB]) tables.users.set(person.userId, { ...person });
+  for (const person of [SUPER, ALICE, BOB]) tables.users.set(person.userId, { ...person, plan: 'scale' });
+  lyrpayments = new Map();
   trusted = {};
   stacks = new Map();
   calls = [];
@@ -145,9 +169,16 @@ test('a Kubernetes cluster is built in the customer’s account, in EKS-capable 
   assert.equal((await call(ALICE, 'POST', '/cloud/clusters', { name: 'prod', provider: 'azure', region: 'eastus', kind: 'kubernetes' })).status, 409, 'Azure not connected');
   assert.equal((await call(ALICE, 'POST', '/cloud/clusters', { name: 'prod', provider: 'aws', region: 'mars-1', kind: 'kubernetes' })).status, 400);
   assert.match((await call(ALICE, 'POST', '/cloud/clusters', { name: 'prod', provider: 'aws', region: 'us-east-1', kind: 'kubernetes' })).body.error, /administer/);
-  const res = await call(ALICE, 'POST', '/cloud/clusters', { name: 'prod', provider: 'aws', region: 'us-east-1', kind: 'kubernetes', nodeType: 't3.large', nodes: 3, adminArn: ADMIN_ARN });
-  assert.equal(res.status, 200);
+  const ordered = await call(ALICE, 'POST', '/cloud/clusters', { name: 'prod', provider: 'aws', region: 'us-east-1', kind: 'kubernetes', nodeType: 't3.large', nodes: 3, adminArn: ADMIN_ARN });
+  assert.equal(ordered.body.cluster.status, 'awaiting_payment', 'Kubernetes management is paid first');
+  assert.match(ordered.body.payUrl, /^https:\/\/lyrpay\.com\/pay\/lpp_/);
+  assert.equal([...lyrpayments.values()][0].amount, '49.00');
+  assert.equal(calls.some((c) => c.name === 'CreateStackCommand'), false, 'nothing built before paying');
+  assert.equal((await call(ALICE, 'POST', `/cloud/clusters/${ordered.body.cluster.id}/payment`)).body.cluster.status, 'awaiting_payment');
+  payAll();
+  const res = { body: (await call(ALICE, 'POST', `/cloud/clusters/${ordered.body.cluster.id}/payment`)).body };
   assert.equal(res.body.cluster.status, 'creating');
+  assert.equal(res.body.cluster.fee.active, true);
   assert.ok(Math.abs(res.body.cluster.estimate.monthly - (73 + 182.21 + 10.95)) < 0.01);
   const create = calls.find((c) => c.name === 'CreateStackCommand');
   assert.equal(create.session, 'session-for-arn:aws:iam::111122223333:role/LyrcloudAccess', 'runs as the customer’s role');
@@ -235,4 +266,64 @@ test('staff see everyone’s clusters; customers only their own', async () => {
   assert.equal((await call(BOB, 'GET', '/cloud')).body.clusters.length, 0);
   const admin = await call(SUPER, 'GET', '/admin/cloud');
   assert.deepEqual([admin.body.clusters.length, admin.body.clusters[0].ownerEmail, admin.body.connections[0].status], [1, ALICE.email, 'connected']);
+});
+
+test('plans limit what Lyrcloud manages; Kubernetes needs its monthly fee, but can always be deleted', async () => {
+  tables.users.get(ALICE.userId).plan = 'launch';
+  await connect(ALICE);
+  const kube = { name: 'kube', provider: 'aws', region: 'us-east-1', kind: 'kubernetes', adminArn: ADMIN_ARN };
+  const refused = await call(ALICE, 'POST', '/cloud/clusters', kube);
+  assert.deepEqual([refused.status, /Scale plan/.test(refused.body.error)], [402, true]);
+  assert.equal((await call(ALICE, 'POST', '/cloud/clusters', { name: 'one', provider: 'aws', region: 'us-east-1', kind: 'serverless' })).status, 200);
+  assert.equal((await call(ALICE, 'POST', '/cloud/clusters', { name: 'two', provider: 'aws', region: 'us-east-2', kind: 'serverless' })).status, 402, 'Launch manages one cluster');
+  assert.equal((await call(ALICE, 'GET', '/cloud')).body.limits.clusters, 1);
+
+  // Staff are exempt: no payment, built at once.
+  await connect(SUPER, '444455556666');
+  const staff = await call(SUPER, 'POST', '/cloud/clusters', { ...kube, name: 'staffkube' });
+  assert.equal(staff.body.cluster.status, 'creating');
+  assert.equal(staff.body.cluster.fee.needsFee, false);
+
+  // Scale: paid, then the month runs out: changes stop, deleting still works.
+  tables.users.get(ALICE.userId).plan = 'scale';
+  const ordered = await call(ALICE, 'POST', '/cloud/clusters', kube);
+  const { id } = ordered.body.cluster;
+  payAll();
+  await call(ALICE, 'POST', `/cloud/clusters/${id}/payment`);
+  finish('us-east-1', 'lyrcloud-cluster-kube', { ClusterName: 'lyrcloud-kube' });
+  tables.cloud.get(`cluster#${id}|cluster`).paidThrough = '2020-01-01T00:00:00.000Z';
+  tables.cloud.get(`cluster#${id}|cluster`).checkedAt = '2020-01-01T00:00:00.000Z';
+  assert.equal((await call(ALICE, 'GET', `/cloud/clusters/${id}`)).body.cluster.fee.active, false);
+  assert.equal((await call(ALICE, 'PUT', `/cloud/clusters/${id}`, { nodes: 3 })).status, 402);
+  const renew = await call(ALICE, 'POST', `/cloud/clusters/${id}/pay`);
+  assert.match(renew.body.payUrl, /lyrpay\.com\/pay\//);
+  payAll();
+  const renewed = await call(ALICE, 'POST', `/cloud/clusters/${id}/payment`);
+  assert.ok(Date.parse(renewed.body.cluster.fee.paidThrough) > Date.now() + 25 * 864e5, 'a month from now');
+  assert.equal((await call(ALICE, 'PUT', `/cloud/clusters/${id}`, { nodes: 3 })).status, 200);
+  tables.cloud.get(`cluster#${id}|cluster`).paidThrough = '2020-01-01T00:00:00.000Z';
+  tables.cloud.get(`cluster#${id}|cluster`).status = 'ready';
+  assert.equal((await call(ALICE, 'DELETE', `/cloud/clusters/${id}`)).status, 200, 'deleting is never blocked');
+});
+
+test('an unpaid cluster order is dropped when its payment expires', async () => {
+  await connect(ALICE);
+  const ordered = await call(ALICE, 'POST', '/cloud/clusters', { name: 'kube', provider: 'aws', region: 'us-east-1', kind: 'kubernetes', adminArn: ADMIN_ARN });
+  lyrpayments.forEach((p) => { p.status = 'expired'; });
+  const list = await call(ALICE, 'GET', '/cloud');
+  assert.equal(list.body.clusters.length, 0);
+  assert.equal(calls.some((c) => c.name === 'CreateStackCommand'), false);
+  assert.equal((await call(ALICE, 'GET', `/cloud/clusters/${ordered.body.cluster.id}`)).status, 404);
+});
+
+test('if a paid cluster can’t be built, the fee goes back to the customer', async () => {
+  await connect(ALICE);
+  stacks.set('us-east-1|lyrcloud-cluster-kube', { StackStatus: 'CREATE_COMPLETE' }); // taken in their account
+  const ordered = await call(ALICE, 'POST', '/cloud/clusters', { name: 'kube', provider: 'aws', region: 'us-east-1', kind: 'kubernetes', adminArn: ADMIN_ARN });
+  payAll();
+  const result = await call(ALICE, 'POST', `/cloud/clusters/${ordered.body.cluster.id}/payment`);
+  assert.equal(result.body.cluster.status, 'failed');
+  assert.match(result.body.cluster.failureReason, /refunded/);
+  assert.equal([...lyrpayments.values()][0].status, 'refunded');
+  assert.equal(result.body.cluster.fee.active, false);
 });

@@ -9,6 +9,20 @@ import { fullImage, remoteName, runBody } from './providers.mjs';
 
 process.env.TABLE_NAME = 'cloud';
 process.env.USERS_TABLE_NAME = 'users';
+process.env.LYRPAY_JSON = JSON.stringify({ secret_key: 'lpk_test', webhook_secret: 'lpwh_test' });
+let lyrpayments;
+globalThis.fetch = async (url, init = {}) => {
+  const u = new URL(url);
+  assert.equal(u.host, 'lyrpay.com');
+  const respond = (body) => ({ ok: true, status: 200, json: async () => body });
+  if (init.method === 'POST') {
+    const body = JSON.parse(init.body);
+    const id = `lpp_${String(lyrpayments.size + 1).padStart(24, '0')}`;
+    lyrpayments.set(id, { id, status: 'pending', amount: body.amount, currency: body.currency });
+    return respond({ ...lyrpayments.get(id), url: `https://lyrpay.com/pay/${id}` });
+  }
+  return respond(lyrpayments.get(u.pathname.split('/').pop()));
+};
 const { clients, handler } = await import('./index.mjs');
 
 const ALICE = { userId: 'sub-alice', email: 'alice@example.com', provider: 'GoogleOIDC' };
@@ -112,6 +126,14 @@ clients.fetch = async (url, init = {}) => {
   throw new Error(`unexpected request ${url}`);
 };
 
+// Orders a Kubernetes cluster, "pays" its first month in Lyrpay, and returns the built cluster.
+async function orderPaid(person, body) {
+  const ordered = await call(person, 'POST', '/cloud/clusters', body);
+  assert.equal(ordered.body.cluster.status, 'awaiting_payment', JSON.stringify(ordered.body));
+  lyrpayments.forEach((p) => { p.status = 'paid'; });
+  return call(person, 'POST', `/cloud/clusters/${ordered.body.cluster.id}/payment`);
+}
+
 const call = (person, method, path, body) => handler({
   requestContext: { http: { method, path }, authorizer: { jwt: { claims: { sub: person.userId } } } },
   body: body === undefined ? undefined : JSON.stringify(body),
@@ -119,7 +141,8 @@ const call = (person, method, path, body) => handler({
 
 beforeEach(() => {
   tables = { users: new Map(), cloud: new Map() };
-  for (const person of [ALICE, MALLORY]) tables.users.set(person.userId, { ...person });
+  for (const person of [ALICE, MALLORY]) tables.users.set(person.userId, { ...person, plan: 'scale' });
+  lyrpayments = new Map();
   gcpProjects = {};
   azureApps = {};
   requests = [];
@@ -164,7 +187,7 @@ test('Google Cloud: Cloud Run services go public once ready; Autopilot clusters 
   assert.ok(project.public.has('web-site'), 'anyone can open it');
   assert.equal((await call(ALICE, 'DELETE', `/cloud/clusters/${run.body.cluster.id}`)).status, 409, 'services first');
 
-  const gke = await call(ALICE, 'POST', '/cloud/clusters', { name: 'kube', provider: 'gcp', region: 'europe-west1', kind: 'kubernetes' });
+  const gke = await orderPaid(ALICE, { name: 'kube', provider: 'gcp', region: 'europe-west1', kind: 'kubernetes' });
   assert.equal(gke.body.cluster.status, 'creating');
   assert.equal(project.clusters.get('lyrcloud-kube').autopilot.enabled, true);
   project.clusters.get('lyrcloud-kube').status = 'RUNNING';
@@ -191,7 +214,7 @@ test('Azure: Lyrcloud only works in the connection’s own resource group', asyn
   assert.equal((await call(MALLORY, 'PUT', '/cloud/connections/azure', ids)).status, 403);
   requests = []; // from here on, only Alice's cluster work
 
-  const aks = await call(ALICE, 'POST', '/cloud/clusters', { name: 'kube', provider: 'azure', region: 'westeurope', kind: 'kubernetes', nodeType: 'Standard_B2s', nodes: 2 });
+  const aks = await orderPaid(ALICE, { name: 'kube', provider: 'azure', region: 'westeurope', kind: 'kubernetes', nodeType: 'Standard_B2s', nodes: 2 });
   assert.equal(aks.status, 200, JSON.stringify(aks.body));
   const resource = app.resources.get('Microsoft.ContainerService/managedClusters/lyrcloud-kube');
   assert.equal(resource.properties.agentPoolProfiles[0].count, 2);
