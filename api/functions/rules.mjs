@@ -44,7 +44,8 @@ export function mainError(main) {
 }
 
 // Checks the archive's file list ([{ name, size }]) against the limits and the entry file.
-export function archiveError(entries, main) {
+// `main` may be null for a static-only project; then `assetsDir` must hold at least one file.
+export function archiveError(entries, main, assetsDir = null) {
   if (!entries.length) return 'The upload has no files.';
   if (entries.length > MAX_FILES) return `Functions can have at most ${MAX_FILES} files.`;
   let total = 0;
@@ -54,7 +55,8 @@ export function archiveError(entries, main) {
     total += item.size;
   }
   if (total > MAX_UNZIPPED_BYTES) return `Functions can be at most ${MAX_UNZIPPED_BYTES / 1024 / 1024} MB unzipped.`;
-  if (!entries.some((item) => item.name === main)) return `The entry file ${main} isn’t in the upload.`;
+  if (main && !entries.some((item) => item.name === main)) return `The entry file ${main} isn’t in the upload.`;
+  if (assetsDir && !entries.some((item) => item.name.startsWith(`${assetsDir}/`))) return `The assets folder ${assetsDir} has no files in the upload.`;
   return null;
 }
 
@@ -98,3 +100,27 @@ export function nameFromHost(host, domain = FUNCTIONS_DOMAIN_DEFAULT) {
 // The certificate is renewed when it has less than this long left (it's issued for 90 days).
 export const CERT_RENEW_MS = 30 * 86_400_000;
 export const certNeedsRenewal = (cert, now = Date.now()) => !cert?.arn || !cert.notAfter || Date.parse(cert.notAfter) - now < CERT_RENEW_MS;
+
+// lyrcloud.json "assets": "public" or { "dir": "public", "spa": true, "maxAge": 3600, "htmlMaxAge": 60 }
+// -> [config, null], [null, null] when absent, or [null, problem].
+export function cleanAssets(assets) {
+  if (assets === undefined || assets === null || assets === false) return [null, null];
+  const raw = typeof assets === 'string' ? { dir: assets } : assets;
+  if (typeof raw !== 'object' || Array.isArray(raw)) return [null, '"assets" must be a folder name or { "dir": "public", "spa"?: true }.'];
+  const dir = String(raw.dir || '').replace(/^\.\//, '').replace(/\/+$/, '');
+  if (!dir || dir.startsWith('/') || dir.split('/').includes('..') || !/^[A-Za-z0-9_.\/-]+$/.test(dir)) return [null, '"assets.dir" must be a folder inside your project, such as "public".'];
+  const age = (value, name, fallback) => {
+    if (value === undefined) return [fallback, null];
+    const n = Number(value);
+    return Number.isInteger(n) && n >= 0 && n <= 31_536_000 ? [n, null] : [null, `"assets.${name}" must be seconds from 0 to 31536000.`];
+  };
+  const [maxAge, maxAgeProblem] = age(raw.maxAge, 'maxAge', 3600);
+  if (maxAgeProblem) return [null, maxAgeProblem];
+  const [htmlMaxAge, htmlProblem] = age(raw.htmlMaxAge, 'htmlMaxAge', 60);
+  if (htmlProblem) return [null, htmlProblem];
+  return [{ dir, spa: raw.spa === true, maxAge, htmlMaxAge }, null];
+}
+
+// The router caches responses that say they may be shared, for this many seconds at most.
+export const CACHE_MAX_SECONDS = 7 * 86400;
+export const CACHE_MAX_BODY = 300 * 1024; // base64 bytes; DynamoDB items stop at 400 KB

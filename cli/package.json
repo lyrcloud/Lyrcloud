@@ -1,6 +1,6 @@
 {
   "name": "lyrcloud",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "The Lyrcloud CLI: build and deploy edge functions to <name>.dev.lyr",
   "type": "module",
   "bin": {

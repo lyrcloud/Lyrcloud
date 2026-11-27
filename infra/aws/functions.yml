@@ -341,6 +341,9 @@ Resources:
   PutRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties: { ApiId: !Ref ControlApi, RouteKey: 'PUT /functions/{proxy+}', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  FunctionPostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref ControlApi, RouteKey: 'POST /functions/{proxy+}', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
   DeleteRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties: { ApiId: !Ref ControlApi, RouteKey: 'DELETE /functions/{proxy+}', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
@@ -425,13 +428,13 @@ Resources:
               - Effect: Allow
                 Action: lambda:InvokeFunction
                 Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:lyrfn-*'
-              # Access and Security: read each function's settings, sign sessions, mark tickets used,
-              # count rate limits and write the security log.
+              # Access, Security and the cache: read each function's settings, sign sessions, mark
+              # tickets used, count rate limits, write the security log, read and store cached answers.
               - Effect: Allow
                 Action: dynamodb:GetItem
                 Resource: !GetAtt FunctionsTable.Arn
               - Effect: Allow
-                Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
                 Resource: !GetAtt DataTable.Arn
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue

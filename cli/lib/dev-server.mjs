@@ -19,6 +19,9 @@ function isProtected(access, path) {
 
 const [root, portText] = process.argv.slice(2);
 const { config } = loadProject(root);
+// Static assets are served by the runtime from LYR_ROOT, as in production.
+process.env.LYR_ROOT = root;
+if (config.assets) process.env.LYR_ASSETS = JSON.stringify(typeof config.assets === 'string' ? { dir: config.assets } : config.assets);
 // KV namespaces and buckets are kept in .lyrcloud/storage/ while developing. AI calls go to the real
 // Lyrcloud AI Gateway as you (there's no local model), and count against your plan.
 const local = localStorage(root);
@@ -34,7 +37,7 @@ const env = makeEnv(config.vars || {}, bindingsOf(config), call);
 let mod;
 let loadError = null;
 try {
-  mod = await import(pathToFileURL(path.join(root, config.main)).href);
+  mod = config.main ? await import(pathToFileURL(path.join(root, config.main)).href) : null;
 } catch (err) {
   loadError = err;
   console.error(`Couldn’t load ${config.main}:`, err);

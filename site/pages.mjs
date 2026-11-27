@@ -353,7 +353,7 @@ ${ctaBand('Not sure where to start?', 'Our solutions engineers will map your arc
 
 const cliCommands = [
   ['lyrcloud login', 'Sign in with your Lyrcloud account in the browser (<code>--email</code> for email and password).'],
-  ['lyrcloud init <name>', 'Create a new edge function project in <code>./&lt;name&gt;</code>.'],
+  ['lyrcloud init <name> [--static]', 'Create a new edge function project, or a static site, in <code>./&lt;name&gt;</code>.'],
   ['lyrcloud dev', 'Run the project on <code>localhost:8787</code> with the same runtime as production, reloading on every edit.'],
   ['lyrcloud deploy', 'Upload the project and make it live at <code>https://&lt;name&gt;.dev.lyr</code>.'],
   ['lyrcloud list', 'List your functions, their status and addresses.'],
@@ -366,6 +366,7 @@ const cliCommands = [
   ['lyrcloud ai models | run | usage', 'See the models on your plan, ask one from the terminal, and check this month’s tokens.'],
   ['lyrcloud access log [name]', 'See who signed in to a protected function, allowed or refused.'],
   ['lyrcloud security log [name]', 'See which requests your security rules blocked or logged.'],
+  ['lyrcloud cache purge [--path | --prefix]', 'Clear cached responses for a function: everything, one path or a prefix.'],
 ];
 
 const developersPage = {
@@ -487,6 +488,20 @@ const { data } = await env.AI.embed(['first text', 'second text']);`)}</code></p
   "blockIps": ["203.0.113.0/24"],
   "headers": true
 }`)}</code></pre>
+      </section>
+
+      <section id="cdn" class="section">
+        <div class="section-heading compact">
+          <span class="eyebrow">CDN</span>
+          <h2>Caching and static sites</h2>
+          <p>Return <code class="inline">Cache-Control: public, max-age=…</code> and Lyrcloud serves repeats from cache. Add <code class="inline">"assets": "public"</code> to serve a folder of files, or start a static site with <code class="inline">lyrcloud init my-site --static</code>.</p>
+        </div>
+        <div class="section-grid">
+          <pre class="snippet"><code>${escape(`"assets": { "dir": "public", "spa": true }`)}</code></pre>
+          <pre class="snippet"><code>${escape(`lyrcloud cache purge                  # everything
+lyrcloud cache purge --path /pricing
+lyrcloud cache purge --prefix /blog`)}</code></pre>
+        </div>
       </section>
 
       <section id="cli" class="section">

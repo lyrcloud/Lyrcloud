@@ -11,7 +11,7 @@ ARTIFACTS_BUCKET="${ARTIFACTS_BUCKET:-lyrcloud-deploy-artifacts}"
 FUNCTIONS_DOMAIN="${FUNCTIONS_DOMAIN:-dev.lyr}"
 
 for f in zip runtime; do cmp -s "api/functions/$f.mjs" "cli/lib/$f.mjs" || { echo "cli/lib/$f.mjs differs from api/functions/$f.mjs" >&2; exit 1; }; done
-node --test api/functions/rules.test.mjs api/functions/handler.test.mjs api/functions/storage.test.mjs api/functions/ai.test.mjs api/functions/access.test.mjs api/functions/security.test.mjs
+node --test api/functions/rules.test.mjs api/functions/handler.test.mjs api/functions/storage.test.mjs api/functions/ai.test.mjs api/functions/access.test.mjs api/functions/security.test.mjs api/functions/cdn.test.mjs
 
 param() {
   aws cloudformation describe-stacks --stack-name lyrcloud-account-api \

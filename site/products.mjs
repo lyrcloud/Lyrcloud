@@ -4,22 +4,28 @@ export const products = [
     slug: 'cdn',
     icon: '⚡',
     name: 'Global CDN',
-    group: 'Application performance',
-    tagline: 'Cache everything, everywhere, in milliseconds.',
-    summary: 'Serve static and dynamic content from a global edge network with tiered caching, smart routing, and instant purges.',
+    group: 'Application services',
+    tagline: 'Cache answers. Serve files. Purge in one command.',
+    summary: 'Response caching, static files and whole static sites for your edge functions, with cache headers you control and purges from the CLI.',
     features: [
-      ['Tiered cache', 'Upper-tier data centers shield your origin so cache misses rarely leave the network.'],
-      ['Instant purge', 'Purge by URL, tag, prefix, or everything — propagated worldwide in under 150 ms.'],
-      ['Smart routing', 'Real-time latency telemetry steers traffic around congested internet paths.'],
-      ['Image optimization', 'Resize, compress, and convert to AVIF/WebP on the fly at the edge.'],
-      ['HTTP/3 & 0-RTT', 'Modern protocols enabled by default for faster handshakes on every device.'],
-      ['Cache rules', 'Fine-grained TTLs, bypass rules, and custom cache keys per hostname or path.'],
+      ['Response caching', 'Answer with <code>Cache-Control: public, max-age=60</code> and repeat requests are served from cache without running your code.'],
+      ['Static files & sites', '<code>"assets": "public"</code> serves a folder with content types, ETags and clean URLs. A project can be just a static site.'],
+      ['Single-page apps', 'Set <code>"spa": true</code> and unknown routes get <code>index.html</code>.'],
+      ['Purge from the CLI', '<code>lyrcloud cache purge</code> clears everything, one path or a prefix. Every deploy starts with a fresh cache.'],
+      ['Safe by default', 'Private, cookie-setting, signed-in and Access-protected responses are never cached. <code>x-lyr-cache</code> shows HIT, MISS or BYPASS.'],
+      ['Image optimization & edge locations', 'Coming soon.'],
     ],
-    code: `# Purge a single URL from every edge location
-lyrcloud cache purge https://www.example.com/app.js
+    code: `// lyrcloud.json: "assets": "public"
+export default {
+  async fetch(request) {
+    const data = await expensiveLookup();
+    return Response.json(data, {
+      headers: { 'cache-control': 'public, max-age=300' },
+    });
+  },
+};
 
-# Purge everything tagged "product-42"
-lyrcloud cache purge --tag product-42`,
+// $ lyrcloud cache purge --prefix /blog`,
   },
   {
     slug: 'security',

@@ -31,8 +31,14 @@ export function loadProject(dir = process.cwd()) {
   } catch (err) {
     throw new ProjectError(`${CONFIG_FILE} isn’t valid JSON: ${err.message}`);
   }
-  const main = config.main || 'index.js';
-  if (!existsSync(path.join(root, main))) throw new ProjectError(`The entry file ${main} (set by "main" in ${CONFIG_FILE}) doesn’t exist.`);
+  // A project with "assets" and no "main" (or no index.js) is a static site.
+  const assetsDir = typeof config.assets === 'string' ? config.assets : config.assets?.dir;
+  if (assetsDir && !existsSync(path.join(root, assetsDir))) throw new ProjectError(`The assets folder ${assetsDir} (set by "assets" in ${CONFIG_FILE}) doesn’t exist.`);
+  let main = config.main || 'index.js';
+  if (!existsSync(path.join(root, main))) {
+    if (assetsDir && !config.main) main = null;
+    else throw new ProjectError(`The entry file ${main} (set by "main" in ${CONFIG_FILE}) doesn’t exist.`);
+  }
   return { root, config: { ...config, main } };
 }
 

@@ -84,6 +84,12 @@ Visitors sign in at www.lyrcloud.com and only the emails and domains you list (a
 
 Rules run before your function: rate limits per visitor IP (`10s`, `1m`, `10m`, `1h`), IP block and allow lists (CIDR), a firewall for common attacks (`"log"` only records), bot checks (`"challenge"` for browsers, `"block"` for automation tools) and secure response headers. `lyrcloud security log` shows what was stopped. `lyrcloud dev` doesn't apply these rules.
 
+## Caching and static sites
+
+Answer with `Cache-Control: public, max-age=300` (or `s-maxage`) and Lyrcloud serves repeat requests from cache; `x-lyr-cache` says HIT, MISS or BYPASS. Private, cookie-setting, signed-in and Access-protected responses are never cached, and each deploy starts fresh. `lyrcloud cache purge [--path /p | --prefix /blog]` clears it.
+
+`"assets": "public"` (or `{ "dir": "public", "spa": true, "maxAge": 3600 }`) serves that folder before your code runs, with content types and ETags. Without `main`, the project is a static site: `lyrcloud init my-site --static`.
+
 ## lyrcloud.json
 
 ```json

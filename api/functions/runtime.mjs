@@ -8,14 +8,92 @@
 // API Gateway result. `env` holds the function's variables (LYR_VARS) and bindings (LYR_BINDINGS: KV
 // namespaces, object buckets and the AI Gateway, which call the platform function with this function's token), and
 // nothing from Lambda's own environment. ctx.waitUntil(promise) work finishes before the invocation ends.
+import { createHash } from 'node:crypto';
+import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+// LYR_ROOT is set by `lyrcloud dev`; in Lambda the code lives in LAMBDA_TASK_ROOT.
+const rootDir = () => process.env.LYR_ROOT || process.env.LAMBDA_TASK_ROOT || process.cwd();
+
+// A static-only project (assets and no "main") has no module to load.
 let loaded;
 function load() {
-  const root = process.env.LAMBDA_TASK_ROOT || process.cwd();
-  loaded ??= import(pathToFileURL(path.join(root, process.env.LYR_MAIN || 'index.js')).href);
+  if (!process.env.LYR_MAIN) return Promise.resolve(null);
+  loaded ??= import(pathToFileURL(path.join(rootDir(), process.env.LYR_MAIN)).href);
   return loaded;
+}
+
+// ---------------------------------------------------------------- static assets
+
+// LYR_ASSETS: { dir, spa, maxAge, htmlMaxAge } from lyrcloud.json "assets". Files there are answered
+// before fetch() runs, with a content type, an ETag and a Cache-Control the router's cache honours.
+const TYPES = {
+  '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.json': 'application/json',
+  '.map': 'application/json', '.txt': 'text/plain; charset=utf-8', '.xml': 'application/xml', '.csv': 'text/csv; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.avif': 'image/avif', '.ico': 'image/x-icon', '.woff': 'font/woff', '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf', '.otf': 'font/otf', '.pdf': 'application/pdf', '.mp4': 'video/mp4', '.webm': 'video/webm', '.mp3': 'audio/mpeg',
+  '.wasm': 'application/wasm', '.webmanifest': 'application/manifest+json', '.zip': 'application/zip',
+};
+export const contentTypeOf = (file) => TYPES[path.extname(file).toLowerCase()] || 'application/octet-stream';
+
+const assetsConfig = () => {
+  try {
+    return JSON.parse(process.env.LYR_ASSETS || 'null');
+  } catch {
+    return null;
+  }
+};
+
+async function isFile(file) {
+  try {
+    return (await stat(file)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+// The asset response for this request, or null to let fetch() (or a 404) handle it.
+export async function serveAsset(event, assets = assetsConfig()) {
+  if (!assets?.dir) return null;
+  const method = (event.requestContext?.http?.method || 'GET').toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD') return null;
+  let wanted;
+  try {
+    wanted = decodeURIComponent(event.rawPath || '/');
+  } catch {
+    return null;
+  }
+  if (wanted.includes('\0') || wanted.split('/').includes('..')) return null;
+  const base = path.resolve(rootDir(), assets.dir);
+  const inside = (rel) => {
+    const file = path.resolve(base, `.${rel}`);
+    return file === base || file.startsWith(base + path.sep) ? file : null;
+  };
+  const candidates = wanted.endsWith('/') ? [`${wanted}index.html`] : [wanted, `${wanted}.html`, `${wanted}/index.html`];
+  let file = null;
+  for (const rel of candidates) {
+    const found = inside(rel);
+    if (found && (await isFile(found))) {
+      file = found;
+      break;
+    }
+  }
+  if (!file && assets.spa && !path.extname(wanted)) {
+    const index = inside('/index.html');
+    if (index && (await isFile(index))) file = index;
+  }
+  if (!file) return null;
+  const bytes = await readFile(file);
+  const etag = `"${createHash('sha1').update(bytes).digest('base64url').slice(0, 20)}"`;
+  const type = contentTypeOf(file);
+  const maxAge = type.startsWith('text/html') ? (assets.htmlMaxAge ?? 60) : (assets.maxAge ?? 3600);
+  const headers = { 'content-type': type, etag, 'cache-control': `public, max-age=${maxAge}` };
+  const sent = event.headers?.['if-none-match'] || event.headers?.['If-None-Match'];
+  if (sent && sent.split(',').map((v) => v.trim()).includes(etag)) return { statusCode: 304, headers, body: '' };
+  return { statusCode: 200, headers, body: method === 'HEAD' ? '' : bytes.toString('base64'), isBase64Encoded: method !== 'HEAD' };
 }
 
 // ---------------------------------------------------------------- storage bindings
@@ -208,6 +286,9 @@ const plain = (statusCode, text) => ({ statusCode, headers: { 'content-type': 't
 
 // `envOverride` lets `lyrcloud dev` pass bindings backed by local files.
 export async function run(mod, event, envOverride) {
+  const asset = await serveAsset(event);
+  if (asset) return asset;
+  if (!mod) return plain(404, 'Not found');
   const app = mod.default ?? mod;
   const fetch = typeof app === 'function' ? app : app?.fetch;
   if (typeof fetch !== 'function') {

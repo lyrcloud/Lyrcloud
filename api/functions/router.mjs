@@ -12,7 +12,7 @@ import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-sec
 import {
   ACCESS_HEADER, cookieValue, isProtected, REQUEST_SECONDS, safeReturn, SESSION_COOKIE, SESSION_SECONDS, sign, TICKET_SECONDS, verify,
 } from './access.mjs';
-import { FUNCTIONS_DOMAIN_DEFAULT, lambdaName, nameFromHost } from './rules.mjs';
+import { CACHE_MAX_BODY, CACHE_MAX_SECONDS, FUNCTIONS_DOMAIN_DEFAULT, lambdaName, nameFromHost } from './rules.mjs';
 import {
   CHALLENGE_SECONDS, challengePage, HUMAN_COOKIE, HUMAN_SECONDS, ipMatches, looksAutomated, solves, underPath, wafMatch, withSecureHeaders,
 } from './security.mjs';
@@ -48,9 +48,12 @@ async function settingsOf(name) {
   const hit = policies.get(name);
   if (hit && hit.at > clock.now() - 30_000) return hit.settings;
   const { Item } = await ddb.send(new GetCommand({
-    TableName: env.FUNCTIONS_TABLE, Key: { pk: `fn#${name}`, sk: 'fn' }, ProjectionExpression: '#a, #s, ownerId', ExpressionAttributeNames: { '#a': 'access', '#s': 'security' },
+    TableName: env.FUNCTIONS_TABLE, Key: { pk: `fn#${name}`, sk: 'fn' }, ProjectionExpression: '#a, #s, ownerId, deploys, cacheVersion', ExpressionAttributeNames: { '#a': 'access', '#s': 'security' },
   }));
-  const settings = { access: Item?.access || null, security: Item?.security || null, ownerId: Item?.ownerId || null };
+  const settings = {
+    access: Item?.access || null, security: Item?.security || null, ownerId: Item?.ownerId || null,
+    cacheVersion: `${Item?.deploys || 0}.${Item?.cacheVersion || 0}`,
+  };
   policies.set(name, { settings, at: clock.now() });
   return settings;
 }
@@ -151,6 +154,40 @@ async function screen(event, name, settings, headers) {
   return null;
 }
 
+// ---------------------------------------------------------------- cache
+
+// Seconds a function's response may be shared for, or 0. Only plain public answers are kept: no
+// cookies, no private/no-store, no Vary beyond Accept-Encoding, and small enough for one table item.
+export function cacheSeconds(answer) {
+  if (![200, 203, 301, 404, 410].includes(answer.statusCode)) return 0;
+  if (answer.cookies?.length || answer.multiValueHeaders) return 0;
+  const headers = Object.fromEntries(Object.entries(answer.headers || {}).map(([k, v]) => [k.toLowerCase(), String(v)]));
+  if (headers['set-cookie']) return 0;
+  const vary = (headers.vary || '').toLowerCase().split(',').map((v) => v.trim()).filter(Boolean);
+  if (vary.some((v) => v !== 'accept-encoding')) return 0;
+  const cc = (headers['cache-control'] || '').toLowerCase();
+  if (!cc || /\b(private|no-store|no-cache)\b/.test(cc)) return 0;
+  const shared = /\bs-maxage=(\d+)/.exec(cc);
+  const max = /\bmax-age=(\d+)/.exec(cc);
+  if (!shared && !(max && /\bpublic\b/.test(cc))) return 0;
+  const seconds = Number((shared || max)[1]);
+  if (!(seconds > 0)) return 0;
+  if (String(answer.body || '').length > CACHE_MAX_BODY) return 0;
+  return Math.min(seconds, CACHE_MAX_SECONDS);
+}
+
+const withCacheHeader = (answer, state, age) => ({
+  ...answer,
+  headers: { ...(answer.headers || {}), 'x-lyr-cache': state, ...(age !== undefined ? { age: String(age) } : {}) },
+});
+
+async function cacheLookup(key) {
+  if (!env.DATA_TABLE_NAME) return null;
+  const { Item } = await ddb.send(new GetCommand({ TableName: env.DATA_TABLE_NAME, Key: key }));
+  if (!Item || Item.expiresAt <= Math.floor(clock.now() / 1000)) return null;
+  return Item;
+}
+
 async function acceptChallenge(event, name) {
   const params = new URLSearchParams(event.rawQueryString || '');
   const challenge = verify(await platformSecret(), 'challenge', params.get('token'), clock.now());
@@ -218,6 +255,22 @@ export const handler = async (event) => {
     headers[ACCESS_HEADER] = session.email;
   }
 
+  // The cache: GET and HEAD for paths that aren't behind Access, without an Authorization header.
+  const method = (event.requestContext?.http?.method || 'GET').toUpperCase();
+  const cacheable = (method === 'GET' || method === 'HEAD') && !isProtected(policy, path) && !Object.keys(headers).some((k) => k.toLowerCase() === 'authorization');
+  const cacheKey = { pk: `cache#${name}#${settings.cacheVersion || '0.0'}`, sk: path + (event.rawQueryString ? `?${event.rawQueryString}` : '') };
+  if (cacheable) {
+    const hit = await cacheLookup(cacheKey).catch((err) => {
+      console.error('Cache read failed', err);
+      return null;
+    });
+    if (hit) {
+      const age = Math.max(0, Math.floor(clock.now() / 1000) - hit.storedAt);
+      const answer = { statusCode: hit.statusCode, headers: hit.headers, body: method === 'HEAD' ? '' : hit.body, isBase64Encoded: method === 'HEAD' ? false : hit.isBase64Encoded };
+      return finish(withCacheHeader(answer, 'HIT', age));
+    }
+  }
+
   let result;
   try {
     result = await lambda.send(new InvokeCommand({ FunctionName: lambdaName(name), Payload: Buffer.from(JSON.stringify(forwarded)) }));
@@ -238,7 +291,17 @@ export const handler = async (event) => {
   }
   try {
     const answer = JSON.parse(text);
-    if (answer && typeof answer.statusCode === 'number') return finish(answer);
+    if (answer && typeof answer.statusCode === 'number') {
+      const seconds = cacheable && method === 'GET' ? cacheSeconds(answer) : 0;
+      if (seconds && env.DATA_TABLE_NAME) {
+        const storedAt = Math.floor(clock.now() / 1000);
+        await ddb.send(new PutCommand({
+          TableName: env.DATA_TABLE_NAME,
+          Item: { ...cacheKey, statusCode: answer.statusCode, headers: answer.headers || {}, body: answer.body || '', isBase64Encoded: Boolean(answer.isBase64Encoded), storedAt, expiresAt: storedAt + seconds },
+        })).catch((err) => console.error('Cache write failed', err));
+      }
+      return finish(cacheable ? withCacheHeader(answer, seconds ? 'MISS' : 'BYPASS') : answer);
+    }
   } catch {
     // fall through
   }

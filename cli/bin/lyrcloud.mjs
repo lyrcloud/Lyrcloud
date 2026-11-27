@@ -24,7 +24,7 @@ ${bold('Commands')}
   login [--email]          Sign in (opens your browser; --email for email and password)
   logout                   Sign out on this computer
   whoami                   Show who you're signed in as
-  init <name>              Create a new function project in ./<name>
+  init <name> [--static]   Create a new project in ./<name> (--static: a static site)
   dev [--port 8787]        Run the project locally, reloading on changes
   deploy [--name <name>]   Upload the project and make it live
   list                     List your functions
@@ -53,6 +53,9 @@ ${bold('Access')}
 ${bold('Security')}
   security log [name] [--since 7d] Requests your security rules blocked or logged
 
+${bold('Cache')}
+  cache purge [name] [--path /p | --prefix /blog]   Clear cached responses (everything by default)
+
 ${bold('Options')}
   -h, --help               Show help
   -v, --version            Show the version
@@ -65,7 +68,7 @@ function parseArgs(argv) {
   const positional = [];
   const flags = {};
   const aliases = { f: 'follow', y: 'yes', p: 'port', h: 'help', v: 'version', n: 'name' };
-  const valued = new Set(['port', 'since', 'name', 'prefix', 'ttl', 'file', 'out', 'type', 'system', 'max-tokens', 'month']);
+  const valued = new Set(['port', 'since', 'name', 'prefix', 'ttl', 'file', 'out', 'type', 'system', 'max-tokens', 'month', 'path']);
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--') {
@@ -140,6 +143,21 @@ export default {
 };
 `;
 
+const STATIC_TEMPLATE = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title><name></title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <h1><name></h1>
+    <p>Served from <code>public/</code> by Lyrcloud. Edit this file and run <code>lyrcloud deploy</code>.</p>
+  </body>
+</html>
+`;
+
 async function init([name], flags) {
   if (!name) throw new UsageError('Give the project a name: lyrcloud init <name>');
   const problem = nameError(name);
@@ -147,7 +165,13 @@ async function init([name], flags) {
   const dir = path.resolve(name);
   if (existsSync(dir) && readdirSync(dir).length && !flags.force) throw new UsageError(`${name}/ already exists and isn’t empty. Use --force to write into it.`);
   mkdirSync(dir, { recursive: true });
-  const files = {
+  const files = flags.static ? {
+    [CONFIG_FILE]: `${JSON.stringify({ name, assets: { dir: 'public' } }, null, 2)}\n`,
+    'public/index.html': STATIC_TEMPLATE.replaceAll('<name>', name),
+    'public/style.css': 'body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 15vh auto; padding: 0 1rem; line-height: 1.6; }\n',
+    'package.json': `${JSON.stringify({ name, version: '0.0.0', private: true, scripts: { dev: 'lyrcloud dev', deploy: 'lyrcloud deploy' } }, null, 2)}\n`,
+    '.gitignore': '.lyrcloud/\n',
+  } : {
     [CONFIG_FILE]: `${JSON.stringify({ name, main: 'index.js', vars: { GREETING: 'Hello' } }, null, 2)}\n`,
     'index.js': TEMPLATE.replace('<name>', name),
     'package.json': `${JSON.stringify({ name, version: '0.0.0', private: true, type: 'module', scripts: { dev: 'lyrcloud dev', deploy: 'lyrcloud deploy' } }, null, 2)}\n`,
@@ -155,6 +179,7 @@ async function init([name], flags) {
   };
   for (const [file, content] of Object.entries(files)) {
     if (existsSync(path.join(dir, file)) && !flags.force) continue;
+    mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
     writeFileSync(path.join(dir, file), content);
   }
   ok(`Created ${bold(name)} in ./${path.relative(process.cwd(), dir) || '.'}`);
@@ -228,7 +253,7 @@ async function deploy(_, flags) {
   }
   console.log(dim(`Uploading ${files.length} file${files.length === 1 ? '' : 's'} (${formatBytes(projectSize(files))}, ${formatBytes(zip.length)} zipped)…`));
   const started = Date.now();
-  const { function: fn } = await api('PUT', `/functions/${name}`, { body: { code: zip.toString('base64'), main: config.main, vars: config.vars || {}, kv: config.kv, buckets: config.buckets, ai: config.ai, access: config.access, security: config.security } });
+  const { function: fn } = await api('PUT', `/functions/${name}`, { body: { code: zip.toString('base64'), main: config.main, vars: config.vars || {}, kv: config.kv, buckets: config.buckets, ai: config.ai, access: config.access, security: config.security, assets: config.assets } });
   ok(`Deployed ${bold(name)} ${dim(`in ${((Date.now() - started) / 1000).toFixed(1)}s`)}`);
   console.log(`  ${cyan(fn.url)}`);
   if (fn.access) {
@@ -497,7 +522,17 @@ async function securityCommand([action, ...rest], flags) {
   table(events.map((e) => [e.time.replace('T', ' ').slice(0, 19), e.action === 'block' ? red('blocked') : yellow('logged'), e.rule, `${e.method || ''} ${e.path || ''}`.trim(), e.ip || '']), ['TIME', 'ACTION', 'RULE', 'REQUEST', 'IP']);
 }
 
-const COMMANDS = { login, logout, whoami, init, dev, deploy, list, ls: list, logs, tail: logs, delete: remove, rm: remove, storage, kv: kvCommand, bucket: bucketCommand, buckets: bucketCommand, ai: aiCommand, access: accessCommand, security: securityCommand };
+async function cacheCommand([action, ...rest], flags) {
+  if (action !== 'purge') throw new UsageError('Usage: lyrcloud cache purge [name] [--path /p | --prefix /blog]');
+  const name = nameFor(rest, flags);
+  const body = typeof flags.path === 'string' ? { path: flags.path } : typeof flags.prefix === 'string' ? { prefix: flags.prefix } : {};
+  const out = await api('POST', `/functions/${name}/purge`, { body });
+  if (out.purged === 'all') ok(`Purged everything cached for ${bold(name)}.`);
+  else if (out.purged === 'path') ok(`Purged ${bold(out.path)} on ${name}.`);
+  else ok(`Purged ${out.count} cached response${out.count === 1 ? '' : 's'} under ${bold(out.prefix)} on ${name}.`);
+}
+
+const COMMANDS = { login, logout, whoami, init, dev, deploy, list, ls: list, logs, tail: logs, delete: remove, rm: remove, storage, kv: kvCommand, bucket: bucketCommand, buckets: bucketCommand, ai: aiCommand, access: accessCommand, security: securityCommand, cache: cacheCommand };
 
 // ---------------------------------------------------------------- main
 

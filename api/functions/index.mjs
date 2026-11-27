@@ -61,6 +61,7 @@ import { issueCertificate } from '../domains/lyrca.mjs';
 import {
   archiveError,
   certNeedsRenewal,
+  cleanAssets,
   cleanVars,
   FUNCTIONS_DOMAIN_DEFAULT,
   functionNameError,
@@ -156,6 +157,7 @@ const publicFunction = (item) => ({
   bindings: item.bindings || [],
   access: item.access ? { allow: item.access.allow, paths: item.access.paths } : null,
   security: item.security || null,
+  assets: item.assets || null,
   codeBytes: item.codeBytes || 0,
   deploys: item.deploys || 0,
   createdAt: item.createdAt,
@@ -254,11 +256,12 @@ async function waitUntilReady(functionName) {
   throw new UserError(504, 'The function is taking longer than usual to start. Run deploy again in a minute.');
 }
 
-async function putLambda(name, zip, main, vars, bindings, ownerId) {
+async function putLambda(name, zip, main, vars, bindings, ownerId, assets = null) {
   const FunctionName = lambdaName(name);
   const Environment = {
     Variables: {
-      LYR_MAIN: main,
+      LYR_MAIN: main || '',
+      LYR_ASSETS: assets ? JSON.stringify(assets) : '',
       LYR_VARS: JSON.stringify(vars),
       LYR_BINDINGS: JSON.stringify(bindings),
       LYR_PLATFORM: PLATFORM_FUNCTION || '',
@@ -336,17 +339,23 @@ async function ensureDomain(name) {
   return domain.DomainNameConfigurations?.[0]?.ApiGatewayDomainName;
 }
 
+// Deletes a custom domain and its mappings; throws TooManyRequestsException when API Gateway is busy.
+async function deleteDomain(DomainName, tries) {
+  try {
+    const { Items = [] } = await apigw.send(new GetApiMappingsCommand({ DomainName }));
+    for (const mapping of Items) await patiently(() => apigw.send(new DeleteApiMappingCommand({ DomainName, ApiMappingId: mapping.ApiMappingId })), { tries });
+    await patiently(() => apigw.send(new DeleteDomainNameCommand({ DomainName })), { tries });
+  } catch (err) {
+    if (err.name !== 'NotFoundException') throw err;
+  }
+}
+
+// The function stops answering first (record and Lambda gone), then its address is removed. API
+// Gateway allows few domain changes a minute, so a busy address is left for the daily cleanup.
 async function removeFunctionResources(name) {
   const FunctionName = lambdaName(name);
   const DomainName = hostFor(name, DOMAIN);
   await setLyrRecord(DomainName, null);
-  try {
-    const { Items = [] } = await apigw.send(new GetApiMappingsCommand({ DomainName }));
-    for (const mapping of Items) await patiently(() => apigw.send(new DeleteApiMappingCommand({ DomainName, ApiMappingId: mapping.ApiMappingId })));
-    await patiently(() => apigw.send(new DeleteDomainNameCommand({ DomainName })));
-  } catch (err) {
-    if (err.name !== 'NotFoundException') throw err;
-  }
   try {
     await lambda.send(new DeleteFunctionCommand({ FunctionName }));
   } catch (err) {
@@ -357,6 +366,31 @@ async function removeFunctionResources(name) {
   } catch (err) {
     if (err.name !== 'ResourceNotFoundException') throw err;
   }
+  try {
+    await deleteDomain(DomainName, 3);
+  } catch (err) {
+    if (err.name !== 'TooManyRequestsException') throw err;
+    await ddb.send(new PutCommand({ TableName: DATA_TABLE, Item: { pk: 'cleanup#domain', sk: name, at: now() } }));
+  }
+}
+
+// Daily: remove addresses left behind by busy deletes, unless the name has been deployed again since.
+export async function cleanupDomains() {
+  const { Items = [] } = await ddb.send(new QueryCommand({ TableName: DATA_TABLE, KeyConditionExpression: 'pk = :pk', ExpressionAttributeValues: { ':pk': 'cleanup#domain' } }));
+  let removed = 0;
+  for (const row of Items) {
+    if (!(await getItem(fnKey(row.sk)))) {
+      try {
+        await deleteDomain(hostFor(row.sk, DOMAIN), 6);
+        removed += 1;
+      } catch (err) {
+        if (err.name === 'TooManyRequestsException') break;
+        throw err;
+      }
+    }
+    await ddb.send(new DeleteCommand({ TableName: DATA_TABLE, Key: { pk: row.pk, sk: row.sk } }));
+  }
+  return removed;
 }
 
 // ---------------------------------------------------------------- routes
@@ -364,8 +398,12 @@ async function removeFunctionResources(name) {
 async function deploy(event, name, who) {
   const body = parseJson(event);
   if (!body) return error(400, 'Invalid JSON body.');
-  const main = body.main ?? 'index.js';
-  const mainProblem = mainError(main);
+  const [assets, assetsProblem] = cleanAssets(body.assets);
+  if (assetsProblem) return error(400, assetsProblem);
+  // "main": null deploys a static-only project (assets and no code).
+  const main = body.main === undefined ? 'index.js' : body.main;
+  if (main === null && !assets) return error(400, 'Set "main" to your entry file, or "assets" to a folder of files to serve.');
+  const mainProblem = main === null ? null : mainError(main);
   if (mainProblem) return error(400, mainProblem);
   const [vars, varsProblem] = cleanVars(body.vars);
   if (varsProblem) return error(400, varsProblem);
@@ -385,7 +423,7 @@ async function deploy(event, name, who) {
     if (err instanceof ZipError) return error(400, err.message);
     throw err;
   }
-  const archiveProblem = archiveError(entries, main);
+  const archiveProblem = archiveError(entries, main, assets?.dir);
   if (archiveProblem) return error(400, archiveProblem);
 
   let item = await getItem(fnKey(name));
@@ -406,7 +444,7 @@ async function deploy(event, name, who) {
 
   const zip = addZipEntry(code, RUNTIME_ENTRY, runtime());
   try {
-    await putLambda(name, zip, main, vars, bindings, who.userId);
+    await putLambda(name, zip, main, vars, bindings, who.userId, assets);
     const target = await ensureDomain(name);
     await setLyrRecord(hostFor(name, DOMAIN), target);
   } catch (err) {
@@ -415,7 +453,7 @@ async function deploy(event, name, who) {
     if (err instanceof UserError) return error(err.statusCode, err.message);
     throw err;
   }
-  const saved = { ...item, status: 'live', main, vars, bindings, access: access || undefined, security: security || undefined, codeBytes: code.length, deploys: (item.deploys || 0) + 1, updatedAt: now(), lastError: undefined };
+  const saved = { ...item, status: 'live', main, vars, bindings, access: access || undefined, security: security || undefined, assets: assets || undefined, codeBytes: code.length, deploys: (item.deploys || 0) + 1, updatedAt: now(), lastError: undefined };
   delete saved.lastError;
   await ddb.send(new PutCommand({ TableName: TABLE, Item: saved }));
   return json(200, { function: publicFunction(saved) });
@@ -447,7 +485,7 @@ async function functionRoutes(event, method, path, who) {
     const items = (await functionsOf(who.userId)).sort((a, b) => a.name.localeCompare(b.name));
     return json(200, { functions: items.map(publicFunction), limit: limitFor(who.plan), plan: who.plan, domain: DOMAIN });
   }
-  const match = path.match(/^\/functions\/([^/]+)(\/logs|\/access-log|\/security-log)?$/);
+  const match = path.match(/^\/functions\/([^/]+)(\/logs|\/access-log|\/security-log|\/purge)?$/);
   if (!match) return error(404, 'not_found');
   const name = decodeURIComponent(match[1]).toLowerCase();
   const problem = functionNameError(name);
@@ -460,6 +498,10 @@ async function functionRoutes(event, method, path, who) {
   if (match[2] === '/logs' && method === 'GET') return readLogs(event, name);
   if (match[2] === '/access-log' && method === 'GET') return readAccessLog(event, item);
   if (match[2] === '/security-log' && method === 'GET') return readSecurityLog(event, item);
+  if (match[2] === '/purge' && method === 'POST') {
+    if (item.ownerId !== who.userId && who.role !== 'superadmin') return error(403, 'Only the owner can purge this function’s cache.');
+    return purgeCache(event, item);
+  }
   if (!match[2] && method === 'GET') return json(200, { function: publicFunction(item) });
   if (!match[2] && method === 'DELETE') {
     if (item.ownerId !== who.userId && who.role !== 'superadmin') return error(403, 'Only the owner can delete this function.');
@@ -568,6 +610,42 @@ async function readAccessLog(event, item) {
   return json(200, { events: Items.map((row) => ({ time: row.sk.split('#')[0], email: row.email, allowed: row.allowed, path: row.path, ip: row.ip })) });
 }
 
+// ---------------------------------------------------------------- cache
+
+// The router keeps cached responses under pk "cache#<name>#<deploys>.<cacheVersion>", sk the path and
+// query. A new deploy, or a full purge (a new cacheVersion), starts an empty cache; old entries expire.
+export const cacheVersionOf = (item) => `${item.deploys || 0}.${item.cacheVersion || 0}`;
+
+async function purgeCache(event, item) {
+  const body = parseJson(event) || {};
+  const pk = `cache#${item.name}#${cacheVersionOf(item)}`;
+  if (typeof body.path === 'string') {
+    if (!body.path.startsWith('/')) return error(400, 'path must start with /.');
+    await ddb.send(new DeleteCommand({ TableName: DATA_TABLE, Key: { pk, sk: body.path } }));
+    return json(200, { purged: 'path', path: body.path });
+  }
+  if (typeof body.prefix === 'string') {
+    if (!body.prefix.startsWith('/')) return error(400, 'prefix must start with /.');
+    let count = 0;
+    let ExclusiveStartKey;
+    do {
+      const page = await ddb.send(new QueryCommand({
+        TableName: DATA_TABLE, KeyConditionExpression: 'pk = :pk AND begins_with(sk, :p)', ExpressionAttributeValues: { ':pk': pk, ':p': body.prefix },
+        ProjectionExpression: 'pk, sk', ExclusiveStartKey,
+      }));
+      for (const row of page.Items || []) {
+        await ddb.send(new DeleteCommand({ TableName: DATA_TABLE, Key: { pk: row.pk, sk: row.sk } }));
+        count += 1;
+      }
+      ExclusiveStartKey = page.LastEvaluatedKey;
+    } while (ExclusiveStartKey && count < 10_000);
+    return json(200, { purged: 'prefix', prefix: body.prefix, count });
+  }
+  const saved = { ...item, cacheVersion: (item.cacheVersion || 0) + 1, updatedAt: now() };
+  await ddb.send(new PutCommand({ TableName: TABLE, Item: saved }));
+  return json(200, { purged: 'all' });
+}
+
 async function readSecurityLog(event, item) {
   const since = parseSince(event.queryStringParameters?.since || '7d');
   if (since === null) return error(400, 'Use since like 1h, 7d or 30d.');
@@ -620,7 +698,8 @@ async function adminRoutes(method, path, who) {
 export const handler = async (event) => {
   if (event.task === 'renew-certificate' || event.source === 'aws.events') {
     const cert = await ensureCertificate({ force: event.force === true });
-    return { arn: cert.arn, notAfter: cert.notAfter };
+    const domainsRemoved = DATA_TABLE ? await cleanupDomains() : 0;
+    return { arn: cert.arn, notAfter: cert.notAfter, domainsRemoved };
   }
   const method = event.requestContext?.http?.method;
   const path = event.requestContext?.http?.path || '';

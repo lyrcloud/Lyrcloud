@@ -12,7 +12,7 @@ import { createRoot } from '../domains/lyrca.mjs';
 Object.assign(process.env, {
   TABLE_NAME: 'functions', USERS_TABLE_NAME: 'users', DOMAINS_TABLE_NAME: 'domains', FUNCTIONS_DOMAIN: 'dev.lyr',
   EXEC_ROLE_ARN: 'arn:aws:iam::1:role/exec', INGRESS_API_ID: 'ingress', LYR_CA_SECRET_NAME: 'ca',
-  PLATFORM_SECRET: 'test-secret', PLATFORM_FUNCTION: 'lyrcloud-functions-platform',
+  PLATFORM_SECRET: 'test-secret', PLATFORM_FUNCTION: 'lyrcloud-functions-platform', DATA_TABLE_NAME: 'data',
 });
 const { handler, timing } = await import('./index.mjs');
 const { createZip, listZip } = await import('./zip.mjs');
@@ -49,6 +49,9 @@ DynamoDBDocumentClient.prototype.send = async function send(command) {
   if (name === 'DeleteCommand') {
     t.delete(k(input.Key));
     return {};
+  }
+  if (name === 'QueryCommand' && input.ExpressionAttributeValues[':pk']) {
+    return { Items: [...t.values()].filter((item) => item.pk === input.ExpressionAttributeValues[':pk']) };
   }
   if (name === 'QueryCommand') {
     const owner = input.ExpressionAttributeValues[':o'];
@@ -110,6 +113,7 @@ ApiGatewayV2Client.prototype.send = async function send(command) {
     domains.get(DomainName).mappings = [];
     return {};
   }
+  if (name === 'DeleteDomainNameCommand' && throttleDomains) throw awsError('TooManyRequestsException');
   if (name === 'DeleteDomainNameCommand') {
     domains.delete(DomainName);
     return {};
@@ -264,4 +268,20 @@ test('deploying with storage bindings gives the function a token for its owner',
   assert.match(parse(await call('PUT', '/functions/bad', { body: { code: code(), kv: { 'no good': 'x' } } })).error, /valid binding/);
   const storage = parse(await call('GET', '/storage'));
   assert.deepEqual(storage, { status: 200, kv: ['cache'], buckets: ['uploads'] });
+});
+
+test('a delete while API Gateway is busy still takes the function down, and the daily run removes the address', async () => {
+  await call('PUT', '/functions/busy', { body: { code: code() } });
+  throttleDomains = true;
+  const res = parse(await call('DELETE', '/functions/busy'));
+  assert.equal(res.status, 200, res.error);
+  assert.equal(lambdas.has('lyrfn-busy'), false);
+  assert.deepEqual(table('domains').get('lyr#dev.lyr|lyr').records, []);
+  assert.ok(domains.has('busy.dev.lyr'));
+  assert.ok(table('data').has('cleanup#domain|busy'));
+  throttleDomains = false;
+  const daily = await handler({ task: 'renew-certificate' });
+  assert.equal(daily.domainsRemoved, 1);
+  assert.equal(domains.has('busy.dev.lyr'), false);
+  assert.equal(table('data').size, 0);
 });
