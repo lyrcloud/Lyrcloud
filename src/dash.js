@@ -1120,6 +1120,10 @@ function importView() {
         <input name="url" id="import-url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://github.com/owner/repo" />
         <small class="muted">GitHub, GitLab, Bitbucket, Codeberg or any https git URL. A “/tree/branch” link picks that branch.</small>
       </label>
+      <label class="field only-url">Bitbucket access token <span class="muted small">optional: private repositories, and deploy on every push</span>
+        <input name="bitbucketToken" type="password" autocomplete="off" placeholder="Repository access token" />
+        <small class="muted">In Bitbucket: Repository settings → Access tokens → Create, with <b>Repositories: Read</b> and <b>Webhooks: Read and write</b>. Lyrcloud stores it encrypted and adds a webhook that redeploys on push.</small>
+      </label>
       <label class="field only-repo">Repository
         <select name="repo" id="import-repo">${repoOptions}</select>
       </label>
@@ -1165,13 +1169,14 @@ function projectsView(route) {
   const rows = list.map((item) => `
     <tr>
       <td><a class="link" href="#/projects/${item.projectId}">${esc(item.name)}</a><div class="muted mono">${esc(item.url.replace('https://', ''))}</div></td>
-      <td>${item.github ? `GitHub · ${esc(item.github.fullName)}` : item.source ? `${SOURCE_LABELS[item.source.provider] || 'Git'} · ${esc(item.source.url.replace(/^https:\/\/[^/]+\//, ''))}` : '—'}</td>
+      <td>${item.github ? `GitHub · ${esc(item.github.fullName)}` : item.bitbucket ? `Bitbucket · ${esc(item.bitbucket.fullName)} <span class="muted small">· deploys on push</span>` : item.source ? `${SOURCE_LABELS[item.source.provider] || 'Git'} · ${esc(item.source.url.replace(/^https:\/\/[^/]+\//, ''))}` : '—'}</td>
       <td>${deployBadge(item.status)}</td>
       <td>${item.lastDeployAt ? formatDate(item.lastDeployAt) : '<span class="muted">—</span>'}</td>
     </tr>`).join('');
   return `
     ${pageHead('Projects', `Import any git repository and put it live at <span class="mono">name.${esc(projects.data.domain)}</span>.`, '<a class="btn primary" href="#/projects?new=1">+ Import project</a>')}
     ${githubPanel(github)}
+    ${jiraPanel()}
     ${list.length
       ? `<section class="panel"><div class="table-scroll"><table class="table">
           <thead><tr><th>Project</th><th>Source</th><th>Status</th><th>Last deploy</th></tr></thead>
@@ -1183,6 +1188,31 @@ function projectsView(route) {
           <div class="row center"><a class="btn primary" href="#/projects?new=1">Import project</a></div>
         </section>`}
     <p class="muted">${limits.used} of ${limits.projects} projects on your ${esc(PLAN_INFO[limits.plan]?.name || limits.plan)} plan · ${limits.buildsPerDay} builds a day.</p>`;
+}
+
+// Jira: comment on the issues in each commit message when a deploy goes live.
+function jiraPanel() {
+  if (projects.jira === undefined && !projects.jiraLoading) {
+    projects.jiraLoading = true;
+    projectsApi('/projects/jira').then(({ jira }) => { projects.jira = jira; }, () => { projects.jira = null; }).finally(() => { projects.jiraLoading = false; render(); });
+  }
+  const jira = projects.jira;
+  if (jira) {
+    return `<section class="panel">${settingRow('Jira', `Connected to <span class="mono">${esc(jira.site.replace('https://', ''))}</span> as ${esc(jira.accountName)}. When a deploy goes live, Lyrcloud comments on the issues named in its commit message (like SHOP-12) with the address.`, '<button class="btn" data-action="jira-disconnect">Disconnect</button>')}</section>`;
+  }
+  return `
+    <details class="panel">
+      <summary><b>Connect Jira</b> <span class="muted small">· live deploys comment on the issues in the commit message</span></summary>
+      <form class="stack" data-form="jira-connect">
+        <div class="field-grid">
+          <label class="field">Jira site<input name="site" placeholder="yourteam.atlassian.net" required autocomplete="off" /></label>
+          <label class="field">Atlassian email<input name="email" type="email" required autocomplete="email" /></label>
+          <label class="field">API token<input name="token" type="password" required autocomplete="off" /></label>
+        </div>
+        <p class="muted small">Make the token at id.atlassian.com → Security → API tokens. Lyrcloud keeps it encrypted and only uses it to add those comments.</p>
+        <div class="row"><button class="btn primary" type="submit">Connect Jira</button></div>
+      </form>
+    </details>`;
 }
 
 const shortCommit = (commit) => (commit ? `<code>${esc(commit.slice(0, 7))}</code>` : '');
@@ -1261,7 +1291,7 @@ async function importProject(form, data) {
   const settings = Object.fromEntries(['branch', 'rootDir', 'installCommand', 'buildCommand', 'outputDir'].map((field) => [field, String(data.get(field) || '').trim()]).filter(([, value]) => value));
   const body = {
     name: String(data.get('name')).trim().toLowerCase(),
-    source: kind === 'repo' ? { repo: String(data.get('repo')) } : { url: String(data.get('url')).trim() },
+    source: kind === 'repo' ? { repo: String(data.get('repo')) } : { url: String(data.get('url')).trim(), ...(String(data.get('bitbucketToken') || '').trim() ? { token: String(data.get('bitbucketToken')).trim() } : {}) },
     mode,
     settings,
     ...(mode === 'copy' || mode === 'fork' ? { copy: { name: String(data.get('copyName') || '').trim() || undefined, private: data.get('copyPrivate') === 'on' } } : {}),
@@ -3546,6 +3576,11 @@ const clickActions = {
   'account-menu': (target) => setAccountMenu(target.getAttribute('aria-expanded') !== 'true'),
   'avatar-provider': () => saveProfile({ avatar: null }, 'Using your sign-in photo'),
   'avatar-initials': () => saveProfile({ avatar: 'initials' }, 'Photo removed'),
+  'jira-disconnect': async () => {
+    await projectsApi('/projects/jira', { method: 'DELETE' }).catch((error) => toast(error.message));
+    projects.jira = null;
+    render();
+  },
   'github-connect': (target) => connectGithubAccount(target),
   'github-disconnect': async (target) => {
     if (!confirmed(target, 'Disconnect GitHub? Linked projects stop deploying on push until you reconnect.')) return;
@@ -3677,6 +3712,18 @@ const showFormError = (form, message) => {
 
 const formActions = {
   'project-import': (form, data) => importProject(form, data),
+  'jira-connect': async (form, data) => {
+    const button = form.querySelector('[type="submit"]');
+    button.disabled = true;
+    try {
+      ({ jira: projects.jira } = await projectsApi('/projects/jira', { method: 'PUT', body: JSON.stringify(Object.fromEntries(data)) }));
+      toast('Jira connected');
+      render();
+    } catch (error) {
+      toast(error.message);
+      button.disabled = false;
+    }
+  },
   'project-settings': async (form, data) => {
     const button = form.querySelector('[type="submit"]');
     button.disabled = true;

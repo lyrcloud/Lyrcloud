@@ -108,8 +108,23 @@ CloudFrontKeyValueStoreClient.prototype.send = async function send(command) {
 };
 
 // GitHub: an installation that can see "ada/blog", and a user who can create repositories.
+// Bitbucket (repo "ada/shop", token "bb-token") and Jira (ada.atlassian.net, ada@example.com / "jira-token").
+let atlassian;
 globalThis.fetch = async (url, options = {}) => {
-  const { pathname } = new URL(url);
+  const { pathname, host } = new URL(url);
+  const atlas = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  if (host === 'api.bitbucket.org') {
+    if (options.headers.authorization !== 'Bearer bb-token') return atlas({ error: { message: 'Unauthorized' } }, 401);
+    if (pathname === '/2.0/repositories/ada/shop') return atlas({ is_private: true, mainbranch: { name: 'trunk' } });
+    if (pathname === '/2.0/repositories/ada/shop/hooks') return atlassian.hooks.push(JSON.parse(options.body)), atlas({ uuid: '{h}' }, 201);
+    return atlas({ error: { message: 'Not found' } }, 404);
+  }
+  if (host === 'ada.atlassian.net') {
+    if (options.headers.authorization !== `Basic ${Buffer.from('ada@example.com:jira-token').toString('base64')}`) return atlas({}, 401);
+    if (pathname === '/rest/api/3/myself') return atlas({ displayName: 'Ada L' });
+    const key = pathname.match(/issue\/([^/]+)\/comment/)?.[1];
+    if (key) return atlassian.comments.push([key, JSON.parse(options.body)]), atlas({ id: '1' }, 201);
+  }
   githubCalls.push([options.method || 'GET', pathname, options.body ? JSON.parse(options.body) : undefined]);
   const reply = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
   if (pathname === '/login/oauth/access_token') return reply({ access_token: 'ghu_user', refresh_token: 'ghr_refresh', expires_in: 28800, refresh_token_expires_in: 15811200 });
@@ -152,6 +167,7 @@ beforeEach(() => {
   objects = new Map();
   routes = new Map();
   githubCalls = [];
+  atlassian = { hooks: [], comments: [] };
 });
 
 test('import a public URL, build it and go live', async () => {
@@ -299,4 +315,61 @@ test('staff can disable a project, which takes it offline; owners delete their p
   assert.equal(routes.has('shady'), false);
   assert.equal([...objects.keys()].some((k) => k.includes(body.project.projectId)), false);
   assert.equal((await call(BOB, 'POST', '/projects', { name: 'shady', source: { url: 'https://github.com/a/b' } })).status, 201, 'the name is free again');
+});
+
+test('Bitbucket: a private repository with an access token clones privately and redeploys on signed pushes', async () => {
+  const { createHmac } = await import('node:crypto');
+  const refused = await call(ADA, 'POST', '/projects', { name: 'shop', source: { url: 'https://bitbucket.org/ada/shop', token: 'wrong' } });
+  assert.equal(refused.status, 400);
+  assert.equal((await call(ADA, 'POST', '/projects', { name: 'shop', source: { url: 'https://github.com/ada/blog', token: 'x' } })).status, 400, 'tokens are for Bitbucket');
+  const res = await call(ADA, 'POST', '/projects', { name: 'shop', source: { url: 'https://bitbucket.org/ada/shop', token: 'bb-token' } });
+  assert.equal(res.status, 201, JSON.stringify(res.body));
+  assert.deepEqual(res.body.project.bitbucket, { fullName: 'ada/shop', url: 'https://bitbucket.org/ada/shop', deployOnPush: true });
+  const [hook] = atlassian.hooks;
+  assert.equal(hook.url, `https://projects.example.com/public/bitbucket/webhook?p=${res.body.project.projectId}`);
+  assert.deepEqual(hook.events, ['repo:push']);
+  const stored = project(res.body.project.projectId);
+  assert.equal(JSON.stringify(stored).includes('bb-token'), false, 'the token is sealed');
+  const [buildId] = builds.keys();
+  const vars = Object.fromEntries(builds.get(buildId).environment.environmentVariables.map(({ name, value }) => [name, value]));
+  assert.equal(vars.LYR_SOURCE_URL, 'https://x-token-auth:bb-token@bitbucket.org/ada/shop.git');
+  assert.equal(vars.LYR_BRANCH, 'trunk', 'the repository’s main branch');
+
+  const deliver = (payload, secret = hook.secret, eventKey = 'repo:push') => {
+    const body = JSON.stringify(payload);
+    return handler({
+      requestContext: { http: { method: 'POST', path: '/public/bitbucket/webhook' }, domainName: 'projects.example.com' },
+      rawQueryString: `p=${res.body.project.projectId}`,
+      headers: { 'x-event-key': eventKey, 'x-hub-signature': `sha256=${createHmac('sha256', secret).update(body).digest('hex')}` },
+      body,
+    });
+  };
+  const push = (branch) => ({ push: { changes: [{ new: { type: 'branch', name: branch, target: { hash: 'f00d', message: 'SHOP-12 new checkout\nmore' } } }] } });
+  assert.equal((await deliver(push('trunk'), 'forged')).statusCode, 401);
+  assert.equal(builds.size, 1);
+  assert.match((await deliver(push('feature'))).body, /another branch/);
+  const started = JSON.parse((await deliver(push('trunk'))).body).started;
+  assert.equal(started.length, 1);
+  assert.equal(builds.size, 2);
+});
+
+test('Jira: deploys that go live comment on the issues in the commit message', async () => {
+  assert.equal((await call(ADA, 'PUT', '/projects/jira', { site: 'ada.example.com', email: 'ada@example.com', token: 'jira-token' })).status, 400, 'an atlassian.net site');
+  assert.equal((await call(ADA, 'PUT', '/projects/jira', { site: 'ada.atlassian.net', email: 'ada@example.com', token: 'nope' })).status, 400);
+  const ok = await call(ADA, 'PUT', '/projects/jira', { site: 'https://ada.atlassian.net/jira', email: 'ada@example.com', token: 'jira-token' });
+  assert.deepEqual([ok.body.jira.site, ok.body.jira.accountName], ['https://ada.atlassian.net', 'Ada L']);
+  assert.equal(JSON.stringify([...items.values()]).includes('jira-token'), false, 'sealed');
+
+  const res = await call(ADA, 'POST', '/projects', { name: 'shop', source: { url: 'https://bitbucket.org/ada/shop', token: 'bb-token' } });
+  const [buildId] = builds.keys();
+  const deploy = [...items.values()].find((item) => item.sk?.startsWith('deploy#'));
+  deploy.message = 'SHOP-12 and SHOP-13: new checkout (not abc-1)';
+  await finishBuild(buildId, { 'index.html': 10 });
+  assert.deepEqual(atlassian.comments.map(([key]) => key), ['SHOP-12', 'SHOP-13']);
+  const text = JSON.stringify(atlassian.comments[0][1]);
+  assert.ok(text.includes('https://shop.lyrcloud.app'), text);
+  assert.equal((await call(ADA, 'GET', '/projects/jira')).body.jira.site, 'https://ada.atlassian.net');
+  await call(ADA, 'DELETE', '/projects/jira');
+  assert.equal((await call(ADA, 'GET', '/projects/jira')).body.jira, null);
+  assert.ok(res.body.project);
 });

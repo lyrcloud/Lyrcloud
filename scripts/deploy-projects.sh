@@ -51,7 +51,14 @@ for root in ['@aws-sdk/client-cloudfront-keyvaluestore', '@aws-sdk/signature-v4a
     deps(root, needed)
 
 with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED) as z:
-    for name in ['index', 'rules', 'github', 'buildspec', 'sigv4a']:
+    # Every module in api/projects (not the tests), so a new file can't be left out of the Lambda.
+    import glob, re
+    names = sorted(os.path.basename(p)[:-4] for p in glob.glob('api/projects/*.mjs') if not p.endswith('.test.mjs'))
+    for name in names:
+        for dep in re.findall(r"from '\./([\w-]+)\.mjs'", open(f'api/projects/{name}.mjs').read()):
+            if dep not in names:
+                sys.exit(f'api/projects/{name}.mjs imports ./{dep}.mjs, which does not exist')
+    for name in names:
         z.write(f'api/projects/{name}.mjs', f'projects/{name}.mjs')
     for name in ['roles', 'phone']:
         z.write(f'api/account/{name}.mjs', f'account/{name}.mjs')

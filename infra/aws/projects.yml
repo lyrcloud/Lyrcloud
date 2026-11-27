@@ -361,6 +361,10 @@ Resources:
     Type: AWS::ApiGatewayV2::Route
     Properties: { ApiId: !Ref HttpApi, RouteKey: 'POST /public/github/webhook', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE }
 
+  BitbucketWebhookRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'POST /public/bitbucket/webhook', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE }
+
   Stage:
     Type: AWS::ApiGatewayV2::Stage
     Properties:

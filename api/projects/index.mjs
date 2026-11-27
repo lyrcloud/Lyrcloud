@@ -19,8 +19,12 @@
 //   GET    /public/github-app/created                  GitHub's redirect after the app is created
 //   GET    /public/github/callback                     GitHub's redirect after a user installs the app
 //   POST   /public/github/webhook                      push events → redeploy
+//   POST   /public/bitbucket/webhook?p={id}            Bitbucket push events → redeploy (atlassian.mjs)
+//   GET|PUT|DELETE /projects/jira                      { site, email, token } comment on Jira issues when deploys go live
+// A Bitbucket repository with source.token (an access token) is cloned privately and redeploys on push.
 //
 // The same function receives CodeBuild state changes from EventBridge and publishes finished builds.
+import { randomBytes } from 'node:crypto';
 import './sigv4a.mjs';
 import { CloudFrontKeyValueStoreClient, DeleteKeyCommand, DescribeKeyValueStoreCommand, PutKeyCommand } from '@aws-sdk/client-cloudfront-keyvaluestore';
 import { CloudWatchLogsClient, GetLogEventsCommand } from '@aws-sdk/client-cloudwatch-logs';
@@ -31,6 +35,7 @@ import { GetSecretValueCommand, PutSecretValueCommand, SecretsManagerClient } fr
 import { DeleteCommand, DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { isStaff, planFor, roleFor } from '../account/roles.mjs';
 import { buildspec } from './buildspec.mjs';
+import { AtlassianError, bitbucketCloneUrl, bitbucketPushes, cleanJiraSite, connectBitbucket, notifyJira, validBitbucketSignature, verifyJira } from './atlassian.mjs';
 import {
   appManifest,
   convertManifest,
@@ -209,6 +214,7 @@ async function allowBuild(ownerId, plan) {
 // ---------------------------------------------------------------- GitHub connection
 
 const connectionKey = (userId) => ({ pk: `github#${userId}`, sk: 'connection' });
+const jiraKey = (userId) => ({ pk: `jira#${userId}`, sk: 'jira' });
 
 // A current user token for the caller, refreshing it when it has expired.
 async function userAccess(userId) {
@@ -299,6 +305,8 @@ async function startDeployment(project, { trigger, copy, commit, message } = {})
   } else if (project.github) {
     sourceUrl = tokenCloneUrl(await installationToken(await getGithubApp(), project.github.installationId), project.github.fullName);
     settings.branch ||= project.github.branch;
+  } else if (project.bitbucket) {
+    sourceUrl = bitbucketCloneUrl(unseal(await getProjectsSecret(), project.bitbucket.token), project.bitbucket.workspace, project.bitbucket.repo);
   }
   const variables = {
     LYR_PROJECT_ID: project.projectId,
@@ -426,6 +434,7 @@ async function finishDeployment(project, deployment, result, build) {
     finishedAt: now(),
   });
   if (deployment.trigger === 'copy' || project.copyPending) await update(projectKey(project.projectId), {}, ['copyPending']);
+  if (result.status === 'live') await tellJira(project, { ...deployment, message: deployment.message || exported.LYR_COMMIT_MESSAGE, commit: deployment.commit || exported.LYR_COMMIT }).catch((err) => console.error('Jira', err.message));
   if (result.status === 'failed' && !project.liveDeployId) await update(projectKey(project.projectId), { status: 'failed' });
 }
 
@@ -500,6 +509,7 @@ const publicProject = (item) => ({
   disabled: item.disabled === true,
   source: item.source ? { url: item.source.webUrl, provider: item.source.provider } : null,
   github: item.github ? { fullName: item.github.fullName, url: `https://github.com/${item.github.fullName}`, branch: item.github.branch, mode: item.github.mode } : null,
+  bitbucket: item.bitbucket ? { fullName: `${item.bitbucket.workspace}/${item.bitbucket.repo}`, url: `https://bitbucket.org/${item.bitbucket.workspace}/${item.bitbucket.repo}`, deployOnPush: true } : null,
   settings: item.settings || {},
   liveDeployId: item.liveDeployId || null,
   lastDeployAt: item.lastDeployAt || null,
@@ -524,6 +534,7 @@ async function createProject(event, who) {
   if (owned.length >= limitsFor(who.plan).projects) return error(403, `Your plan allows ${limitsFor(who.plan).projects} projects. Delete one or upgrade.`);
 
   // Work out the source before claiming the name, so a bad URL doesn't use it up.
+  let bitbucketSetup = null;
   const project = { projectId: newId(), name, ownerId: who.userId, ownerEmail: who.email, settings, status: 'queued', createdAt: now() };
   let copy = null;
   let access = null;
@@ -539,6 +550,11 @@ async function createProject(event, who) {
     if (!parsed) return error(400, 'Enter a public https git URL, like https://github.com/owner/repo.');
     project.source = { cloneUrl: parsed.cloneUrl, webUrl: parsed.webUrl, provider: parsed.provider };
     settings.branch ||= parsed.branch;
+    if (body.source?.token) {
+      if (parsed.provider !== 'bitbucket') return error(400, 'Access tokens are for Bitbucket repositories. For GitHub, connect GitHub instead.');
+      if (mode !== 'deploy') return error(400, 'Bitbucket repositories are deployed as they are, not copied.');
+      bitbucketSetup = { token: String(body.source.token).trim(), workspace: parsed.owner, repo: parsed.repo };
+    }
     if (mode !== 'deploy') {
       access = await userAccess(who.userId);
       if (!access) return error(400, 'Connect GitHub to copy or fork the project into your account.');
@@ -594,6 +610,20 @@ async function createProject(event, who) {
     if (err.name === 'ConditionalCheckFailedException') return error(409, `${name}.${DOMAIN} is taken. Pick another name.`);
     throw err;
   }
+  if (bitbucketSetup) {
+    // Check the token and add the push webhook; give the name back if Bitbucket says no.
+    const secret = await getProjectsSecret();
+    const hookSecret = randomBytes(24).toString('hex');
+    try {
+      const info = await connectBitbucket({ ...bitbucketSetup, hookUrl: `${apiBase(event)}/public/bitbucket/webhook?p=${project.projectId}`, hookSecret });
+      project.settings.branch ||= info.mainBranch;
+    } catch (err) {
+      await ddb.send(new DeleteCommand({ TableName: TABLE, Key: { pk: `name#${name}`, sk: 'name' } }));
+      if (err instanceof AtlassianError) return error(err.status, err.message);
+      throw err;
+    }
+    project.bitbucket = { workspace: bitbucketSetup.workspace, repo: bitbucketSetup.repo, token: seal(secret, bitbucketSetup.token), hookSecret: seal(secret, hookSecret) };
+  }
   await ddb.send(new PutCommand({ TableName: TABLE, Item: { ...projectKey(project.projectId), ...project } }));
 
   if (!(await allowBuild(who.userId, who.plan))) return json(201, { project: publicProject(project), warning: 'You’ve used today’s builds; deploy it tomorrow.' });
@@ -630,6 +660,7 @@ async function projectRoutes(event, method, path, who) {
     if (!connection) return error(400, 'Connect GitHub first.');
     return json(200, { repos: await installationRepos(connection.installationId) });
   }
+  if (path === '/projects/jira') return jiraRoutes(event, method, who);
   if (path === '/projects/github' && method === 'DELETE') {
     await ddb.send(new DeleteCommand({ TableName: TABLE, Key: connectionKey(who.userId) }));
     return json(200, { connected: false });
@@ -754,6 +785,60 @@ async function appCreated(event) {
   return redirect(`${DASH_URL}#/admin?tab=settings&github-app=created`);
 }
 
+// Comments on the Jira issues named in a live deployment's commit message, if the owner connected Jira.
+async function tellJira(project, deployment) {
+  const jira = await getItem(jiraKey(project.ownerId));
+  if (!jira || !deployment.message) return [];
+  return notifyJira({ site: jira.site, email: jira.email, token: unseal(await getProjectsSecret(), jira.token) }, {
+    message: deployment.message, commit: deployment.commit, projectName: project.name, url: liveUrl(project),
+  });
+}
+
+async function bitbucketWebhook(event) {
+  const projectId = new URLSearchParams(event.rawQueryString || '').get('p') || '';
+  const project = /^[a-z0-9]{1,40}$/.test(projectId) ? await getProject(projectId) : null;
+  if (!project?.bitbucket) return error(404, 'Unknown project.');
+  const body = rawBody(event);
+  const headers = Object.fromEntries(Object.entries(event.headers || {}).map(([key, value]) => [key.toLowerCase(), value]));
+  if (!validBitbucketSignature(unseal(await getProjectsSecret(), project.bitbucket.hookSecret), body, headers['x-hub-signature'])) return error(401, 'Bad signature.');
+  if (headers['x-event-key'] !== 'repo:push') return json(200, { ignored: headers['x-event-key'] || 'event' });
+  const push = bitbucketPushes(JSON.parse(body)).find((p) => p.branch === project.settings?.branch);
+  if (!push || project.disabled) return json(200, { ignored: 'another branch' });
+  const owner = (await ddb.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId: project.ownerId } }))).Item;
+  if (!(await allowBuild(project.ownerId, planFor(owner)))) return json(200, { ignored: 'build limit' });
+  const deployment = await startDeployment(project, { trigger: 'push', commit: push.commit, message: push.message });
+  return json(200, { started: [deployment.deployId] });
+}
+
+async function jiraRoutes(event, method, who) {
+  if (method === 'GET') {
+    const jira = await getItem(jiraKey(who.userId));
+    return json(200, { jira: jira ? { site: jira.site, email: jira.email, accountName: jira.accountName, connectedAt: jira.connectedAt } : null });
+  }
+  if (method === 'PUT') {
+    const body = parseJson(event) || {};
+    const site = cleanJiraSite(body.site);
+    const email = String(body.email || '').trim().toLowerCase();
+    const token = String(body.token || '').trim();
+    if (!site) return error(400, 'Enter your Jira site, like yourteam.atlassian.net.');
+    if (!/^\S+@\S+\.\S+$/.test(email) || !token) return error(400, 'Enter your Atlassian email and an API token.');
+    try {
+      const { accountName } = await verifyJira({ site, email, token });
+      const item = { ...jiraKey(who.userId), site, email, token: seal(await getProjectsSecret(), token), accountName, connectedAt: now() };
+      await ddb.send(new PutCommand({ TableName: TABLE, Item: item }));
+      return json(200, { jira: { site, email, accountName, connectedAt: item.connectedAt } });
+    } catch (err) {
+      if (err instanceof AtlassianError) return error(err.status, err.message);
+      throw err;
+    }
+  }
+  if (method === 'DELETE') {
+    await ddb.send(new DeleteCommand({ TableName: TABLE, Key: jiraKey(who.userId) }));
+    return json(200, { jira: null });
+  }
+  return error(404, 'not_found');
+}
+
 async function webhook(event) {
   const app = await getGithubApp();
   const body = rawBody(event);
@@ -786,6 +871,7 @@ export const handler = async (event) => {
   const path = event.requestContext?.http?.path || '';
   try {
     if (path === '/public/github/webhook' && method === 'POST') return await webhook(event);
+    if (path === '/public/bitbucket/webhook' && method === 'POST') return await bitbucketWebhook(event);
     if (path === '/public/github/callback' && method === 'GET') return await connectGithub(event);
     if (path === '/public/github-app/created' && method === 'GET') return await appCreated(event);
 
