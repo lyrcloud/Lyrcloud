@@ -20,7 +20,11 @@ Parameters:
   AnthropicSecretName:
     Type: String
     Default: lyrshop/anthropic
-    Description: Secrets Manager secret holding the Anthropic API key Lyrbot uses (shared with Lyrshop and Lyrsoft). Blank turns Lyrbot off.
+    Description: Secrets Manager secret holding the Anthropic API key Lyrbot falls back to when Gemini can't answer (shared with Lyrshop and Lyrsoft). Blank leaves Claude out.
+  GeminiSecretName:
+    Type: String
+    Default: lyrsoft/gemini
+    Description: Secrets Manager secret holding the Google Gemini API key Lyrbot tries first (shared with the other Lyr sites).
 
   MailFrom:
     Type: String
@@ -28,7 +32,7 @@ Parameters:
     Description: Sender of the welcome and update emails; its domain must be a verified SES identity. Blank turns email off.
   MailReplyTo:
     Type: String
-    Default: hello@lyrcloud.com
+    Default: support@lyrcloud.com
   SmsSenderId:
     Type: String
     Default: ''
@@ -137,6 +141,14 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref AppSecret
+        # Lyrbot answers with Gemini first.
+        - PolicyName: GeminiSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GeminiSecretName}-*'
         - !If
           - HasAnthropicSecret
           - PolicyName: LyrbotSecret
@@ -156,7 +168,7 @@ Resources:
       Handler: index.handler
       Role: !GetAtt AccountApiFunctionRole.Arn
       MemorySize: 512
-      Timeout: 29 # Lyrbot replies come from Claude; API Gateway waits at most 30 seconds
+      Timeout: 29 # Lyrbot replies come from Gemini or Claude; API Gateway waits at most 30 seconds
       Environment:
         Variables:
           TABLE_NAME: !Ref UsersTable
@@ -164,6 +176,7 @@ Resources:
           SUPER_ADMIN_EMAIL: !Ref SuperAdminEmail
           USER_POOL_ID: !Ref UserPoolId
           ANTHROPIC_SECRET: !Ref AnthropicSecretName
+          GEMINI_SECRET: !Ref GeminiSecretName
           APP_SECRET_NAME: !Ref AppSecret
           MAIL_FROM: !Ref MailFrom
           MAIL_REPLY_TO: !Ref MailReplyTo

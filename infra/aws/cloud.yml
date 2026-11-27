@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lyrcloud Cloud - connect customers' own AWS accounts and build container clusters (EKS, ECS Fargate) and services there.
+# Deploy with scripts/deploy-cloud.sh. Lambda source: api/cloud/ (plus api/account/roles.mjs and src/clouds.js).
+# Lyrcloud only ever acts through the LyrcloudAccess role each customer creates (with their own ExternalId).
+
+Parameters:
+  ArtifactsBucketName:
+    Type: String
+    Default: lyrcloud-deploy-artifacts
+  LambdaCodeS3Key:
+    Type: String
+  UserPoolId:
+    Type: String
+  UserPoolClientId:
+    Type: String
+  UsersTableName:
+    Type: String
+    Default: lyrcloud-users
+  SuperAdminEmail:
+    Type: String
+    Default: lyrclouds@gmail.com
+  AllowedOrigins:
+    Type: CommaDelimitedList
+    Default: 'https://www.lyrcloud.com,http://localhost:5173'
+
+Resources:
+  CloudTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: lyrcloud-cloud
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: ownerId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: byOwner
+          KeySchema:
+            - { AttributeName: ownerId, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+
+  # Holds only the access-role template (cloud/access-role.json) that the CloudFormation console's
+  # one-click link reads. That link needs a public S3 URL; nothing else goes in this bucket.
+  PublicBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'lyrcloud-public-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  PublicBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PublicBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub '${PublicBucket.Arn}/cloud/*'
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: Cloud
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:Scan]
+                Resource: [!GetAtt CloudTable.Arn, !Sub '${CloudTable.Arn}/index/*']
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${UsersTableName}'
+              # Customers' accounts, only through the role they created for Lyrcloud (which also checks the ExternalId).
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: 'arn:aws:iam::*:role/LyrcloudAccess'
+
+  CloudFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lyrcloud-cloud
+      Runtime: nodejs22.x
+      Handler: api/cloud/index.handler
+      Role: !GetAtt FunctionRole.Arn
+      MemorySize: 512
+      Timeout: 29
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref CloudTable
+          USERS_TABLE_NAME: !Ref UsersTableName
+          SUPER_ADMIN_EMAIL: !Ref SuperAdminEmail
+          ACCESS_TEMPLATE_URL: !Sub 'https://${PublicBucket}.s3.amazonaws.com/cloud/access-role.json'
+      Code:
+        S3Bucket: !Ref ArtifactsBucketName
+        S3Key: !Ref LambdaCodeS3Key
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: lyrcloud-cloud-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: !Ref AllowedOrigins
+        AllowMethods: [GET, PUT, POST, DELETE, OPTIONS]
+        AllowHeaders: [Authorization, Content-Type]
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      Name: CognitoJwtAuthorizer
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration:
+        Audience: [!Ref UserPoolClientId]
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}'
+
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CloudFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  OverviewRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /cloud', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  GetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /cloud/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  PostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'POST /cloud/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  PutRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'PUT /cloud/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  DeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'DELETE /cloud/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  AdminRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /admin/cloud', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 30
+        ThrottlingRateLimit: 10
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CloudFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*'
+
+Outputs:
+  CloudApiBaseUrl:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  PublicBucketName:
+    Value: !Ref PublicBucket
+  AccessTemplateUrl:
+    Value: !Sub 'https://${PublicBucket}.s3.amazonaws.com/cloud/access-role.json'

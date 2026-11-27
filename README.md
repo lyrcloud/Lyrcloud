@@ -45,6 +45,17 @@ The dashboard itself is not backed by a server yet:
 - **Real:** adding a site scans its existing DNS records over public DNS-over-HTTPS (dns.google), and “Check nameservers” looks up the domain’s live NS records. The Edge Functions preview runs code in an isolated Web Worker in the browser.
 - **Preview only:** websites, DNS records, functions, and settings are stored in the visitor’s browser (localStorage). Analytics and security events are generated sample data and labeled as such.
 
+## Cloud
+
+Customers run container clusters in **their own** cloud accounts; Lyrcloud builds and manages them, and the provider bills the customer. Dashboard → Cloud; Network page → "Every major cloud, on one map".
+
+- **Regions:** `src/clouds.js` lists the data center regions of AWS, Azure, Google Cloud, Oracle, Alibaba, IBM and DigitalOcean with coordinates (AWS from `describe-regions`), plus a land mask for the dotted world map (`src/cloud-map.js`, Natural Earth 1:110m, public domain). Update the lists and `CATALOG_DATE` together. Only providers with `provisioning: true` (AWS) can get clusters so far.
+- **Connecting AWS:** the customer launches the `lyrcloud-access` stack from a one-click link (template in the public `lyrcloud-public-<account>` bucket). It creates the `LyrcloudAccess` role, trusting Lyrcloud's account only with that customer's ExternalId, allowed to manage EKS/ECS/VPC/ELB/logs and IAM roles named `lyrcloud-*`. Lyrcloud stores no keys; it assumes the role per request.
+- **Clusters:** Kubernetes (EKS with a managed node group and an access entry for the customer's admin ARN) or serverless (ECS on Fargate). Each is a CloudFormation stack in the customer's chosen region, with a VPC of public subnets and no NAT gateway. Lyrcloud first creates any missing service-linked roles (a brand-new account has none).
+- **Services:** on serverless clusters, a container image becomes an ECS service behind a public load balancer (its own stack); changing image, size, copies or environment redeploys it with a circuit breaker. On Kubernetes, customers use kubectl.
+- **Costs:** `src/cloud-pricing.js` holds sizes and us-east-1 prices, shared by the API and the dashboard's estimates.
+- **Backend:** `api/cloud/` in the `lyrcloud-cloud` stack (`infra/aws/cloud.yml`, table `lyrcloud-cloud`); deploy with `bash scripts/deploy-cloud.sh`, which also uploads the access-role template. `CLOUD_API_BASE` in `src/auth.js` points at it. Verified end to end on 2026-11-05 (serverless cluster + nginx service in us-east-2, then torn down); EKS templates are validated by CloudFormation but weren't run live.
+
 ## Domains
 
 Lyrcloud resells domains through Route 53 Domains, with its own commission on top, paid with Stripe. The public search and price list are at `/domains/` (`src/domains.js`); buying, transfers, renewals and DNS records are in the dashboard (`/dash/#/domains`), and prices, payments and sales are in the admin console's Domains tab.
@@ -69,6 +80,15 @@ Customers claim `name.lyr.cloud` in Dashboard → Domains and edit its records (
 - **Claiming and running names:** signed-in customers claim up to three `.lyr` names for free (`POST /domains/lyr-waitlist`), first come first served; `/lyr/` checks availability. Saving records in Dashboard → Domains → Manage (`PUT /domains/lyr/{name}`) switches a name on; giving it up switches it off. The super admin can still edit any name in the admin console.
 - **HTTPS (Lyr Root CA):** `api/domains/lyrca.mjs` issues 90-day certificates for `name.lyr` and `*.name.lyr` (`POST /domains/lyr/{name}/certificate`, optionally with the holder's CSR; 5 a day per name). The root carries a critical name constraint (only `.lyr`, no IP addresses), so browsers reject anything else it signs. Its key lives only in the `lyrcloud/lyr-ca` secret. Set it up once, after `deploy-domains.sh`: run `node scripts/lyr-root-ca.mjs` (writes `public/lyr-root.crt` and adds the root to `public/lyr.mobileconfig`), commit both, then `bash scripts/deploy-live.sh`. The `/lyr/` page shows the install steps once `public/lyr-root.crt` exists. Never regenerate the root: everyone would have to install it again.
 - **Becoming a real TLD:** only ICANN can add `.lyr` to the DNS root. Its 2026 round closed on 12 August 2026 (fee $227,000); no next round is scheduled. Until then, `.lyr` works for people using Lyrcloud DNS.
+
+### Pay with Lyrpay
+
+Customers can pay for a domain (register, transfer or renew) from their Lyrpay balance (`api/domains/lyrpay.mjs`):
+a second button on the checkout form, shown once the `lyrcloud/lyrpay` secret holds the keys from
+lyrpay.com/#admin > Lyr apps (`{"secret_key": "lpk_lyrcloud_...", "webhook_secret": "lpwh_..."}`, callback
+`https://uqp5mc2gq0.execute-api.us-east-1.amazonaws.com/public/lyrpay/callback`). Lyrpay's signed callback runs the
+same fulfilment as a Stripe payment; the 15-minute run picks up a missed callback and frees names whose Lyrpay
+payment expired. Refunds go back to the Lyrpay balance. Auto-renew needs a saved card, so those renew from the dashboard.
 
 ## Theme
 
