@@ -23,23 +23,27 @@ lyrcloud cache purge --tag product-42`,
   },
   {
     slug: 'security',
-    icon: '🛡',
+    icon: '🔒',
     name: 'Application Security',
-    group: 'Application security',
-    tagline: 'Stop attacks before they reach your origin.',
-    summary: 'Unmetered DDoS mitigation, a managed WAF, bot management, and API protection in one policy engine.',
+    group: 'Security',
+    tagline: 'Stop attacks before they reach your code.',
+    summary: 'Rate limits, IP rules, a firewall for common attacks, bot checks and secure headers for your edge functions, set in lyrcloud.json and enforced before your code runs.',
     features: [
-      ['DDoS protection', 'Always-on, unmetered mitigation for L3/4 and L7 attacks of any size.'],
-      ['Managed WAF', 'OWASP and zero-day rulesets curated by the Lyrcloud threat team, updated continuously.'],
-      ['Bot management', 'Behavioral and fingerprint signals separate good bots from scrapers and credential stuffers.'],
-      ['Rate limiting', 'Protect login, checkout, and API endpoints with per-path request budgets.'],
-      ['API shield', 'Schema validation, mTLS, and anomaly detection for every API endpoint you expose.'],
-      ['Managed TLS', 'Free certificates issued and renewed automatically for every hostname.'],
+      ['Rate limiting', 'Requests per visitor per path, per 10 s, 1 m, 10 m or 1 h. Over the limit gets 429 with <code>Retry-After</code>.'],
+      ['Firewall (WAF)', 'Blocks SQL injection, XSS, path traversal, Log4Shell, command injection and probes for secret files. Start in <code>"log"</code> mode to see what it would catch.'],
+      ['Bot checks', '<code>"challenge"</code> asks browsers for a quick proof of work that scripts can’t do. <code>"block"</code> refuses automation tools outright.'],
+      ['IP rules', 'Block addresses or ranges, or allow only your own, with CIDR for IPv4 and IPv6.'],
+      ['Secure headers & TLS', 'HSTS, nosniff, frame and referrer policies added for you; every address gets HTTPS automatically.'],
+      ['Security log', '<code>lyrcloud security log</code> shows what was blocked or logged, by rule, path and IP. Country rules are coming soon.'],
     ],
-    code: `# Block a country and challenge suspicious bots
-lyrcloud waf rule create \\
-  --expression 'ip.geo.country eq "XX" or bot.score lt 30' \\
-  --action challenge`,
+    code: `// lyrcloud.json
+"security": {
+  "rateLimits": [{ "path": "/api", "requests": 100, "per": "1m" }],
+  "waf": "block",
+  "bots": { "mode": "challenge", "paths": ["/login"] },
+  "blockIps": ["203.0.113.0/24"],
+  "headers": true
+}`,
   },
   {
     slug: 'edge-functions',

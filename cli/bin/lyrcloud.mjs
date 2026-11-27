@@ -8,7 +8,7 @@ import { ApiError, api } from '../lib/api.mjs';
 import { AuthError, browserLogin, decodeJwt, passwordLogin, revoke } from '../lib/auth.mjs';
 import { credentialsPath, deleteCredentials, DOCS_URL, FUNCTIONS_DOMAIN, LYR_SETUP_URL, readCredentials } from '../lib/config.mjs';
 import { CONFIG_FILE, collectFiles, loadProject, nameError, ProjectError, projectSize } from '../lib/project.mjs';
-import { ask, bold, cyan, dim, fail, formatBytes, green, ok, red, relativeTime, table, warn } from '../lib/ui.mjs';
+import { ask, bold, cyan, dim, fail, formatBytes, green, ok, red, relativeTime, table, warn, yellow } from '../lib/ui.mjs';
 import { createZip } from '../lib/zip.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -49,6 +49,9 @@ ${bold('AI')}
 
 ${bold('Access')}
   access log [name] [--since 7d]   Who signed in to a protected function, allowed or refused
+
+${bold('Security')}
+  security log [name] [--since 7d] Requests your security rules blocked or logged
 
 ${bold('Options')}
   -h, --help               Show help
@@ -225,12 +228,23 @@ async function deploy(_, flags) {
   }
   console.log(dim(`Uploading ${files.length} file${files.length === 1 ? '' : 's'} (${formatBytes(projectSize(files))}, ${formatBytes(zip.length)} zipped)…`));
   const started = Date.now();
-  const { function: fn } = await api('PUT', `/functions/${name}`, { body: { code: zip.toString('base64'), main: config.main, vars: config.vars || {}, kv: config.kv, buckets: config.buckets, ai: config.ai, access: config.access } });
+  const { function: fn } = await api('PUT', `/functions/${name}`, { body: { code: zip.toString('base64'), main: config.main, vars: config.vars || {}, kv: config.kv, buckets: config.buckets, ai: config.ai, access: config.access, security: config.security } });
   ok(`Deployed ${bold(name)} ${dim(`in ${((Date.now() - started) / 1000).toFixed(1)}s`)}`);
   console.log(`  ${cyan(fn.url)}`);
   if (fn.access) {
     const who = fn.access.allow.length ? fn.access.allow.join(', ') : 'only you';
     console.log(`  ${dim(`Lyrcloud Access: ${fn.access.paths.length ? fn.access.paths.join(', ') : 'every path'} · ${who}`)}`);
+  }
+  if (fn.security) {
+    const s = fn.security;
+    const parts = [
+      s.rateLimits.length && `${s.rateLimits.length} rate limit${s.rateLimits.length === 1 ? '' : 's'}`,
+      s.waf !== 'off' && `WAF (${s.waf})`,
+      s.bots.mode !== 'off' && `bots (${s.bots.mode})`,
+      (s.blockIps.length || s.allowIps.length) && 'IP rules',
+      s.headers && 'secure headers',
+    ].filter(Boolean);
+    if (parts.length) console.log(`  ${dim(`Security: ${parts.join(' · ')}`)}`);
   }
   if (fn.deploys === 1) {
     console.log(dim('\n  New addresses take about a minute to start answering.'));
@@ -471,7 +485,19 @@ async function accessCommand([action, ...rest], flags) {
   table(events.map((e) => [e.time.replace('T', ' ').slice(0, 19), e.allowed ? green('allowed') : red('refused'), e.email, e.path || '', e.ip || '']), ['TIME', 'RESULT', 'EMAIL', 'PATH', 'IP']);
 }
 
-const COMMANDS = { login, logout, whoami, init, dev, deploy, list, ls: list, logs, tail: logs, delete: remove, rm: remove, storage, kv: kvCommand, bucket: bucketCommand, buckets: bucketCommand, ai: aiCommand, access: accessCommand };
+async function securityCommand([action, ...rest], flags) {
+  if (action !== 'log') throw new UsageError('Usage: lyrcloud security log [name] [--since 7d]');
+  const name = nameFor(rest, flags);
+  const since = typeof flags.since === 'string' ? flags.since : '7d';
+  const { events } = await api('GET', `/functions/${name}/security-log`, { query: { since } });
+  if (!events.length) {
+    console.log(dim(`Nothing blocked on ${name} in the last ${since}.`));
+    return;
+  }
+  table(events.map((e) => [e.time.replace('T', ' ').slice(0, 19), e.action === 'block' ? red('blocked') : yellow('logged'), e.rule, `${e.method || ''} ${e.path || ''}`.trim(), e.ip || '']), ['TIME', 'ACTION', 'RULE', 'REQUEST', 'IP']);
+}
+
+const COMMANDS = { login, logout, whoami, init, dev, deploy, list, ls: list, logs, tail: logs, delete: remove, rm: remove, storage, kv: kvCommand, bucket: bucketCommand, buckets: bucketCommand, ai: aiCommand, access: accessCommand, security: securityCommand };
 
 // ---------------------------------------------------------------- main
 

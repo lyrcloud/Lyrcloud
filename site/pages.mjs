@@ -365,6 +365,7 @@ const cliCommands = [
   ['lyrcloud storage', 'List the namespaces and buckets your functions bind.'],
   ['lyrcloud ai models | run | usage', 'See the models on your plan, ask one from the terminal, and check this month’s tokens.'],
   ['lyrcloud access log [name]', 'See who signed in to a protected function, allowed or refused.'],
+  ['lyrcloud security log [name]', 'See which requests your security rules blocked or logged.'],
 ];
 
 const developersPage = {
@@ -471,6 +472,21 @@ const { data } = await env.AI.embed(['first text', 'second text']);`)}</code></p
 
 // Send people to /__lyrcloud/logout to sign out.`)}</code></pre>
         </div>
+      </section>
+
+      <section id="security" class="section">
+        <div class="section-heading compact">
+          <span class="eyebrow">Security</span>
+          <h2>Rate limits, firewall and bot checks</h2>
+          <p>Add <code class="inline">security</code> to <code class="inline">lyrcloud.json</code>. Rules run before your code, and <code class="inline">lyrcloud security log</code> shows what they stopped.</p>
+        </div>
+        <pre class="snippet"><code>${escape(`"security": {
+  "rateLimits": [{ "path": "/api", "requests": 100, "per": "1m" }],
+  "waf": "block",
+  "bots": { "mode": "challenge", "paths": ["/login"] },
+  "blockIps": ["203.0.113.0/24"],
+  "headers": true
+}`)}</code></pre>
       </section>
 
       <section id="cli" class="section">

@@ -2,16 +2,21 @@
 // HTTP API whose only route sends here; this passes the request to the Lambda function lyrfn-<name>
 // (which runs __lyrcloud/runtime.mjs) and returns what it answers.
 //
-// Lyrcloud Access (access.mjs) is enforced here, before the function runs: protected paths need a valid
-// session cookie, /__lyrcloud/access swaps a sign-in ticket for one, and /__lyrcloud/logout ends it.
+// Before the function runs, this enforces Application Security (security.mjs: IP rules, WAF, rate limits,
+// bot checks) and Lyrcloud Access (access.mjs: protected paths need a valid session cookie,
+// /__lyrcloud/access swaps a sign-in ticket for one, /__lyrcloud/logout ends it). Blocks are logged.
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import {
   ACCESS_HEADER, cookieValue, isProtected, REQUEST_SECONDS, safeReturn, SESSION_COOKIE, SESSION_SECONDS, sign, TICKET_SECONDS, verify,
 } from './access.mjs';
 import { FUNCTIONS_DOMAIN_DEFAULT, lambdaName, nameFromHost } from './rules.mjs';
+import {
+  CHALLENGE_SECONDS, challengePage, HUMAN_COOKIE, HUMAN_SECONDS, ipMatches, looksAutomated, solves, underPath, wafMatch, withSecureHeaders,
+} from './security.mjs';
+import { newNonce } from './access.mjs';
 
 const env = process.env;
 const DOMAIN = env.FUNCTIONS_DOMAIN || FUNCTIONS_DOMAIN_DEFAULT;
@@ -35,16 +40,125 @@ async function platformSecret() {
   return secret;
 }
 
-// A function's Access policy, cached briefly so most requests don't read the table.
+// A function's Access and Security settings, cached briefly so most requests don't read the table.
 const policies = new Map();
-async function accessPolicy(name) {
-  if (!env.FUNCTIONS_TABLE) return null;
+export const clearPolicies = () => policies.clear();
+async function settingsOf(name) {
+  if (!env.FUNCTIONS_TABLE) return {};
   const hit = policies.get(name);
-  if (hit && hit.at > clock.now() - 30_000) return hit.policy;
-  const { Item } = await ddb.send(new GetCommand({ TableName: env.FUNCTIONS_TABLE, Key: { pk: `fn#${name}`, sk: 'fn' }, ProjectionExpression: 'access' }));
-  const policy = Item?.access || null;
-  policies.set(name, { policy, at: clock.now() });
-  return policy;
+  if (hit && hit.at > clock.now() - 30_000) return hit.settings;
+  const { Item } = await ddb.send(new GetCommand({
+    TableName: env.FUNCTIONS_TABLE, Key: { pk: `fn#${name}`, sk: 'fn' }, ProjectionExpression: '#a, #s, ownerId', ExpressionAttributeNames: { '#a': 'access', '#s': 'security' },
+  }));
+  const settings = { access: Item?.access || null, security: Item?.security || null, ownerId: Item?.ownerId || null };
+  policies.set(name, { settings, at: clock.now() });
+  return settings;
+}
+
+// Security events go to the owner's log, at most 60 a minute per function from each router instance
+// so an attack can't flood the table.
+const logBudget = new Map();
+async function logEvent(name, settings, entry) {
+  if (!settings.ownerId || !env.DATA_TABLE_NAME) return;
+  const minute = Math.floor(clock.now() / 60_000);
+  const used = logBudget.get(name);
+  const count = used?.minute === minute ? used.count : 0;
+  if (count >= 60) return;
+  logBudget.set(name, { minute, count: count + 1 });
+  const at = new Date(clock.now());
+  try {
+    await ddb.send(new PutCommand({
+      TableName: env.DATA_TABLE_NAME,
+      Item: { pk: `sec#${settings.ownerId}#${name}`, sk: `${at.toISOString()}#${newNonce()}`, ...entry, expiresAt: Math.floor(at.getTime() / 1000) + 30 * 86400 },
+    }));
+  } catch (err) {
+    console.error('Security log failed', err);
+  }
+}
+
+const blocked = (statusCode, message, headers = {}) => ({
+  statusCode,
+  headers: { 'content-type': 'application/json', 'cache-control': 'no-store', ...headers },
+  body: JSON.stringify({ error: message }),
+});
+
+// Fixed-window count for one rule and visitor; returns seconds to wait when over the limit, else 0.
+async function overLimit(name, index, rule, ip) {
+  const window = Math.floor(clock.now() / 1000 / rule.seconds);
+  const { Attributes } = await ddb.send(new UpdateCommand({
+    TableName: env.DATA_TABLE_NAME,
+    Key: { pk: `rl#${name}#${index}#${ip}`, sk: String(window) },
+    UpdateExpression: 'ADD #c :one SET expiresAt = :exp',
+    ExpressionAttributeNames: { '#c': 'count' },
+    ExpressionAttributeValues: { ':one': 1, ':exp': (window + 2) * rule.seconds },
+    ReturnValues: 'UPDATED_NEW',
+  }));
+  if (Attributes.count <= rule.requests) return 0;
+  return Math.max(1, (window + 1) * rule.seconds - Math.floor(clock.now() / 1000));
+}
+
+// Application Security checks; a response to send instead of running the function, or null.
+async function screen(event, name, settings, headers) {
+  const security = settings.security;
+  if (!security) return null;
+  const path = event.rawPath || '/';
+  const ip = event.requestContext?.http?.sourceIp || '';
+  const method = event.requestContext?.http?.method || 'GET';
+  const base = { ip, path: path.slice(0, 300), method, userAgent: String(headers['user-agent'] || '').slice(0, 200) };
+
+  if (security.allowIps?.length && !ipMatches(security.allowIps, ip)) {
+    await logEvent(name, settings, { ...base, rule: 'ip-allow-list', action: 'block' });
+    return blocked(403, 'Your IP address isn’t allowed here.');
+  }
+  if (ipMatches(security.blockIps, ip)) {
+    await logEvent(name, settings, { ...base, rule: 'ip-block-list', action: 'block' });
+    return blocked(403, 'Your IP address is blocked here.');
+  }
+  if (security.waf && security.waf !== 'off') {
+    const rule = wafMatch(event);
+    if (rule) {
+      await logEvent(name, settings, { ...base, rule: `waf:${rule}`, action: security.waf === 'block' ? 'block' : 'log' });
+      if (security.waf === 'block') return blocked(403, 'This request was blocked by the site’s firewall.');
+    }
+  }
+  for (const [index, rule] of (security.rateLimits || []).entries()) {
+    if (!underPath(rule.path, path)) continue;
+    const wait = await overLimit(name, index, rule, ip);
+    if (wait) {
+      await logEvent(name, settings, { ...base, rule: `rate-limit:${rule.path}`, action: 'block' });
+      return blocked(429, 'Too many requests. Slow down and try again shortly.', { 'retry-after': String(wait) });
+    }
+  }
+  const bots = security.bots || { mode: 'off' };
+  const botPath = !bots.paths?.length || bots.paths.some((prefix) => underPath(prefix, path));
+  if (bots.mode === 'block' && botPath && looksAutomated(headers['user-agent'])) {
+    await logEvent(name, settings, { ...base, rule: 'bots:automation', action: 'block' });
+    return blocked(403, 'Automated requests aren’t allowed here.');
+  }
+  if (bots.mode === 'challenge' && botPath) {
+    const human = verify(await platformSecret(), 'human', cookieValue(event.cookies || headers.cookie, HUMAN_COOKIE), clock.now());
+    if (!human || human.fn !== name) {
+      if (method !== 'GET' && method !== 'HEAD') {
+        await logEvent(name, settings, { ...base, rule: 'bots:challenge', action: 'block' });
+        return blocked(403, 'Open this site in a browser first.');
+      }
+      const nonce = newNonce();
+      const ret = path + (event.rawQueryString ? `?${event.rawQueryString}` : '');
+      const token = sign(await platformSecret(), 'challenge', { fn: name, nonce, ret }, CHALLENGE_SECONDS, clock.now());
+      return { statusCode: 403, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }, body: challengePage(token, nonce, ret) };
+    }
+  }
+  return null;
+}
+
+async function acceptChallenge(event, name) {
+  const params = new URLSearchParams(event.rawQueryString || '');
+  const challenge = verify(await platformSecret(), 'challenge', params.get('token'), clock.now());
+  if (!challenge || challenge.fn !== name || !solves(challenge.nonce, params.get('answer'))) {
+    return page(403, 'Check failed', 'Your browser didn’t pass the check. <a href="/">Try again</a>.');
+  }
+  const human = sign(await platformSecret(), 'human', { fn: name }, HUMAN_SECONDS, clock.now());
+  return redirect(safeReturn(challenge.ret), [`${HUMAN_COOKIE}=${human}; Path=/; Max-Age=${HUMAN_SECONDS}; HttpOnly; Secure; SameSite=Lax`]);
 }
 
 const sessionCookie = (value, maxAge) => `${SESSION_COOKIE}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`;
@@ -82,8 +196,14 @@ export const handler = async (event) => {
 
   if (path === '/__lyrcloud/access') return acceptTicket(event, name);
   if (path === '/__lyrcloud/logout') return redirect('/', [sessionCookie('', 0)]);
+  if (path === '/__lyrcloud/challenge') return acceptChallenge(event, name);
 
-  const policy = await accessPolicy(name);
+  const settings = await settingsOf(name);
+  const refused = await screen(forwarded, name, settings, headers);
+  if (refused) return refused;
+  const finish = (result) => (settings.security?.headers ? withSecureHeaders(result) : result);
+
+  const policy = settings.access;
   if (isProtected(policy, path)) {
     const session = verify(await platformSecret(), 'session', cookieValue(event.cookies || headers.cookie), clock.now());
     if (!session || session.fn !== name) {
@@ -118,7 +238,7 @@ export const handler = async (event) => {
   }
   try {
     const answer = JSON.parse(text);
-    if (answer && typeof answer.statusCode === 'number') return answer;
+    if (answer && typeof answer.statusCode === 'number') return finish(answer);
   } catch {
     // fall through
   }

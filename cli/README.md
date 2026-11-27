@@ -70,6 +70,20 @@ Put a function, or some paths, behind Lyrcloud sign-in:
 
 Visitors sign in at www.lyrcloud.com and only the emails and domains you list (and you) get through. Your code reads `request.headers.get('lyr-access-email')`. `/__lyrcloud/logout` signs out. `lyrcloud access log` shows every decision. In `lyrcloud dev`, protected paths act as if `LYRCLOUD_DEV_EMAIL` (or `dev@localhost`) signed in.
 
+## Security
+
+```json
+"security": {
+  "rateLimits": [{ "path": "/api", "requests": 100, "per": "1m" }],
+  "waf": "block",
+  "bots": { "mode": "challenge", "paths": ["/login"] },
+  "blockIps": ["203.0.113.0/24"],
+  "headers": true
+}
+```
+
+Rules run before your function: rate limits per visitor IP (`10s`, `1m`, `10m`, `1h`), IP block and allow lists (CIDR), a firewall for common attacks (`"log"` only records), bot checks (`"challenge"` for browsers, `"block"` for automation tools) and secure response headers. `lyrcloud security log` shows what was stopped. `lyrcloud dev` doesn't apply these rules.
+
 ## lyrcloud.json
 
 ```json

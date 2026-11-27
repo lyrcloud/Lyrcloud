@@ -28,6 +28,9 @@
 //                                   against the function's allow-list, logs it, returns the ticket URL
 //   GET  /functions/{name}/access-log   ?since=7d  allow/deny decisions (owner)
 //
+// Application Security (security.mjs, enforced by the router):
+//   GET  /functions/{name}/security-log ?since=7d  blocked and logged requests (owner)
+//
 // A daily EventBridge rule sends { task: 'renew-certificate' } to keep the *.dev.lyr certificate fresh.
 import { generateKeyPairSync } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -73,6 +76,7 @@ import {
 } from './rules.mjs';
 import { cleanAccess, isAllowed, newNonce, sign, TICKET_SECONDS, verify as verifyAccess } from './access.mjs';
 import { aiLimitsFor, listModels, usageOf } from './ai.mjs';
+import { cleanSecurity } from './security.mjs';
 import { performAny, platformSecret } from './platform.mjs';
 import { cleanBindings, perform, signToken, StorageError } from './storage.mjs';
 import { addZipEntry, listZip, ZipError } from './zip.mjs';
@@ -151,6 +155,7 @@ const publicFunction = (item) => ({
   vars: Object.keys(item.vars || {}),
   bindings: item.bindings || [],
   access: item.access ? { allow: item.access.allow, paths: item.access.paths } : null,
+  security: item.security || null,
   codeBytes: item.codeBytes || 0,
   deploys: item.deploys || 0,
   createdAt: item.createdAt,
@@ -368,6 +373,8 @@ async function deploy(event, name, who) {
   if (bindingsProblem) return error(400, bindingsProblem);
   const [access, accessProblem] = cleanAccess(body.access);
   if (accessProblem) return error(400, accessProblem);
+  const [security, securityProblem] = cleanSecurity(body.security);
+  if (securityProblem) return error(400, securityProblem);
   if (typeof body.code !== 'string' || !body.code) return error(400, 'Send the code as a base64 zip in "code".');
   const code = Buffer.from(body.code, 'base64');
   if (code.length > MAX_CODE_BYTES) return error(413, `Functions can be at most ${MAX_CODE_BYTES / 1024 / 1024} MB zipped.`);
@@ -408,7 +415,7 @@ async function deploy(event, name, who) {
     if (err instanceof UserError) return error(err.statusCode, err.message);
     throw err;
   }
-  const saved = { ...item, status: 'live', main, vars, bindings, access: access || undefined, codeBytes: code.length, deploys: (item.deploys || 0) + 1, updatedAt: now(), lastError: undefined };
+  const saved = { ...item, status: 'live', main, vars, bindings, access: access || undefined, security: security || undefined, codeBytes: code.length, deploys: (item.deploys || 0) + 1, updatedAt: now(), lastError: undefined };
   delete saved.lastError;
   await ddb.send(new PutCommand({ TableName: TABLE, Item: saved }));
   return json(200, { function: publicFunction(saved) });
@@ -440,7 +447,7 @@ async function functionRoutes(event, method, path, who) {
     const items = (await functionsOf(who.userId)).sort((a, b) => a.name.localeCompare(b.name));
     return json(200, { functions: items.map(publicFunction), limit: limitFor(who.plan), plan: who.plan, domain: DOMAIN });
   }
-  const match = path.match(/^\/functions\/([^/]+)(\/logs|\/access-log)?$/);
+  const match = path.match(/^\/functions\/([^/]+)(\/logs|\/access-log|\/security-log)?$/);
   if (!match) return error(404, 'not_found');
   const name = decodeURIComponent(match[1]).toLowerCase();
   const problem = functionNameError(name);
@@ -452,6 +459,7 @@ async function functionRoutes(event, method, path, who) {
   if (!mayRead) return error(404, `You have no function called ${name}.`);
   if (match[2] === '/logs' && method === 'GET') return readLogs(event, name);
   if (match[2] === '/access-log' && method === 'GET') return readAccessLog(event, item);
+  if (match[2] === '/security-log' && method === 'GET') return readSecurityLog(event, item);
   if (!match[2] && method === 'GET') return json(200, { function: publicFunction(item) });
   if (!match[2] && method === 'DELETE') {
     if (item.ownerId !== who.userId && who.role !== 'superadmin') return error(403, 'Only the owner can delete this function.');
@@ -558,6 +566,19 @@ async function readAccessLog(event, item) {
     Limit: 500,
   }));
   return json(200, { events: Items.map((row) => ({ time: row.sk.split('#')[0], email: row.email, allowed: row.allowed, path: row.path, ip: row.ip })) });
+}
+
+async function readSecurityLog(event, item) {
+  const since = parseSince(event.queryStringParameters?.since || '7d');
+  if (since === null) return error(400, 'Use since like 1h, 7d or 30d.');
+  const { Items = [] } = await ddb.send(new QueryCommand({
+    TableName: DATA_TABLE,
+    KeyConditionExpression: 'pk = :pk AND sk >= :since',
+    ExpressionAttributeValues: { ':pk': `sec#${item.ownerId}#${item.name}`, ':since': new Date(since).toISOString() },
+    ScanIndexForward: false,
+    Limit: 500,
+  }));
+  return json(200, { events: Items.map((row) => ({ time: row.sk.split('#')[0], rule: row.rule, action: row.action, ip: row.ip, method: row.method, path: row.path, userAgent: row.userAgent })) });
 }
 
 async function aiRoutes(event, method, path, who) {
