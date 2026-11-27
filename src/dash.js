@@ -1760,9 +1760,12 @@ function domainBuyView(route) {
       </fieldset>
       <p class="form-error" hidden></p>
       <div class="row">
-        <button class="btn primary" type="submit"${blocked ? ' disabled' : ''}>Continue to payment<span id="domain-total">${total ? ` · ${money(total)}` : ''}</span></button>
-        ${domains.data?.lyrpayReady ? `<button class="btn" type="submit" name="payWith" value="lyrpay"${blocked ? ' disabled' : ''}>Pay with Lyrpay balance</button>` : ''}
-        <span class="muted small">Secure card payment with Stripe${domains.data?.lyrpayReady ? ', or from your Lyrpay balance (renew those from here: auto-renew needs a card)' : ''}. If the registry refuses the domain, you’re refunded in full.</span>
+        ${domains.data?.lyrpayReady
+          // Lyrpay is the Lyr apps' default way to pay (first, so Enter pays with it too); a card is the alternative
+          ? `<button class="btn primary" type="submit" name="payWith" value="lyrpay"${blocked ? ' disabled' : ''}>Pay with Lyrpay<span id="domain-total">${total ? ` · ${money(total)}` : ''}</span></button>
+             <button class="btn" type="submit"${blocked ? ' disabled' : ''}>Pay by card</button>`
+          : `<button class="btn primary" type="submit"${blocked ? ' disabled' : ''}>Continue to payment<span id="domain-total">${total ? ` · ${money(total)}` : ''}</span></button>`}
+        <span class="muted small">${domains.data?.lyrpayReady ? 'Pay from your Lyrpay balance (a free Lyrpay account takes a minute; renew Lyrpay domains from here, since auto-renew needs a card), or by card with Stripe' : 'Secure card payment with Stripe'}. If the registry refuses the domain, you’re refunded in full.</span>
       </div>
     </form>`;
 }
