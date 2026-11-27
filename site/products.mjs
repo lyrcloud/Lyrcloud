@@ -1,5 +1,17 @@
-// Product catalog. Each entry renders /products/<slug>/ and appears in the nav mega-menu.
+// Product catalog. Each entry renders /products/<slug>/ and appears in the nav mega-menu; an entry with its own
+// `href` (Domains, which has a full page at /domains/) links there instead of getting a product page.
+export const productHref = (product) => product.href || `/products/${product.slug}/`;
+
 export const products = [
+  {
+    slug: 'domains',
+    href: '/domains/',
+    icon: '🌐',
+    name: 'Domains',
+    group: 'Domains & DNS',
+    tagline: 'Search, register and transfer, with free WHOIS privacy.',
+    summary: 'Register or transfer a domain with free WHOIS privacy and Lyrcloud DNS, paid by card or with Lyrpay.',
+  },
   {
     slug: 'cdn',
     icon: '⚡',

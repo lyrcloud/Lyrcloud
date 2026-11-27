@@ -3,7 +3,7 @@ import { worldMapSvg } from '../src/cloud-map.js';
 import { CATALOG_DATE, CONTINENT_NAMES, continentOf, PROVIDERS, REGIONS } from '../src/clouds.js';
 import { logo } from '../src/logo.js';
 import { escape } from './layout.mjs';
-import { products } from './products.mjs';
+import { productHref, products } from './products.mjs';
 
 const pageHero = ({ eyebrow, title, lede, ctas = '' }) => `
       <section class="page-hero section">
@@ -29,7 +29,7 @@ const productCard = (product) => `
             <span class="feature-icon">${product.icon}</span>
             <h3>${product.name}</h3>
             <p>${escape(product.summary)}</p>
-            <a href="/products/${product.slug}/">Learn more <span aria-hidden="true">→</span></a>
+            <a href="${productHref(product)}">Learn more <span aria-hidden="true">→</span></a>
           </article>`;
 
 const plans = [
@@ -260,7 +260,7 @@ ${ctaBand()}
     </main>`,
 };
 
-const productPages = products.map((product) => ({
+const productPages = products.filter((product) => !product.href).map((product) => ({
   route: `/products/${product.slug}/`,
   title: product.name,
   description: product.summary,
@@ -340,7 +340,7 @@ ${pageHero({
             <p>${text}</p>
             <div class="tag-row">${used
               .map((slug) => products.find((product) => product.slug === slug))
-              .map((product) => `<a class="tag" href="/products/${product.slug}/">${product.name}</a>`)
+              .map((product) => `<a class="tag" href="${productHref(product)}">${product.name}</a>`)
               .join('')}</div>
           </article>`,
           )

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { logo } from '../src/logo.js';
-import { products } from './products.mjs';
+import { productHref, products } from './products.mjs';
 
 // Browsers cache favicons in their own long-lived store keyed by URL, so a redesigned icon at
 // the same /favicon.svg can keep showing the old one for weeks. A content hash in the query
@@ -22,7 +22,7 @@ function header(active) {
   const productLinks = products
     .map(
       (product) => `
-          <a class="mega-item" href="/products/${product.slug}/">
+          <a class="mega-item" href="${productHref(product)}">
             <span class="mega-icon" aria-hidden="true">${product.icon}</span>
             <span><b>${product.name}</b><small>${escape(product.tagline)}</small></span>
           </a>`,
@@ -36,7 +36,7 @@ function header(active) {
       </a>
       <nav aria-label="Main navigation">
         <div class="nav-dropdown">
-          <a href="/products/"${active.startsWith('/products/') ? ' aria-current="page"' : ''}>Products <span aria-hidden="true">▾</span></a>
+          <a href="/products/"${active.startsWith('/products/') || active.startsWith('/domains/') ? ' aria-current="page"' : ''}>Products <span aria-hidden="true">▾</span></a>
           <div class="mega-menu">
             <div class="mega-grid">${productLinks}
             </div>
@@ -46,7 +46,6 @@ function header(active) {
         ${navLink('/solutions/', 'Solutions', active)}
         ${navLink('/developers/', 'Developers', active)}
         ${navLink('/network/', 'Network', active)}
-        ${navLink('/domains/', 'Domains', active)}
         ${navLink('/pricing/', 'Pricing', active)}
         <div class="nav-dropdown">
           <a href="https://lyrsoft.com/">Lyr platforms <span aria-hidden="true">▾</span></a>
@@ -90,7 +89,7 @@ function footer() {
         <p class="form-note" id="news-status" role="status"></p>
       </div>
       <div class="footer-columns">
-        ${column('Products', products.map((product) => [`/products/${product.slug}/`, product.name]))}
+        ${column('Products', products.map((product) => [productHref(product), product.name]))}
         ${column('Developers', [
           ['/developers/', 'Developer hub'],
           ['/developers/#quickstart', 'Quickstart'],
