@@ -1783,12 +1783,22 @@ a.stat:hover {
 
 .field-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 0 14px;
+  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+  gap: 12px 14px;
 }
 
 .field-grid .field {
+  min-width: 0;
   max-width: none;
+}
+
+/* Inputs never push their column wider than the screen (long IDs and ARNs scroll inside the box). */
+.field-grid .field input,
+.field-grid .field select,
+.field-grid .field textarea {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
 }
 
 .phone-field {
@@ -2059,4 +2069,35 @@ a.stat:hover {
   border-radius: 6px;
   background: var(--surface-2, rgba(0, 0, 0, 0.05));
   font-size: 0.85rem;
+}
+
+/* Cloud connect steps: the setup script scrolls inside its own box instead of widening the page,
+   so the ID fields below it keep fitting the screen. */
+.cloud-connect-card,
+.steps-list,
+.steps-list > li,
+.steps-list form {
+  min-width: 0;
+  max-width: 100%;
+}
+.cloud-connect-card .setup-script {
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.cloud-connect-card .row {
+  flex-wrap: wrap;
+}
+@media (max-width: 560px) {
+  .steps-list {
+    padding-left: 1.1em;
+  }
+  .cloud-connect-card {
+    padding: 12px;
+  }
+  .cloud-connect-card h3 {
+    flex-wrap: wrap;
+  }
+  .cloud-connect-card .row .btn {
+    flex: 1 1 auto;
+  }
 }
