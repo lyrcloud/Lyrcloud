@@ -47,6 +47,7 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DeleteCommand, DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { GetSecretValueCommand, PutSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { ChangeResourceRecordSetsCommand, ListResourceRecordSetsCommand, Route53Client } from '@aws-sdk/client-route-53';
+import { SendEmailCommand, SESv2Client } from '@aws-sdk/client-sesv2';
 import {
   alreadyDone,
   dnaAvailability,
@@ -119,12 +120,15 @@ const SUPER_ADMIN_EMAIL = env.SUPER_ADMIN_EMAIL || 'lyrclouds@gmail.com';
 const SUB_ZONE = env.SUBDOMAIN_ZONE || '';
 const SUB_ZONE_ID = env.SUBDOMAIN_ZONE_ID || '';
 const SITE_URL = env.SITE_URL || 'https://www.lyrcloud.com';
+// Sender of the low-balance alerts to the super admin (an SES-verified identity); blank turns them off.
+const MAIL_FROM = env.MAIL_FROM || '';
 const ALLOWED_ORIGINS = String(env.ALLOWED_ORIGINS || SITE_URL).split(',').map((origin) => origin.trim());
 
 export const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 export const secrets = new SecretsManagerClient({});
 // Route 53 still hosts the name.lyr.cloud zone and the zones of domains bought before the switch to DNA.
 export const dns = new Route53Client({ region: 'us-east-1' });
+export const ses = new SESv2Client({});
 
 const STRIPE_EVENTS = ['checkout.session.completed', 'checkout.session.expired'];
 const LIVE_STATUSES = ['registering', 'transferring', 'active'];
@@ -263,12 +267,112 @@ async function registrarCanPay(costCents) {
   try {
     const account = await dna('GET', 'deposit/accounts/me');
     const enough = Math.round(Number(account?.usdBalance ?? 0) * 100) >= costCents;
-    if (!enough) console.error('REGISTRAR ACCOUNT PROBLEM: top up DNA. Balance', account?.usdBalance, 'USD; this order needs', (costCents / 100).toFixed(2));
+    if (!enough) {
+      console.error('REGISTRAR ACCOUNT PROBLEM: top up DNA. Balance', account?.usdBalance, 'USD; this order needs', (costCents / 100).toFixed(2));
+      await checkRegistrarBalance({ account, blockedCents: costCents }).catch((err) => console.error('balance alert failed', err));
+    }
     return enough;
   } catch (err) {
     console.error('Couldn’t read the DNA balance before checkout', err);
     return true;
   }
+}
+
+// ---------------------------------------------------------------- registrar balance alerts
+//
+// DNA has no API to add funds, so the super admin tops up in DNA's panel. The scheduled run checks the
+// balance at most hourly and emails the super admin when it drops below the threshold (default $50), at
+// most once a day while it stays low; checkout refusing a sale checks straight away.
+const REGISTRAR_KEY = { pk: '#registrar', sk: 'balance' };
+export const DEFAULT_BALANCE_ALERT_CENTS = 5000;
+const ALERT_EVERY_MS = 24 * 3600_000;
+const CHECK_EVERY_MS = 3600_000;
+const TX_TYPES = { 1: 'Register', 2: 'Renew', 3: 'Transfer', 4: 'Restore', 5: 'Deposit', 6: 'Backorder', 7: 'Refund', 8: 'Deduction', 9: 'Pre-register', 10: 'Shopping', 11: 'Reseller payment', 12: 'Internal transfer' };
+const TX_STATUS = { 0: 'failed', 1: 'done', 2: 'cancelled', 3: 'processing', 4: 'refunded' };
+
+const usd = (cents) => `$${(cents / 100).toFixed(2)}`;
+
+async function sendAdminEmail(subject, text) {
+  if (!MAIL_FROM || !SUPER_ADMIN_EMAIL) {
+    console.error('Can’t email the super admin: MAIL_FROM or SUPER_ADMIN_EMAIL is not set.', subject);
+    return false;
+  }
+  const html = `<!doctype html><html><body style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#1d1f23;line-height:1.6;max-width:560px;margin:24px auto;padding:0 16px">${text.split('\n\n').map((p) => `<p>${p.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]).replace(/\n/g, '<br>')}</p>`).join('')}</body></html>`;
+  await ses.send(new SendEmailCommand({
+    FromEmailAddress: MAIL_FROM,
+    Destination: { ToAddresses: [SUPER_ADMIN_EMAIL] },
+    Content: { Simple: { Subject: { Data: subject, Charset: 'UTF-8' }, Body: { Text: { Data: text, Charset: 'UTF-8' }, Html: { Data: html, Charset: 'UTF-8' } } } },
+  }));
+  return true;
+}
+
+// Reads (or uses `account`) and records the balance; emails when it's under the threshold.
+// `force` skips the hourly limit; `blockedCents` says a sale was just refused.
+export async function checkRegistrarBalance({ account, force = false, blockedCents } = {}) {
+  const state = (await getItem(REGISTRAR_KEY)) || {};
+  if (!account && !force && state.checkedAt && Date.now() - Date.parse(state.checkedAt) < CHECK_EVERY_MS) return state;
+  const config = await getDnaConfig();
+  if (!config.apiKey || !config.resellerId) return state;
+  const live = account || await dna('GET', 'deposit/accounts/me');
+  const balanceCents = Math.round(Number(live?.usdBalance ?? 0) * 100);
+  const thresholdCents = state.thresholdCents ?? DEFAULT_BALANCE_ALERT_CENTS;
+  const low = balanceCents < thresholdCents || blockedCents !== undefined;
+  const next = { ...REGISTRAR_KEY, ...state, balanceCents, tryBalance: Number(live?.tryBalance ?? 0), checkedAt: now() };
+  if (!low) {
+    delete next.alertedAt; // remind again the next time it runs low
+  } else if (!state.alertedAt || Date.now() - Date.parse(state.alertedAt) > ALERT_EVERY_MS) {
+    const why = blockedCents !== undefined
+      ? `A customer just tried to buy a domain that costs Lyrcloud ${usd(blockedCents)}, but the DNA balance is ${usd(balanceCents)}. Checkout refused the sale without charging them, and will keep refusing until you top up.`
+      : `The DNA balance is ${usd(balanceCents)}, under your alert level of ${usd(thresholdCents)}. When it can't cover an order, checkout stops selling domains.`;
+    const sent = await sendAdminEmail(
+      blockedCents !== undefined ? 'Lyrcloud domain sales are paused: top up DNA' : `Lyrcloud: DNA balance is low (${usd(balanceCents)})`,
+      `${why}\n\nDNA's API can't add funds, so top up in the DNA reseller panel (domainnameapi.com).\n\nYou can see the balance and change the alert level in the admin console: ${SITE_URL}/dash/#/admin\n\nYou'll get at most one of these a day while the balance stays low.`,
+    );
+    if (sent) next.alertedAt = now();
+  }
+  await ddb.send(new PutCommand({ TableName: TABLE, Item: next }));
+  return next;
+}
+
+async function registrarAdmin(event, method, isSuper) {
+  if (method === 'PUT') {
+    if (!isSuper) return error(403, 'Only the super admin can change the balance alert.');
+    const body = parseJson(event);
+    const cents = Math.round(Number(body?.thresholdCents));
+    if (!Number.isInteger(cents) || cents < 0 || cents > 10_000_000) return error(400, 'Send { "thresholdCents": 0 to 10000000 }.');
+    const state = (await getItem(REGISTRAR_KEY)) || REGISTRAR_KEY;
+    await ddb.send(new PutCommand({ TableName: TABLE, Item: { ...state, ...REGISTRAR_KEY, thresholdCents: cents, alertedAt: undefined } }));
+  } else if (method !== 'GET') {
+    return error(404, 'not_found');
+  }
+  let state;
+  let problem = null;
+  try {
+    state = await checkRegistrarBalance({ force: true });
+  } catch (err) {
+    problem = err instanceof DnaError ? err.message : 'Couldn’t reach DNA.';
+    state = (await getItem(REGISTRAR_KEY)) || {};
+  }
+  let transactions = [];
+  try {
+    const page = await dna('GET', 'deposit/transactions', { query: { maxResultCount: 10, sorting: 'creationTime desc' } });
+    transactions = (page?.items || []).map((tx) => ({
+      at: tx.creationTime, type: TX_TYPES[tx.type] || String(tx.type), credit: tx.chargeType === 0, status: TX_STATUS[tx.status] || String(tx.status),
+      amount: Number(tx.amount), currency: tx.amountCurrency || 'USD', description: tx.description || '', balance: tx.balance ?? null,
+    }));
+  } catch (err) {
+    console.error('Couldn’t read DNA transactions', err);
+  }
+  return json(200, {
+    balanceCents: state.balanceCents ?? null,
+    tryBalance: state.tryBalance ?? null,
+    thresholdCents: state.thresholdCents ?? DEFAULT_BALANCE_ALERT_CENTS,
+    checkedAt: state.checkedAt || null,
+    alertedAt: state.alertedAt || null,
+    alertsTo: SUPER_ADMIN_EMAIL ? SUPER_ADMIN_EMAIL.replace(/^(.).*(@.*)$/, '$1…$2') : null,
+    transactions,
+    problem,
+  });
 }
 
 // One DNA call, live unless `registrarEnv` is 'test'.
@@ -1137,6 +1241,7 @@ export async function tick() {
       console.error('scheduled work failed for', item.domain, err);
     }
   });
+  await checkRegistrarBalance().catch((err) => console.error('registrar balance check failed', err));
   return { checked: items.length };
 }
 
@@ -1663,6 +1768,8 @@ async function adminRoutes(event, method, path, who) {
       totals: { revenue, cost, fees, profit: revenue - cost - fees, orders: kept.length },
     });
   }
+
+  if (path === '/admin/registrar') return registrarAdmin(event, method, isSuper);
 
   if (path === '/admin/domain-pricing') {
     if (method === 'PUT') {

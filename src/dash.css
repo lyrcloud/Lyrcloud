@@ -581,6 +581,10 @@ a.role-pill:hover {
   color: var(--warn-ink);
 }
 
+.status.error {
+  color: var(--danger-ink);
+}
+
 .setting-row {
   display: flex;
   align-items: center;

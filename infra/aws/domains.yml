@@ -4,6 +4,10 @@ Description: Lyrcloud Domains - search, sell, transfer in and renew domains thro
 # The Lambda uses the AWS SDK that ships with the Node.js runtime; Stripe is called over its REST API.
 
 Parameters:
+  MailFrom:
+    Type: String
+    Default: 'Lyrcloud <no-reply@lyrcloud.com>'
+    Description: Sender of the low DNA balance alerts to the super admin (a verified SES identity). Blank turns them off.
   # The Lyr Root CA key lives in this secret, created by scripts/lyr-root-ca.mjs. The stack only reads it and
   # never creates, overwrites or deletes it, so a deploy or rollback can't lose the key.
   LyrCaSecretName:
@@ -114,6 +118,10 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref DnaSecret
+              # Low DNA balance alerts to the super admin. identity/* because the SES sandbox also checks the recipient.
+              - Effect: Allow
+                Action: ses:SendEmail
+                Resource: !Sub 'arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*'
               # Signs certificates for .lyr names their holders run.
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
@@ -141,6 +149,7 @@ Resources:
           DNA_SECRET_NAME: !Ref DnaSecret
           LYR_CA_SECRET_NAME: !Ref LyrCaSecretName
           SUPER_ADMIN_EMAIL: !Ref SuperAdminEmail
+          MAIL_FROM: !Ref MailFrom
           SITE_URL: https://www.lyrcloud.com
           ALLOWED_ORIGINS: !Join [',', !Ref AllowedOrigins]
           SUBDOMAIN_ZONE: !Ref SubdomainZone

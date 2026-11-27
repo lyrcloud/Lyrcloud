@@ -2007,8 +2007,12 @@ function lyrNameView(route) {
 async function loadAdminDomains() {
   adminDomains.loading = true;
   try {
-    const [data, pricing, lyr] = await Promise.all([domainsApi('/admin/domains'), domainsApi('/admin/domain-pricing'), domainsApi('/admin/lyr')]);
-    Object.assign(adminDomains, { data, pricing, lyr: lyr.names, lyrReservations: lyr.reservations || [], error: '' });
+    const [data, pricing, lyr, registrar] = await Promise.all([
+      domainsApi('/admin/domains'), domainsApi('/admin/domain-pricing'), domainsApi('/admin/lyr'),
+      // The DNA balance is extra: if DNA can't be reached, the rest of the tab still loads.
+      domainsApi('/admin/registrar').catch((error) => ({ problem: error.message })),
+    ]);
+    Object.assign(adminDomains, { data, pricing, lyr: lyr.names, lyrReservations: lyr.reservations || [], registrar, error: '' });
   } catch (error) {
     adminDomains.error = error.message;
   }
@@ -2032,6 +2036,42 @@ function parseOverrides(text) {
   return overrides;
 }
 
+// Lyrcloud's prepaid DNA balance, which pays for every registration, transfer and renewal. DNA's API
+// can't add funds, so this shows it and sets the level for the low-balance email.
+function registrarPanel(registrar, isSuper) {
+  if (!registrar) return '';
+  const balance = registrar.balanceCents;
+  const threshold = registrar.thresholdCents ?? 5000;
+  const low = balance !== null && balance !== undefined && balance < threshold;
+  const status = balance === null || balance === undefined
+    ? '<span class="status pending">◌ Unknown</span>'
+    : low ? '<span class="status error">● Low: top up</span>' : '<span class="status ok">● OK</span>';
+  const rows = (registrar.transactions || []).map((tx) => `<tr>
+      <td>${formatDate(tx.at)}</td><td>${esc(tx.type)}</td><td class="mono">${esc(tx.description)}</td>
+      <td class="mono">${tx.credit ? '+' : '−'}${tx.amount.toFixed(2)} ${esc(tx.currency)}</td><td>${esc(tx.status)}</td>
+      <td class="mono">${tx.balance === null ? '' : Number(tx.balance).toFixed(2)}</td></tr>`).join('');
+  return `
+    <section class="panel">
+      <div class="panel-head"><h2>Registrar balance (DNA)</h2>${status}</div>
+      ${registrar.problem ? `<p class="form-error">${esc(registrar.problem)}</p>` : ''}
+      <div class="stat-grid">
+        <div class="stat"><span>Balance</span><strong>${balance === null || balance === undefined ? '—' : money(balance)}</strong></div>
+        <div class="stat"><span>Email me below</span><strong>${money(threshold)}</strong></div>
+        <div class="stat"><span>Checked</span><strong>${registrar.checkedAt ? formatDate(registrar.checkedAt) : '—'}</strong></div>
+        <div class="stat"><span>Last alert</span><strong>${registrar.alertedAt ? formatDate(registrar.alertedAt) : 'None'}</strong></div>
+      </div>
+      <p class="muted">Every registration, transfer and renewal is paid from this prepaid balance. DNA’s API can’t add funds: top up in the DNA reseller panel at domainnameapi.com. When the balance can’t cover an order, checkout pauses without charging the customer${registrar.alertsTo ? `, and ${esc(registrar.alertsTo)} gets an email (at most once a day)` : ''}.</p>
+      ${isSuper ? `
+        <form class="row" data-form="admin-registrar-alert">
+          <label class="field grow">Email me when the balance drops below ($)<input name="threshold" type="number" min="0" step="1" value="${(threshold / 100).toFixed(0)}" /></label>
+          <button class="btn" type="submit">Save</button>
+        </form>` : ''}
+      ${rows ? `<div class="table-scroll"><table class="table">
+        <thead><tr><th>When</th><th>Type</th><th>For</th><th>Amount</th><th>Status</th><th>Balance after</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>` : '<p class="muted small">No balance movements yet.</p>'}
+    </section>`;
+}
+
 function adminDomainsTab(isSuper) {
   if (adminDomains.error) return `<section class="panel"><p class="form-error">${esc(adminDomains.error)}</p><button class="btn" data-action="admin-refresh">Try again</button></section>`;
   if (!adminDomains.data) return '<section class="panel"><p class="muted">Loading domains…</p></section>';
@@ -2046,6 +2086,7 @@ function adminDomainsTab(isSuper) {
       ${stat('Card fees (est.)', money(data.totals.fees))}
       ${stat('Profit (est.)', money(data.totals.profit))}
     </div>
+    ${registrarPanel(adminDomains.registrar, isSuper)}
     <section class="panel">
       <div class="panel-head"><h2>Payments</h2>${stripe.connected ? `<span class="status ok">● Stripe ${esc(stripe.mode)} mode</span>` : '<span class="status pending">◌ Not connected</span>'}</div>
       ${stripe.connected
@@ -2470,6 +2511,20 @@ const domainFormActions = {
       const result = await domainsApi('/admin/stripe', { method: 'PUT', body: JSON.stringify({ secretKey: String(data.get('secretKey')).trim() }) });
       toast(`Stripe connected in ${result.mode} mode`);
       loadAdminDomains();
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message);
+    }
+  },
+  'admin-registrar-alert': async (form, data) => {
+    const button = form.querySelector('[type="submit"]');
+    const dollars = Number(data.get('threshold'));
+    if (!Number.isFinite(dollars) || dollars < 0) return toast('Enter an amount in dollars, such as 50.');
+    button.disabled = true;
+    try {
+      adminDomains.registrar = await domainsApi('/admin/registrar', { method: 'PUT', body: JSON.stringify({ thresholdCents: Math.round(dollars * 100) }) });
+      render();
+      toast('Balance alert saved');
     } catch (error) {
       button.disabled = false;
       toast(error.message);

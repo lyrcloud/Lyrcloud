@@ -15,6 +15,13 @@ process.env.ALLOW_TEST_REGISTRATIONS = '1';
 process.env.SUBDOMAIN_ZONE = 'lyr.cloud';
 process.env.SUBDOMAIN_ZONE_ID = 'ZLYR';
 process.env.DNA_JSON = JSON.stringify({ apiKey: 'live-key', resellerId: '00000000-0000-4000-8000-000000000001', testApiKey: 'test-key' });
+process.env.MAIL_FROM = 'Lyrcloud <no-reply@example.com>';
+const { SESv2Client } = await import('@aws-sdk/client-sesv2');
+let emails = [];
+SESv2Client.prototype.send = async function send(command) {
+  emails.push(command.input);
+  return {};
+};
 const { createRoot } = await import('./lyrca.mjs');
 const LYR_ROOT = createRoot();
 const { handler, resetCaches, tick, TEST_MODE_REASON } = await import('./index.mjs');
@@ -158,7 +165,12 @@ function dnaAnswer(method, path, body, query) {
   const held = (domain) => state.held[domain];
   switch (`${method} ${path}`) {
     case 'GET deposit/accounts/me':
-      return { body: { resellerGroupName: 'Reseller', usdBalance: state.usdBalance ?? 500 } };
+      return { body: { resellerGroupName: 'Reseller', usdBalance: state.usdBalance ?? 500, tryBalance: 0 } };
+    case 'GET deposit/transactions':
+      return { body: { totalCount: 2, items: [
+        { traceId: 't2', type: 3, status: 1, chargeType: 1, amount: 11.59, amountCurrency: 'USD', description: 'lyrshop.com', creationTime: '2026-11-27T02:00:00Z', balance: 38.41 },
+        { traceId: 't1', type: 5, status: 1, chargeType: 0, amount: 50, amountCurrency: 'USD', description: 'Deposit', creationTime: '2026-11-27T01:00:00Z', balance: 50 },
+      ] } };
     case 'GET products/tlds':
       return { body: { totalCount: 5, items: [catalogueEntry('com', 16), catalogueEntry('io', 71), catalogueEntry('net', 17), catalogueEntry('ninja', 30), catalogueEntry('org', 15, { attributes: [{ key: 'X', isRequired: true, type: 'Text' }] })] } };
     case 'POST domains/search':
@@ -347,6 +359,7 @@ async function buy(person, domain, extra = {}) {
 
 beforeEach(() => {
   resetCaches();
+  emails = [];
   tables = { users: new Map(), domains: new Map() };
   for (const person of [SUPER, ALICE, BOB]) tables.users.set(person.userId, { ...person });
   secret = '{}';
@@ -506,6 +519,38 @@ test('an empty DNA balance refunds the customer without telling them about Lyrcl
   assert.equal(called(REGISTER)[0][3], 'live');
   assert.equal(stripeCalls.filter((item) => item.path === '/refunds').length, 1);
   assert.doesNotMatch(domainItem('wonder.com').failureReason, /balance/i);
+});
+
+test('a low DNA balance emails the super admin at most once a day, and again after it recovers and drops', async () => {
+  registrarState.usdBalance = 20;
+  await tick();
+  assert.equal(emails.length, 1);
+  assert.deepEqual(emails[0].Destination.ToAddresses, [SUPER.email]);
+  assert.match(emails[0].Content.Simple.Subject.Data, /DNA balance is low \(\$20\.00\)/);
+  assert.match(emails[0].Content.Simple.Body.Text.Data, /reseller panel/);
+  // The hourly limit and the daily limit both hold it back.
+  await tick();
+  assert.equal((await call(SUPER, 'GET', '/admin/registrar')).status, 200);
+  assert.equal(emails.length, 1);
+  // Topped up: no email, and the reminder resets for the next time it runs low.
+  registrarState.usdBalance = 200;
+  await call(SUPER, 'GET', '/admin/registrar');
+  registrarState.usdBalance = 10;
+  await call(SUPER, 'GET', '/admin/registrar');
+  assert.equal(emails.length, 2);
+});
+
+test('the admin console shows the DNA balance and recent transactions, and the super admin sets the alert level', async () => {
+  registrarState.usdBalance = 120;
+  const view = await call(SUPER, 'GET', '/admin/registrar');
+  assert.equal(view.status, 200);
+  assert.equal(view.body.balanceCents, 12000);
+  assert.equal(view.body.thresholdCents, 5000);
+  assert.deepEqual(view.body.transactions.map((tx) => [tx.type, tx.credit, tx.amount]), [['Transfer', false, 11.59], ['Deposit', true, 50]]);
+  assert.equal((await call(SUPER, 'PUT', '/admin/registrar', { thresholdCents: 20000 })).body.thresholdCents, 20000);
+  assert.equal(emails.length, 1, 'now under the new level');
+  assert.equal((await call(ALICE, 'GET', '/admin/registrar')).status, 403);
+  assert.equal((await call(SUPER, 'PUT', '/admin/registrar', { thresholdCents: -5 })).status, 400);
 });
 
 test('checkout refuses before charging anyone when the live DNA balance can’t cover the order', async () => {
@@ -700,7 +745,8 @@ test('domains bought from Route 53 before the switch keep their DNS but are neve
   });
   await tick();
   assert.equal(stripeCalls.filter((item) => item.path === '/payment_intents' && item.method === 'POST').length, 0);
-  assert.equal(registrarCalls.length, 0);
+  // Only the scheduled balance check talks to DNA; nothing about this domain.
+  assert.deepEqual(registrarCalls.map(([name]) => name).filter((name) => name !== 'GET deposit/accounts/me'), []);
   assert.match((await call(ALICE, 'POST', '/domains/checkout', { action: 'renew', domain: 'old.com' })).body.error, /previous registrar/);
   const detail = await call(ALICE, 'GET', '/domains/old.com');
   assert.equal(detail.body.domain.lyrcloudDns, true);
