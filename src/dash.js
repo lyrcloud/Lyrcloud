@@ -288,7 +288,7 @@ const canManage = (actorRole, targetRole) =>
   targetRole === 'user' ? isStaff(actorRole) : targetRole === 'admin' ? actorRole === 'superadmin' : false;
 
 const PLAN_INFO = {
-  launch: { name: 'Launch', price: '$0', blurb: 'CDN, TLS and DDoS protection for every site.', features: ['Global CDN', 'Free TLS certificates', 'Unmetered DDoS protection', '5 custom firewall rules'] },
+  launch: { name: 'Launch', price: '$0', blurb: 'Edge functions with caching, rate limits and a firewall.', features: ['100k edge function requests/day', 'Edge caching and firewall', 'Domain CDN, TLS & DDoS (coming soon)', '5 custom firewall rules'] },
   scale: { name: 'Scale', price: '$29/mo', blurb: 'Adds the managed WAF and image optimization.', features: ['Everything in Launch', 'Managed WAF rules', 'Image optimization', 'Priority email support'] },
   enterprise: { name: 'Enterprise', price: 'Custom', blurb: 'SLAs, bot management and dedicated support.', features: ['Everything in Scale', '100% uptime SLA', 'Advanced bot management', 'Dedicated support engineer'] },
 };
@@ -536,7 +536,7 @@ const views = {
           : `<section class="panel empty">
               <span class="empty-icon" aria-hidden="true">◎</span>
               <h2>Add your first website</h2>
-              <p>Point your domain at Lyrcloud to get a global CDN, free TLS, and DDoS protection in minutes.</p>
+              <p>Coming soon: point your domain at Lyrcloud for a global CDN, free TLS and DDoS protection.</p>
               <div class="row center">
                 <a class="btn primary" href="#/add-site">Add a site</a>
                 <button class="btn" data-action="add-sample">Explore with a sample site</button>
