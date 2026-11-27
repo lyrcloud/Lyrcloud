@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lyrcloud Cognito User Pool with Hosted UI, federated through Google natively and GitHub via a custom OIDC bridge, and one login with the Lyr accounts (Lyrpay, Lyrtrip) through a user migration trigger.
+
+Parameters:
+  UserPoolName:
+    Type: String
+    Default: lyrcloud-users
+  HostedUiDomainPrefix:
+    Type: String
+    Default: lyrcloud-auth
+    Description: Globally unique Cognito Hosted UI domain prefix.
+  CallbackUrls:
+    Type: CommaDelimitedList
+    Default: 'https://www.lyrcloud.com/callback.html,http://localhost:5173/callback.html'
+  LogoutUrls:
+    Type: CommaDelimitedList
+    Default: 'https://www.lyrcloud.com/index.html,http://localhost:5173/index.html'
+  GoogleClientId:
+    Type: String
+    Default: ''
+    NoEcho: true
+  GoogleClientSecret:
+    Type: String
+    Default: ''
+    NoEcho: true
+  GitHubBridgeBaseUrl:
+    Type: String
+    Default: ''
+    Description: Base invoke URL of the GitHub OIDC bridge API (no trailing slash). Leave empty until the bridge is deployed.
+  LyrUserPoolId:
+    Type: String
+    Default: us-east-1_elNSe2VTE
+    Description: The Lyr account pool (Lyrpay, Lyrtrip). Its accounts sign in here too; leave empty to turn that off.
+  LyrBridgeClientId:
+    Type: String
+    Default: lvuefq00fvgs397rlv9ibkrfu
+    Description: App client in the Lyr pool allowed ADMIN_USER_PASSWORD_AUTH, used only by the migration trigger.
+
+Conditions:
+  HasLyrBridge: !Not [!Equals [!Ref LyrUserPoolId, '']]
+  HasGoogle: !Not [!Equals [!Ref GoogleClientId, '']]
+  HasGitHubBridge: !Not [!Equals [!Ref GitHubBridgeBaseUrl, '']]
+
+Resources:
+  # One login for the Lyr apps: someone signing in here with a Lyr account's email and password (or resetting its
+  # password) who has no Lyrcloud account yet gets one made on the spot, from the Lyr account, once its password checks
+  # out there. Only verified Lyr emails are brought over.
+  LyrBridgeRole:
+    Type: AWS::IAM::Role
+    Condition: HasLyrBridge
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: check-lyr-accounts
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [cognito-idp:AdminInitiateAuth, cognito-idp:AdminGetUser]
+                Resource: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${LyrUserPoolId}'
+
+  LyrBridgeFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasLyrBridge
+    Properties:
+      FunctionName: lyrcloud-lyr-account-bridge
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Timeout: 5
+      Role: !GetAtt LyrBridgeRole.Arn
+      Environment:
+        Variables:
+          LYR_POOL_ID: !Ref LyrUserPoolId
+          LYR_CLIENT_ID: !Ref LyrBridgeClientId
+      Code:
+        ZipFile: |
+          const { CognitoIdentityProviderClient, AdminInitiateAuthCommand, AdminGetUserCommand } = require('@aws-sdk/client-cognito-identity-provider');
+          const lyr = new CognitoIdentityProviderClient({});
+          const PHONE_LOGIN_DOMAIN = '@phone.lyrtrip.com';
+          // Attributes for the new Lyrcloud account, from a Lyr account whose email is verified; null otherwise
+          async function lyrAccount(email) {
+            try {
+              const user = await lyr.send(new AdminGetUserCommand({ UserPoolId: process.env.LYR_POOL_ID, Username: email }));
+              const attrs = Object.fromEntries((user.UserAttributes || []).map(a => [a.Name, a.Value]));
+              if (!user.Enabled || user.UserStatus !== 'CONFIRMED' || attrs.email_verified !== 'true') return null;
+              if (!attrs.email || attrs.email.toLowerCase().endsWith(PHONE_LOGIN_DOMAIN)) return null;
+              const out = { email: attrs.email.toLowerCase(), email_verified: 'true' };
+              if (attrs.name) out.name = attrs.name;
+              return out;
+            } catch (err) {
+              if (err.name === 'UserNotFoundException') return null;
+              throw err;
+            }
+          }
+          exports.handler = async (event) => {
+            const email = String(event.userName || '').trim().toLowerCase();
+            if (!email.includes('@')) throw new Error('Email or password is incorrect.');
+            if (event.triggerSource === 'UserMigration_Authentication') {
+              try {
+                await lyr.send(new AdminInitiateAuthCommand({
+                  UserPoolId: process.env.LYR_POOL_ID, ClientId: process.env.LYR_CLIENT_ID, AuthFlow: 'ADMIN_USER_PASSWORD_AUTH',
+                  AuthParameters: { USERNAME: email, PASSWORD: event.request.password },
+                }));
+              } catch (err) {
+                // Wrong password, or a Lyr account that needs another step: not ours to bring over
+                throw new Error('Email or password is incorrect.');
+              }
+            } else if (event.triggerSource !== 'UserMigration_ForgotPassword') {
+              throw new Error('Email or password is incorrect.');
+            }
+            const attributes = await lyrAccount(email);
+            if (!attributes) throw new Error('Email or password is incorrect.');
+            event.response.userAttributes = attributes;
+            event.response.finalUserStatus = event.triggerSource === 'UserMigration_Authentication' ? 'CONFIRMED' : 'RESET_REQUIRED';
+            event.response.messageAction = 'SUPPRESS';
+            console.log('Lyr account brought into Lyrcloud:', event.triggerSource);
+            return event;
+          };
+
+  LyrBridgePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasLyrBridge
+    Properties:
+      FunctionName: !Ref LyrBridgeFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Ref UserPoolName
+      LambdaConfig: !If
+        - HasLyrBridge
+        - UserMigration: !GetAtt LyrBridgeFunction.Arn
+        - !Ref 'AWS::NoValue'
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref HostedUiDomainPrefix
+      UserPoolId: !Ref UserPool
+
+  GoogleIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Condition: HasGoogle
+    Properties:
+      UserPoolId: !Ref UserPool
+      # Named "GoogleOIDC" rather than "Google": CloudFormation can't replace
+      # a custom-named identity provider in place when an immutable property
+      # (ProviderType) changes, so switching away from the broken built-in
+      # "Google" provider type required a one-time rename.
+      ProviderName: GoogleOIDC
+      # Cognito's built-in ProviderType "Google" auto-generates an
+      # attributes_url against Google's People API with an empty
+      # `personFields=` query, which fails server-side and surfaces to the
+      # browser as a generic ?error=server_error on the OAuth callback ?
+      # and that attributes_url is silently regenerated by Cognito even if
+      # you pass your own, so it can't be overridden for this provider type.
+      # Registering Google as a plain OIDC provider instead sidesteps it
+      # entirely: Google fully supports OIDC discovery, so Cognito reads
+      # email/name/picture straight off the id_token and never calls the
+      # People API at all.
+      ProviderType: OIDC
+      ProviderDetails:
+        client_id: !Ref GoogleClientId
+        client_secret: !Ref GoogleClientSecret
+        authorize_scopes: 'openid email profile'
+        oidc_issuer: 'https://accounts.google.com'
+        attributes_request_method: GET
+      AttributeMapping:
+        email: email
+        name: name
+        username: sub
+
+  GitHubBridgeIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Condition: HasGitHubBridge
+    Properties:
+      UserPoolId: !Ref UserPool
+      ProviderName: GitHubBridge
+      ProviderType: OIDC
+      ProviderDetails:
+        client_id: lyrcloud-github-bridge
+        client_secret: lyrcloud-github-bridge
+        attributes_request_method: GET
+        oidc_issuer: !Ref GitHubBridgeBaseUrl
+        authorize_url: !Sub '${GitHubBridgeBaseUrl}/authorize'
+        token_url: !Sub '${GitHubBridgeBaseUrl}/token'
+        jwks_uri: !Sub '${GitHubBridgeBaseUrl}/.well-known/jwks.json'
+        authorize_scopes: openid
+      AttributeMapping:
+        email: email
+        name: name
+        username: sub
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn:
+      - GoogleIdentityProvider
+      - GitHubBridgeIdentityProvider
+    Properties:
+      ClientName: lyrcloud-web
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      CallbackURLs: !Ref CallbackUrls
+      LogoutURLs: !Ref LogoutUrls
+      SupportedIdentityProviders:
+        - !If [HasGoogle, GoogleOIDC, !Ref 'AWS::NoValue']
+        - !If [HasGitHubBridge, GitHubBridge, !Ref 'AWS::NoValue']
+      # Email and password (src/cognito.js) sign in through this client too; without it Cognito refuses them
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  HostedUiDomain:
+    Value: !Sub '${HostedUiDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+  HostedUiBaseUrl:
+    Value: !Sub 'https://${HostedUiDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+  GoogleRedirectUri:
+    Description: Register this exact URI as the Google OAuth Client's authorized redirect URI.
+    Value: !Sub 'https://${HostedUiDomainPrefix}.auth.${AWS::Region}.amazoncognito.com/oauth2/idpresponse'
+
