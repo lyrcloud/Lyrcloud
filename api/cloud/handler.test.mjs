@@ -370,3 +370,28 @@ test('the access role may manage only lyrcloud-* secrets', async () => {
   assert.deepEqual(statement.Resource, { 'Fn::Sub': 'arn:aws:secretsmanager:*:${AWS::AccountId}:secret:lyrcloud-*' });
   assert.equal(statement.Action.includes('secretsmanager:GetSecretValue'), false, 'Lyrcloud can write logins but never read them back');
 });
+
+const SSH_KEY = `ssh-ed25519 ${'A'.repeat(68)} alice@laptop`;
+
+test('Linux servers on AWS: their key, SSH only from where they say, web open; plan limits apply', async () => {
+  tables.users.get(ALICE.userId).plan = 'launch';
+  await connect(ALICE);
+  assert.equal((await call(ALICE, 'POST', '/cloud/servers', { name: 'box', provider: 'aws', region: 'eu-west-1', sshKey: 'not a key' })).status, 400);
+  assert.equal((await call(ALICE, 'POST', '/cloud/servers', { name: 'box', provider: 'aws', region: 'eu-west-1', sshKey: SSH_KEY, sshFrom: '300.1.1.1/32' })).status, 400);
+  const res = await call(ALICE, 'POST', '/cloud/servers', { name: 'box', provider: 'aws', region: 'eu-west-1', image: 'amazon-linux', size: 'medium', sshKey: SSH_KEY, sshFrom: '203.0.113.7/32' });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  const template = stacks.get('eu-west-1|lyrcloud-server-box').template;
+  assert.equal(template.Resources.Server.Properties.InstanceType, 't3.medium');
+  assert.equal(template.Parameters.Image.Default, '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64');
+  assert.equal(template.Resources.Key.Properties.PublicKeyMaterial, SSH_KEY);
+  assert.deepEqual(template.Resources.Firewall.Properties.SecurityGroupIngress.map((r) => [r.FromPort, r.CidrIp]), [[22, '203.0.113.7/32'], [80, '0.0.0.0/0'], [443, '0.0.0.0/0']]);
+  assert.equal(template.Resources.Server.Properties.MetadataOptions.HttpTokens, 'required');
+  assert.equal((await call(ALICE, 'POST', '/cloud/servers', { name: 'box2', provider: 'aws', region: 'eu-west-1', sshKey: SSH_KEY })).status, 402, 'Launch manages one server');
+  finish('eu-west-1', 'lyrcloud-server-box', { PublicIp: '198.51.100.4', InstanceId: 'i-1' });
+  const { id } = res.body.server;
+  const ready = await call(ALICE, 'GET', `/cloud/servers/${id}`);
+  assert.deepEqual([ready.body.server.status, ready.body.server.ssh], ['ready', 'ssh ec2-user@198.51.100.4']);
+  assert.equal((await call(ALICE, 'DELETE', '/cloud/connections/aws')).status, 409, 'servers first');
+  assert.equal((await call(BOB, 'GET', `/cloud/servers/${id}`)).status, 404);
+  assert.equal((await call(ALICE, 'DELETE', `/cloud/servers/${id}`)).body.server.status, 'deleting');
+});

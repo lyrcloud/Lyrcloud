@@ -104,6 +104,22 @@ clients.fetch = async (url, init = {}) => {
     const service = project.services.get(name);
     return service ? reply(200, { uri: `https://${name}-abc.a.run.app`, terminalCondition: { state: service.state } }) : reply(404, {});
   }
+  if (u.host === 'compute.googleapis.com') {
+    const projectId = u.pathname.match(/projects\/([^/]+)\//)[1];
+    const project = Object.values(gcpProjects).find((p) => p.projectId === projectId);
+    if (init.headers.authorization !== `Bearer gcp-${projectId}`) return reply(403, { error: { message: 'denied' } });
+    project.vms ??= new Map();
+    project.firewalls ??= new Map();
+    if (u.pathname.includes('/firewalls')) {
+      if (init.method === 'GET') return project.firewalls.has('lyrcloud-ssh') ? reply(200, project.firewalls.get('lyrcloud-ssh')) : reply(404, {});
+      return project.firewalls.set(body.name, body), reply(200, {});
+    }
+    if (init.method === 'POST') return project.vms.set(body.name, { ...body, zone: u.pathname.split('/zones/')[1].split('/')[0], status: 'PROVISIONING' }), reply(200, {});
+    const name = u.pathname.split('/').pop();
+    if (init.method === 'DELETE') return project.vms.delete(name), reply(200, {});
+    const vm = project.vms.get(name);
+    return vm ? reply(200, { status: vm.status, networkInterfaces: [{ accessConfigs: [{ natIP: '34.0.0.9' }] }] }) : reply(404, {});
+  }
   if (u.host === 'login.microsoftonline.com') {
     const app = azureApps[body.client_id];
     const claims = claimsOf(body.client_assertion);
@@ -275,4 +291,47 @@ test('private images: Azure keeps the password with the app; Cloud Run points to
   const run = await call(ALICE, 'POST', '/cloud/clusters', { name: 'web', provider: 'gcp', region: 'us-central1', kind: 'serverless' });
   const refused = await call(ALICE, 'POST', `/cloud/clusters/${run.body.cluster.id}/services`, { name: 'site', image: 'acme/private', registry: { username: 'a', password: 'b' } });
   assert.deepEqual([refused.status, /Artifact Registry/.test(refused.body.error)], [400, true]);
+});
+
+const KEY = `ssh-ed25519 ${'B'.repeat(68)} me`;
+
+test('Linux servers on Google Cloud and Azure', async () => {
+  const gcp = (await call(ALICE, 'POST', '/cloud/connections/gcp')).body.connection;
+  assert.match(gcp.setupScript, /roles\/compute\.instanceAdmin\.v1/);
+  const project = gcpProjects['123456789'] = { projectId: 'acme-prod', connectionId: gcp.connectionId, services: new Map(), clusters: new Map(), public: new Set() };
+  await call(ALICE, 'PUT', '/cloud/connections/gcp', { projectId: 'acme-prod', projectNumber: '123456789' });
+  assert.equal((await call(ALICE, 'POST', '/cloud/servers', { name: 'box', provider: 'gcp', region: 'us-central1', image: 'amazon-linux', sshKey: KEY })).status, 400, 'Amazon Linux is AWS only');
+  const g = await call(ALICE, 'POST', '/cloud/servers', { name: 'box', provider: 'gcp', region: 'us-central1', image: 'debian', sshKey: KEY, sshFrom: '198.51.100.0/24' });
+  assert.equal(g.status, 200, JSON.stringify(g.body));
+  const vm = project.vms.get('lyrcloud-box');
+  assert.equal(vm.zone, 'us-central1-b');
+  assert.match(vm.machineType, /e2-small$/);
+  assert.deepEqual(vm.metadata.items, [{ key: 'ssh-keys', value: `admin:${KEY}` }]);
+  assert.deepEqual(project.firewalls.get('lyrcloud-ssh').sourceRanges, ['198.51.100.0/24']);
+  vm.status = 'RUNNING';
+  assert.equal((await call(ALICE, 'GET', `/cloud/servers/${g.body.server.id}`)).body.server.ssh, 'ssh admin@34.0.0.9');
+  await call(ALICE, 'DELETE', `/cloud/servers/${g.body.server.id}`);
+  assert.equal(project.vms.size, 0);
+
+  const az = (await call(ALICE, 'POST', '/cloud/connections/azure')).body.connection;
+  const ids = { tenantId: '11111111-1111-1111-1111-111111111111', subscriptionId: '22222222-2222-2222-2222-222222222222', clientId: '33333333-3333-3333-3333-333333333333' };
+  const app = azureApps[ids.clientId] = { ...ids, group: `lyrcloud-${az.connectionId}`, resources: new Map() };
+  await call(ALICE, 'PUT', '/cloud/connections/azure', ids);
+  const a = await call(ALICE, 'POST', '/cloud/servers', { name: 'web', provider: 'azure', region: 'westeurope', image: 'ubuntu', size: 'large', sshKey: KEY });
+  assert.equal(a.status, 200, JSON.stringify(a.body));
+  const deployment = app.resources.get('Microsoft.Resources/deployments/lyrcloud-web');
+  const vmRes = deployment.properties.template.resources.find((r) => r.type === 'Microsoft.Compute/virtualMachines');
+  assert.equal(vmRes.properties.hardwareProfile.vmSize, 'Standard_B2ms');
+  assert.equal(vmRes.properties.osProfile.linuxConfiguration.disablePasswordAuthentication, true);
+  assert.equal(vmRes.properties.networkProfile.networkInterfaceConfigurations[0].properties.deleteOption, 'Delete', 'card and IP go with the VM');
+  deployment.properties.provisioningState = 'Succeeded';
+  app.resources.set('Microsoft.Network/publicIPAddresses/lyrcloud-web-ip', { properties: { ipAddress: '20.0.0.5' } });
+  assert.equal((await call(ALICE, 'GET', `/cloud/servers/${a.body.server.id}`)).body.server.ssh, 'ssh ubuntu@20.0.0.5');
+  app.resources.set('Microsoft.Compute/virtualMachines/lyrcloud-web', { properties: {} });
+  app.resources.set('Microsoft.Network/networkSecurityGroups/lyrcloud-web-nsg', { properties: {} });
+  await call(ALICE, 'DELETE', `/cloud/servers/${a.body.server.id}`);
+  assert.equal(app.resources.has('Microsoft.Compute/virtualMachines/lyrcloud-web'), false);
+  tables.cloud.get(`server#${a.body.server.id}|server`).checkedAt = '2020-01-01T00:00:00.000Z';
+  assert.equal((await call(ALICE, 'GET', `/cloud/servers/${a.body.server.id}`)).body.server.status, 'deleted');
+  assert.equal(app.resources.has('Microsoft.Network/networkSecurityGroups/lyrcloud-web-nsg'), false, 'its firewall goes after it');
 });

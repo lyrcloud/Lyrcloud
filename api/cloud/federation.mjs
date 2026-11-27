@@ -93,7 +93,7 @@ gcloud iam workload-identity-pools providers create-oidc ${connectionId} --locat
   --attribute-mapping="google.subject=assertion.sub,attribute.connection=assertion['https://sts.amazonaws.com/'].request_tags.lyrcloud_connection" \\
   --attribute-condition="${condition}"
 gcloud iam service-accounts describe "$SA" >/dev/null 2>&1 || gcloud iam service-accounts create ${GCP_SERVICE_ACCOUNT} --display-name=Lyrcloud
-for ROLE in roles/run.admin roles/container.admin roles/iam.serviceAccountUser roles/serviceusage.serviceUsageConsumer; do
+for ROLE in roles/run.admin roles/container.admin roles/compute.instanceAdmin.v1 roles/compute.securityAdmin roles/iam.serviceAccountUser roles/serviceusage.serviceUsageConsumer; do
   gcloud projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:$SA" --role="$ROLE" --condition=None >/dev/null
 done
 gcloud iam service-accounts add-iam-policy-binding "$SA" --role=roles/iam.workloadIdentityUser \\

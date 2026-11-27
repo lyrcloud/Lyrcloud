@@ -2530,7 +2530,7 @@ function cloudAfterRender(route) {
   // CloudFormation takes minutes; refresh while anything is changing.
   const busy = route.view === 'cloud-cluster'
     ? cloud.detail && (CLOUD_BUSY.includes(cloud.detail.cluster.status) || cloud.detail.services.some((s) => CLOUD_BUSY.includes(s.status)))
-    : cloud.data?.clusters.some((c) => CLOUD_BUSY.includes(c.status));
+    : cloud.data?.clusters.some((c) => CLOUD_BUSY.includes(c.status)) || cloud.data?.servers?.some((s) => CLOUD_BUSY.includes(s.status));
   if (busy) {
     cloud.timer = setTimeout(() => {
       if (currentRoute.view === 'cloud-cluster') loadCloudCluster(currentRoute.clusterId);
@@ -2745,11 +2745,45 @@ function cloudView() {
           </tr>`).join('')}</tbody></table></div>` : '<p class="muted">No clusters yet.</p>'}
       </section>
       ${Object.values(data.connections || {}).some((c) => c?.status === 'connected') || data.connection?.status === 'connected' ? clusterForm(data.connections || { aws: data.connection }) : ''}
+      ${serversPanel(data)}
       <section class="panel">
         <div class="panel-head"><h2>Other clouds</h2></div>
         <p class="muted">Their regions are on the map. Clusters there come later.</p>
         <div class="provider-legend">${PROVIDERS.filter((p) => !p.provisioning).map((p) => `<span><i style="background:${p.color}"></i>${esc(p.fullName)} <small>coming soon</small></span>`).join('')}</div>
       </section>`}`;
+}
+
+const SERVER_IMAGES = { ubuntu: 'Ubuntu 24.04 LTS', debian: 'Debian 12', 'amazon-linux': 'Amazon Linux 2023 (AWS)' };
+const SERVER_SIZE_LABELS = { small: '2 vCPU · 2 GB', medium: '2 vCPU · 4 GB', large: '2 vCPU · 8 GB' };
+
+function serversPanel(data) {
+  const servers = data.servers || [];
+  const ready = ['aws', 'gcp', 'azure'].filter((p) => (data.connections || {})[p]?.status === 'connected' || (p === 'aws' && data.connection?.status === 'connected'));
+  const provider = ready.includes(cloud.serverProvider) ? cloud.serverProvider : ready[0];
+  return `
+    <section class="panel">
+      <div class="panel-head"><h2>Linux servers</h2><span class="muted">${servers.length}${data.serverLimit ? ` of ${data.serverLimit} on your plan` : ''}</span></div>
+      ${servers.length ? `<ul class="service-list">${servers.map((s) => `
+        <li class="service-card"><div class="service-main">
+          <div><b class="mono">${esc(s.name)}</b> ${cloudStatus(s.status)}<div class="muted small">${CLOUD_NAMES[s.provider]} · ${regionLabel(s.provider, s.region)} · ${esc(s.imageLabel || s.image)} · ${esc(s.sizeLabel || s.size)} · SSH from <span class="mono">${esc(s.sshFrom)}</span></div>
+            ${s.ssh ? `<code class="ssh-line">${esc(s.ssh)}</code>` : ''}${s.failureReason ? `<p class="form-error">${esc(s.failureReason)}</p>` : ''}</div>
+          <div class="row tight"><span class="muted small">≈ ${usd(s.estimate.monthly)}/mo</span>${s.ssh ? `<button class="btn small" data-action="cloud-copy" data-text="${esc(s.ssh)}">Copy SSH</button>` : ''}<button class="btn small danger" data-action="cloud-delete-server" data-id="${s.id}" data-name="${esc(s.name)}"${s.status === 'deleting' ? ' disabled' : ''}>Delete</button></div>
+        </div></li>`).join('')}</ul>` : '<p class="muted">No servers yet. A server is a Linux machine you reach with SSH: for databases, workers, or anything that isn’t a container.</p>'}
+      ${provider ? `
+      <form class="stack" data-form="cloud-create-server">
+        <div class="field-grid">
+          <label class="field">Name<input name="name" placeholder="db" required pattern="[a-z][a-z0-9-]{1,30}[a-z0-9]" maxlength="32" autocomplete="off" /></label>
+          <label class="field">Cloud<select name="provider" data-action="cloud-server-provider">${ready.map((p) => `<option value="${p}"${p === provider ? ' selected' : ''}>${CLOUD_NAMES[p]}</option>`).join('')}</select></label>
+          <label class="field">Region<select name="region">${regionOptions(provider)}</select></label>
+          <label class="field">System<select name="image">${Object.entries(SERVER_IMAGES).filter(([id]) => id !== 'amazon-linux' || provider === 'aws').map(([id, label]) => `<option value="${id}">${label}</option>`).join('')}</select></label>
+          <label class="field">Size<select name="size">${Object.entries(SERVER_SIZE_LABELS).map(([id, label]) => `<option value="${id}">${label}</option>`).join('')}</select></label>
+          <label class="field">SSH from<input name="sshFrom" class="mono" value="0.0.0.0/0" placeholder="203.0.113.7/32" /></label>
+        </div>
+        <label class="field">Your SSH public key<textarea name="sshKey" rows="2" class="mono" required placeholder="ssh-ed25519 AAAA… you@laptop"></textarea></label>
+        <p class="muted small">Find it with <code>cat ~/.ssh/id_ed25519.pub</code> (make one with <code>ssh-keygen -t ed25519</code>). Ports 80 and 443 are open to everyone; SSH only from the range above. 30 GB disk. Your cloud bills the server.</p>
+        <div class="row"><button class="btn primary" type="submit">Create server</button></div>
+      </form>` : '<p class="muted small">Connect a cloud above to create servers.</p>'}
+    </section>`;
 }
 
 function serviceRow(service) {
@@ -3006,6 +3040,18 @@ const cloudClickActions = {
     go('#/');
   },
   'cloud-workloads': (target) => cloudRun(target, () => cloudApi(`/cloud/clusters/${currentRoute.clusterId}/workloads`), '', (result) => { cloud.workloads = result; render(); }),
+  'cloud-delete-server': (target) => {
+    if (!confirmed(target, `Delete ${target.dataset.name}? The server and its disk are erased.`)) return;
+    cloudRun(target, () => cloudApi(`/cloud/servers/${target.dataset.id}`, { method: 'DELETE' }), `Deleting ${target.dataset.name}…`, loadCloud);
+  },
+  'cloud-copy': async (target) => {
+    try {
+      await navigator.clipboard.writeText(target.dataset.text);
+      toast('Copied');
+    } catch {
+      toast('Couldn’t copy. Select it and copy it yourself.');
+    }
+  },
   'cloud-copy-script': async (target) => {
     const script = cloud.data?.connections?.[target.dataset.provider]?.setupScript || '';
     try {
@@ -3034,6 +3080,10 @@ const cloudChangeActions = {
   'cloud-estimate': () => updateClusterEstimate(),
   'cloud-feature': (target) => cloudRun(target, () => cloudApi('/admin/cloud/settings', { method: 'PUT', body: JSON.stringify({ [target.dataset.feature]: target.checked }) }),
     `${target.dataset.feature === 'upsell' ? 'Domain + CDN offer' : 'Managed hosting'} ${target.checked ? 'on' : 'off'}`, () => { adminCloud.data = null; cloud.data = null; loadAdminCloud(); }),
+  'cloud-server-provider': (target) => {
+    cloud.serverProvider = target.value;
+    render();
+  },
   'cloud-provider': (target) => {
     cloud.formProvider = target.value;
     render();
@@ -3069,6 +3119,9 @@ const cloudFormActions = {
       showFormError(form, error.message);
     });
   },
+  'cloud-create-server': (form, data) => cloudRun(form.querySelector('[type="submit"]'),
+    () => cloudApi('/cloud/servers', { method: 'POST', body: JSON.stringify(Object.fromEntries([...data.entries()].map(([k, v]) => [k, String(v).trim()]))) }),
+    'Creating the server… it’s ready in a few minutes', () => { form.reset(); return loadCloud(); }),
   'cloud-apply': (form, data) => {
     cloud.manifests = String(data.get('manifests') || '');
     cloudRun(form.querySelector('[type="submit"]'), () => cloudApi(`/cloud/clusters/${currentRoute.clusterId}/apply`, { method: 'POST', body: JSON.stringify({ manifests: cloud.manifests }) }),

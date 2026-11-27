@@ -2051,3 +2051,12 @@ a.stat:hover {
 .apply-results .bad {
   color: var(--danger, #d0263e);
 }
+
+.ssh-line {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: var(--surface-2, rgba(0, 0, 0, 0.05));
+  font-size: 0.85rem;
+}

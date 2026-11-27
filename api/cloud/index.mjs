@@ -25,6 +25,9 @@
 //   GET    /cloud/clusters/{id}/workloads         deployments and services running on a Kubernetes cluster
 //   POST   /cloud/clusters/{id}/pay               open a Lyrpay payment for a month of Kubernetes management (fees.mjs)
 //   POST   /cloud/clusters/{id}/payment           check that payment; a paid new cluster gets built
+//   POST   /cloud/servers                         { name, provider, region, image, size, sshKey, sshFrom? } a Linux server (servers.mjs)
+//   GET    /cloud/servers/{id}                    a server, refreshed (public IP, ssh command)
+//   DELETE /cloud/servers/{id}                    delete it and everything made for it
 //   GET    /admin/cloud                           every connection, cluster and service (staff)
 //   PUT    /admin/cloud/settings                  { upsell?, hosting? } switch features on or off (super admin)
 import { randomBytes } from 'node:crypto';
@@ -60,6 +63,7 @@ import {
 import { azureAccessToken, azureSetupScript, CONNECTION_RE, FederationError, gcpAccessToken, gcpSetupScript, identity } from './federation.mjs';
 import { PROVIDER_OPS, ProviderError } from './providers.mjs';
 import { applyManifests, eksToken, KubeError, parseManifests, workloads } from './kube.mjs';
+import { awsServerTemplate, IMAGES, SERVER_OPS, SERVER_SIZES, serverError, serverEstimate, SERVERS_LIMIT, sshCommand } from './servers.mjs';
 
 const env = process.env;
 const TABLE = env.TABLE_NAME;
@@ -95,6 +99,7 @@ function parseJson(event) {
 const connectionKey = (userId, provider = 'aws') => ({ pk: `conn#${userId}`, sk: provider });
 const clusterKey = (id) => ({ pk: `cluster#${id}`, sk: 'cluster' });
 const serviceKey = (id) => ({ pk: `service#${id}`, sk: 'service' });
+const serverKey = (id) => ({ pk: `server#${id}`, sk: 'server' });
 const getItem = async (key) => (await ddb.send(new GetCommand({ TableName: TABLE, Key: key }))).Item;
 const put = (item) => ddb.send(new PutCommand({ TableName: TABLE, Item: item }));
 const remove = (key) => ddb.send(new DeleteCommand({ TableName: TABLE, Key: key }));
@@ -335,8 +340,8 @@ async function federatedConnectionRoutes(event, method, who, provider) {
     return json(200, { connection: publicConnection(saved) });
   }
   if (method === 'DELETE') {
-    const clusters = (await itemsOf(who.userId)).filter((item) => item.row === 'cluster' && item.provider === provider);
-    if (clusters.length) return error(409, 'Delete your clusters on this cloud first; Lyrcloud needs the connection to take them down.');
+    const clusters = (await itemsOf(who.userId)).filter((item) => ['cluster', 'server'].includes(item.row) && item.provider === provider);
+    if (clusters.length) return error(409, 'Delete your clusters and servers on this cloud first; Lyrcloud needs the connection to take them down.');
     await remove(key);
     return json(200, { disconnected: true });
   }
@@ -368,8 +373,8 @@ async function connectionRoutes(event, method, who) {
     return json(200, { connection: publicConnection(saved) });
   }
   if (method === 'DELETE') {
-    const clusters = (await itemsOf(who.userId)).filter((item) => item.row === 'cluster');
-    if (clusters.length) return error(409, 'Delete your clusters first; Lyrcloud needs the connection to take them down.');
+    const clusters = (await itemsOf(who.userId)).filter((item) => ['cluster', 'server'].includes(item.row) && (item.provider || 'aws') === 'aws');
+    if (clusters.length) return error(409, 'Delete your clusters and servers first; Lyrcloud needs the connection to take them down.');
     await remove(key);
     return json(200, { disconnected: true });
   }
@@ -791,13 +796,87 @@ async function remoteServiceRoutes(event, method, item) {
   return error(404, 'not_found');
 }
 
+// ---------------------------------------------------------------- Linux servers (servers.mjs)
+
+const publicServer = (item) => ({
+  id: item.id, name: item.name, provider: item.provider, region: item.region, image: item.image, imageLabel: IMAGES[item.image]?.label, size: item.size,
+  sizeLabel: SERVER_SIZES[item.size]?.label, sshFrom: item.sshFrom, status: item.status, failureReason: item.failureReason || null,
+  publicIp: item.outputs?.PublicIp || null, ssh: sshCommand(item), estimate: serverEstimate(item), createdAt: item.createdAt,
+});
+
+async function refreshServer(item) {
+  if (['ready', 'failed'].includes(item.status) && Date.now() - Date.parse(item.checkedAt || 0) < 60_000) return item;
+  const connection = await getItem(connectionKey(item.ownerId, item.provider));
+  if (item.provider === 'aws') return refresh(item, serverKey(item.id), await credentialsFor(connection));
+  const ctx = await providerContext(connection);
+  const state = await SERVER_OPS[item.provider].refresh(ctx, item);
+  if (state.status === 'deleted') {
+    await remove(serverKey(item.id));
+    return { ...item, status: 'deleted' };
+  }
+  return update(serverKey(item.id), { status: state.status, checkedAt: now(), outputs: state.outputs || item.outputs || {}, failureReason: state.failureReason ?? null });
+}
+
+async function serverRoutes(event, method, path, who) {
+  if (path === '/cloud/servers' && method === 'POST') {
+    const body = parseJson(event);
+    const region = findRegion(body?.provider, body?.region);
+    const refused = serverError(body, region);
+    if (refused) return error(...refused);
+    const items = await itemsOf(who.userId);
+    const servers = items.filter((row) => row.row === 'server');
+    const max = SERVERS_LIMIT[who.plan] ?? 1;
+    if (!who.staff && servers.length >= max) return error(402, `Your plan manages up to ${max} server${max === 1 ? '' : 's'}. Upgrade on the Plans page for more.`);
+    if (servers.some((row) => row.name === body.name && row.provider === body.provider)) return error(409, `You already have a server called ${body.name} on this cloud.`);
+    const connection = items.find((row) => row.row === 'connection' && (row.provider || 'aws') === body.provider);
+    const id = shortId();
+    const item = {
+      ...serverKey(id), row: 'server', id, ownerId: who.userId, ownerEmail: who.email, provider: body.provider, region: region.code, name: body.name,
+      image: body.image || 'ubuntu', size: body.size || 'small', sshKey: String(body.sshKey).trim(), sshFrom: String(body.sshFrom || '0.0.0.0/0').trim(), status: 'creating', createdAt: now(),
+    };
+    if (body.provider === 'aws') {
+      const credentials = await credentialsFor(connection);
+      item.stackName = `lyrcloud-server-${body.name}`;
+      try {
+        await clients.cloudformation(region.code, credentials).send(new CreateStackCommand({
+          StackName: item.stackName, TemplateBody: JSON.stringify(awsServerTemplate(item)), OnFailure: 'ROLLBACK',
+          Tags: [{ Key: 'lyrcloud', Value: 'managed' }, { Key: 'lyrcloud:server', Value: body.name }],
+        }));
+      } catch (err) {
+        const message = awsMessage(err);
+        if (message) return error(400, message);
+        throw err;
+      }
+    } else {
+      const ctx = await providerContext(connection);
+      await SERVER_OPS[body.provider].create(ctx, item);
+    }
+    await put(item);
+    return json(200, { server: publicServer(item) });
+  }
+  const id = path.match(/^\/cloud\/servers\/([a-f0-9]{8})$/)?.[1];
+  const item = id && (await getItem(serverKey(id)));
+  if (!item || (item.ownerId !== who.userId && !isStaff(who.role))) return error(404, 'That server isn’t in your account.');
+  if (method === 'GET') return json(200, { server: publicServer(await refreshServer(item)) });
+  if (method === 'DELETE') {
+    if (item.ownerId !== who.userId) return error(403, 'Only the owner can delete this server.');
+    const connection = await getItem(connectionKey(item.ownerId, item.provider));
+    if (item.provider === 'aws') await clients.cloudformation(item.region, await credentialsFor(connection)).send(new DeleteStackCommand({ StackName: item.stackName }));
+    else await SERVER_OPS[item.provider].remove(await providerContext(connection), item);
+    return json(200, { server: publicServer(await update(serverKey(item.id), { status: 'deleting', updatedAt: now() })) });
+  }
+  return error(404, 'not_found');
+}
+
 // ---------------------------------------------------------------- overview and admin
 
 async function overview(who) {
   let items = await itemsOf(who.userId);
   const pending = items.filter((item) => item.row === 'cluster' && item.pendingPayment);
-  if (pending.length) {
+  const busyServers = items.filter((item) => item.row === 'server' && ['creating', 'deleting', 'updating'].includes(item.status));
+  if (pending.length || busyServers.length) {
     for (const item of pending) await settleFee(item).catch((err) => console.error('fee check', item.id, err.message));
+    await Promise.all(busyServers.map((item) => refreshServer(item).catch((err) => console.error('server check', item.id, err.message))));
     items = await itemsOf(who.userId);
   }
   return json(200, {
@@ -805,6 +884,8 @@ async function overview(who) {
     connections: Object.fromEntries(items.filter((item) => item.row === 'connection').map((item) => [item.provider || 'aws', publicConnection(item)])),
     clusters: items.filter((item) => item.row === 'cluster').map(publicCluster),
     services: items.filter((item) => item.row === 'service').map(publicService),
+    servers: items.filter((item) => item.row === 'server').map(publicServer),
+    serverLimit: who.staff ? null : SERVERS_LIMIT[who.plan] ?? 1,
     accessRoleName: ACCESS_ROLE_NAME,
     plan: who.plan,
     limits: who.staff ? null : (await import('./fees.mjs')).limitsFor(who.plan),
@@ -864,6 +945,7 @@ export const handler = async (event) => {
     if (path === '/cloud/connections/gcp' || path === '/cloud/connections/azure') return await federatedConnectionRoutes(event, method, who, path.split('/').pop());
     if (path === '/cloud/clusters' || path.startsWith('/cloud/clusters/')) return await clusterRoutes(event, method, path, who);
     if (path.startsWith('/cloud/services/')) return await serviceRoutes(event, method, path, who);
+    if (path === '/cloud/servers' || path.startsWith('/cloud/servers/')) return await serverRoutes(event, method, path, who);
     return error(404, 'not_found');
   } catch (err) {
     if (err instanceof CloudError || err instanceof FederationError || err instanceof ProviderError || err instanceof KubeError) return error(err.status, err.message);
