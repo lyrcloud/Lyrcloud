@@ -45,9 +45,15 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 python3 - "$work/code.zip" <<'PY'
-import sys, zipfile
+import glob, os, re, sys, zipfile
+# Every module in api/domains (not the tests), so a new file can't be left out of the Lambda.
+names = sorted(os.path.basename(p)[:-4] for p in glob.glob('api/domains/*.mjs') if not p.endswith('.test.mjs'))
+for name in names:  # and fail here, not in production, if an import points at a file that isn't there
+    for dep in re.findall(r"from '\./([\w-]+)\.mjs'", open(f'api/domains/{name}.mjs').read()):
+        if dep not in names:
+            sys.exit(f'api/domains/{name}.mjs imports ./{dep}.mjs, which does not exist')
 with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED) as z:
-    for name in ['index', 'rules', 'lyrdns', 'lyrca', 'dna', 'sites', 'lyrpay']:
+    for name in names:
         z.write(f'api/domains/{name}.mjs', f'domains/{name}.mjs')
     for name in ['roles', 'phone']:
         z.write(f'api/account/{name}.mjs', f'account/{name}.mjs')
