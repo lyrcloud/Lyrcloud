@@ -364,6 +364,7 @@ const cliCommands = [
   ['lyrcloud bucket list|put|get|delete <bucket>', 'Upload, download and list files in a bucket.'],
   ['lyrcloud storage', 'List the namespaces and buckets your functions bind.'],
   ['lyrcloud ai models | run | usage', 'See the models on your plan, ask one from the terminal, and check this month’s tokens.'],
+  ['lyrcloud access log [name]', 'See who signed in to a protected function, allowed or refused.'],
 ];
 
 const developersPage = {
@@ -452,6 +453,24 @@ return new Response(file.body, {
 // { response, usage: { input_tokens, output_tokens }, model, cached }
 
 const { data } = await env.AI.embed(['first text', 'second text']);`)}</code></pre>
+      </section>
+
+      <section id="access" class="section">
+        <div class="section-heading compact">
+          <span class="eyebrow">Access</span>
+          <h2>Protect a function with sign-in</h2>
+          <p>Add <code class="inline">access</code> to <code class="inline">lyrcloud.json</code>. Visitors sign in with Lyrcloud, and only the emails and domains you list get through. Your code reads who they are from <code class="inline">lyr-access-email</code>.</p>
+        </div>
+        <div class="section-grid">
+          <pre class="snippet"><code>${escape(`"access": {
+  "allow": ["ada@example.com", "@yourcompany.com"],
+  "paths": ["/admin"]
+}`)}</code></pre>
+          <pre class="snippet"><code>${escape(`const email = request.headers.get('lyr-access-email');
+// "ada@example.com" on /admin, null on public paths
+
+// Send people to /__lyrcloud/logout to sign out.`)}</code></pre>
+        </div>
       </section>
 
       <section id="cli" class="section">
@@ -910,6 +929,35 @@ const authShell = ({ mode }) => {
     </main>`;
 };
 
+// Lyrcloud Access: functions protected with "access" in lyrcloud.json send visitors here (src/access.js).
+const accessPage = {
+  route: '/access/',
+  title: 'Lyrcloud Access',
+  description: 'Sign in to open an app protected by Lyrcloud Access.',
+  chrome: false,
+  bodyClass: 'auth-body',
+  scripts: ['/src/access.js'],
+  body: `
+    <main class="auth-page">
+      <a class="brand auth-brand" href="/" aria-label="Lyrcloud home">${logo('auth')}</a>
+      <div class="form-card glass-card auth-card access-card">
+        <h1 class="access-title">Checking your access…</h1>
+        <p class="access-text" aria-live="polite">One moment.</p>
+        <div class="provider-buttons access-signin" hidden>
+          <button class="provider-button" type="button" data-access-login="google">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#4285F4" d="M23.5 12.3c0-.8-.1-1.6-.2-2.3H12v4.5h6.5a5.6 5.6 0 0 1-2.4 3.6v3h3.9c2.2-2.1 3.5-5.1 3.5-8.8z"/><path fill="#34A853" d="M12 24c3.2 0 6-1.1 8-2.9l-3.9-3c-1.1.7-2.5 1.2-4.1 1.2-3.1 0-5.8-2.1-6.7-5H1.3v3.1A12 12 0 0 0 12 24z"/><path fill="#FBBC05" d="M5.3 14.3a7.2 7.2 0 0 1 0-4.6V6.6H1.3a12 12 0 0 0 0 10.8l4-3.1z"/><path fill="#EA4335" d="M12 4.8c1.8 0 3.3.6 4.6 1.8l3.4-3.4A12 12 0 0 0 1.3 6.6l4 3.1c.9-2.9 3.6-4.9 6.7-4.9z"/></svg>
+            Continue with Google
+          </button>
+          <a class="provider-button access-email" href="/login/">Use email and password</a>
+        </div>
+        <div class="cta-row access-actions" hidden>
+          <button class="button secondary access-switch" type="button">Use another account</button>
+        </div>
+        <p class="access-foot">Protected by <a class="text-link" href="/products/zero-trust/">Lyrcloud Access</a>.</p>
+      </div>
+    </main>`,
+};
+
 const loginPage = {
   route: '/login/',
   title: 'Log in',
@@ -998,6 +1046,7 @@ export const pages = [
   contactPage,
   loginPage,
   signUpPage,
+  accessPage,
   dashboardPage,
   callbackPage,
   legacyDashboardPage,

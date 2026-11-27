@@ -2370,3 +2370,11 @@ code.inline {
 
 /* The spinning orbit rings' boxes stick out past narrow screens; keep them inside the hero. */
 .hero { overflow-x: clip; }
+
+/* Lyrcloud Access page (/access/) */
+.access-card { text-align: center; }
+.access-title { margin-bottom: 10px; }
+.access-text { margin-bottom: 22px; color: var(--muted); }
+.access-email { justify-content: center; text-decoration: none; color: inherit; }
+.access-actions { justify-content: center; margin-bottom: 8px; }
+.access-foot { margin-top: 22px; color: var(--muted); font-size: 0.85rem; }

@@ -60,6 +60,16 @@ const { data } = await env.AI.embed(['text one', 'text two'], { dimensions: 256 
 
 `lyrcloud ai models` lists the models your plan includes, `lyrcloud ai run "prompt"` asks one, and `lyrcloud ai usage` shows this month's tokens. In `lyrcloud dev`, AI calls go to the real gateway on your account.
 
+## Access
+
+Put a function, or some paths, behind Lyrcloud sign-in:
+
+```json
+"access": { "allow": ["ada@example.com", "@yourcompany.com"], "paths": ["/admin"] }
+```
+
+Visitors sign in at www.lyrcloud.com and only the emails and domains you list (and you) get through. Your code reads `request.headers.get('lyr-access-email')`. `/__lyrcloud/logout` signs out. `lyrcloud access log` shows every decision. In `lyrcloud dev`, protected paths act as if `LYRCLOUD_DEV_EMAIL` (or `dev@localhost`) signed in.
+
 ## lyrcloud.json
 
 ```json
@@ -70,6 +80,7 @@ const { data } = await env.AI.embed(['text one', 'text two'], { dimensions: 256 
   "kv": { "CACHE": "cache" },
   "buckets": { "FILES": "uploads" },
   "ai": "AI",
+  "access": { "allow": ["@yourcompany.com"], "paths": ["/admin"] },
   "exclude": ["fixtures"]
 }
 ```

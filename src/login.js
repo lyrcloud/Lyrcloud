@@ -4,7 +4,8 @@ import { authFetch, CLIENT_ID, isLoggedIn, passwordSignIn, redirectToLogin } fro
 import { confirmForgotPassword, confirmSignUp, forgotPassword, normalizeEmail, resendCode, signUp } from './cognito.js';
 
 const next = new URLSearchParams(location.search).get('next');
-const destination = next && next.startsWith('/dash/') ? next : '/dash/';
+// /dash/ pages, or the Lyrcloud Access page that sent someone here to sign in for a function.
+const destination = next && (next.startsWith('/dash/') || next.startsWith('/access/?')) ? next : '/dash/';
 
 if (isLoggedIn()) location.replace(destination);
 

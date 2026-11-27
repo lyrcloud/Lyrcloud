@@ -23,6 +23,11 @@
 //   POST /ai/run                    { model?, input: { prompt | messages, system?, max_tokens? }, options?: { cache? } }
 //   POST /ai/embed                  { model?, input: text | [texts], options?: { dimensions? } }
 //
+// Lyrcloud Access (access.mjs):
+//   POST /access/grant              { to } from www.lyrcloud.com/access/: checks the signed-in visitor
+//                                   against the function's allow-list, logs it, returns the ticket URL
+//   GET  /functions/{name}/access-log   ?since=7d  allow/deny decisions (owner)
+//
 // A daily EventBridge rule sends { task: 'renew-certificate' } to keep the *.dev.lyr certificate fresh.
 import { generateKeyPairSync } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -66,6 +71,7 @@ import {
   RUNTIME_ENTRY,
   RUNTIME_HANDLER,
 } from './rules.mjs';
+import { cleanAccess, isAllowed, newNonce, sign, TICKET_SECONDS, verify as verifyAccess } from './access.mjs';
 import { aiLimitsFor, listModels, usageOf } from './ai.mjs';
 import { performAny, platformSecret } from './platform.mjs';
 import { cleanBindings, perform, signToken, StorageError } from './storage.mjs';
@@ -103,6 +109,8 @@ const now = () => new Date().toISOString();
 const fnKey = (name) => ({ pk: `fn#${name}`, sk: 'fn' });
 const CERT_KEY = { pk: 'system', sk: 'certificate' };
 const LYR_KEY = { pk: `lyr#${DOMAIN}`, sk: 'lyr' };
+const DATA_TABLE = env.DATA_TABLE_NAME;
+const ACCESS_LOG_DAYS = 90;
 const getItem = async (key, table = TABLE) => (await ddb.send(new GetCommand({ TableName: table, Key: key }))).Item;
 const isConditionFailure = (err) => err?.name === 'ConditionalCheckFailedException';
 
@@ -142,6 +150,7 @@ const publicFunction = (item) => ({
   main: item.main || null,
   vars: Object.keys(item.vars || {}),
   bindings: item.bindings || [],
+  access: item.access ? { allow: item.access.allow, paths: item.access.paths } : null,
   codeBytes: item.codeBytes || 0,
   deploys: item.deploys || 0,
   createdAt: item.createdAt,
@@ -357,6 +366,8 @@ async function deploy(event, name, who) {
   if (varsProblem) return error(400, varsProblem);
   const [bindings, bindingsProblem] = cleanBindings({ kv: body.kv, buckets: body.buckets, ai: body.ai }, vars);
   if (bindingsProblem) return error(400, bindingsProblem);
+  const [access, accessProblem] = cleanAccess(body.access);
+  if (accessProblem) return error(400, accessProblem);
   if (typeof body.code !== 'string' || !body.code) return error(400, 'Send the code as a base64 zip in "code".');
   const code = Buffer.from(body.code, 'base64');
   if (code.length > MAX_CODE_BYTES) return error(413, `Functions can be at most ${MAX_CODE_BYTES / 1024 / 1024} MB zipped.`);
@@ -397,7 +408,7 @@ async function deploy(event, name, who) {
     if (err instanceof UserError) return error(err.statusCode, err.message);
     throw err;
   }
-  const saved = { ...item, status: 'live', main, vars, bindings, codeBytes: code.length, deploys: (item.deploys || 0) + 1, updatedAt: now(), lastError: undefined };
+  const saved = { ...item, status: 'live', main, vars, bindings, access: access || undefined, codeBytes: code.length, deploys: (item.deploys || 0) + 1, updatedAt: now(), lastError: undefined };
   delete saved.lastError;
   await ddb.send(new PutCommand({ TableName: TABLE, Item: saved }));
   return json(200, { function: publicFunction(saved) });
@@ -429,7 +440,7 @@ async function functionRoutes(event, method, path, who) {
     const items = (await functionsOf(who.userId)).sort((a, b) => a.name.localeCompare(b.name));
     return json(200, { functions: items.map(publicFunction), limit: limitFor(who.plan), plan: who.plan, domain: DOMAIN });
   }
-  const match = path.match(/^\/functions\/([^/]+)(\/logs)?$/);
+  const match = path.match(/^\/functions\/([^/]+)(\/logs|\/access-log)?$/);
   if (!match) return error(404, 'not_found');
   const name = decodeURIComponent(match[1]).toLowerCase();
   const problem = functionNameError(name);
@@ -439,7 +450,8 @@ async function functionRoutes(event, method, path, who) {
   const item = await getItem(fnKey(name));
   const mayRead = item && (item.ownerId === who.userId || isStaff(who.role));
   if (!mayRead) return error(404, `You have no function called ${name}.`);
-  if (match[2] && method === 'GET') return readLogs(event, name);
+  if (match[2] === '/logs' && method === 'GET') return readLogs(event, name);
+  if (match[2] === '/access-log' && method === 'GET') return readAccessLog(event, item);
   if (!match[2] && method === 'GET') return json(200, { function: publicFunction(item) });
   if (!match[2] && method === 'DELETE') {
     if (item.ownerId !== who.userId && who.role !== 'superadmin') return error(403, 'Only the owner can delete this function.');
@@ -505,6 +517,49 @@ async function storageRoutes(event, method, who) {
   return error(404, 'not_found');
 }
 
+// ---------------------------------------------------------------- access
+
+async function logAccess(item, entry) {
+  const at = new Date();
+  await ddb.send(new PutCommand({
+    TableName: DATA_TABLE,
+    Item: {
+      pk: `access#${item.ownerId}#${item.name}`, sk: `${at.toISOString()}#${newNonce()}`,
+      ...entry, expiresAt: Math.floor(at.getTime() / 1000) + ACCESS_LOG_DAYS * 86400,
+    },
+  }));
+}
+
+async function grantAccess(event, who) {
+  const body = parseJson(event);
+  const request = verifyAccess(await platformSecret(), 'request', body?.to);
+  if (!request) return error(400, 'This sign-in link has expired. Open the function’s address again.');
+  const item = await getItem(fnKey(request.fn));
+  if (!item) return error(404, 'That function no longer exists.');
+  const host = hostFor(item.name, DOMAIN);
+  if (!item.access) return json(200, { url: `https://${host}${request.ret}` });
+  const email = who.email || null;
+  if (!email) return error(400, 'Your Lyrcloud account has no email address. Add one in Account settings.');
+  const allowed = isAllowed(item.access, email, item.ownerEmail);
+  await logAccess(item, { email, allowed, path: request.ret.slice(0, 300), ip: event.requestContext?.http?.sourceIp || null, userAgent: String(event.headers?.['user-agent'] || '').slice(0, 300) });
+  if (!allowed) return json(403, { error: `${email} isn’t allowed to open ${host}. Ask its owner to add you.`, email, host });
+  const ticket = sign(await platformSecret(), 'ticket', { fn: item.name, email, ret: request.ret, nonce: newNonce() }, TICKET_SECONDS);
+  return json(200, { url: `https://${host}/__lyrcloud/access?ticket=${encodeURIComponent(ticket)}`, email, host });
+}
+
+async function readAccessLog(event, item) {
+  const since = parseSince(event.queryStringParameters?.since || '7d');
+  if (since === null) return error(400, 'Use since like 1h, 7d or 30d.');
+  const { Items = [] } = await ddb.send(new QueryCommand({
+    TableName: DATA_TABLE,
+    KeyConditionExpression: 'pk = :pk AND sk >= :since',
+    ExpressionAttributeValues: { ':pk': `access#${item.ownerId}#${item.name}`, ':since': new Date(since).toISOString() },
+    ScanIndexForward: false,
+    Limit: 500,
+  }));
+  return json(200, { events: Items.map((row) => ({ time: row.sk.split('#')[0], email: row.email, allowed: row.allowed, path: row.path, ip: row.ip })) });
+}
+
 async function aiRoutes(event, method, path, who) {
   if (path === '/ai/models' && method === 'GET') return json(200, { models: listModels(who.plan), plan: who.plan });
   if (path === '/ai/usage' && method === 'GET') {
@@ -556,6 +611,7 @@ export const handler = async (event) => {
     if (path === '/functions' || path.startsWith('/functions/')) return await functionRoutes(event, method, path, who);
     if (path === '/storage' || path.startsWith('/storage/')) return await storageRoutes(event, method, who);
     if (path.startsWith('/ai/')) return await aiRoutes(event, method, path, who);
+    if (path === '/access/grant' && method === 'POST') return await grantAccess(event, who);
     return error(404, 'not_found');
   } catch (err) {
     console.error('Functions API failed', err);

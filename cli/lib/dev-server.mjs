@@ -9,6 +9,14 @@ import { api } from './api.mjs';
 import { bindingsOf, localStorage } from './local-storage.mjs';
 import { makeEnv, run } from './runtime.mjs';
 
+// Same rule as api/functions/access.mjs isProtected: every path, or paths under the listed prefixes.
+function isProtected(access, path) {
+  if (!access) return false;
+  const paths = (access.paths || []).map((p) => String(p).replace(/\*+$/, ''));
+  if (!paths.length) return true;
+  return paths.some((prefix) => path === prefix || path.startsWith(prefix.endsWith('/') ? prefix : `${prefix}/`) || (prefix.endsWith('/') && path === prefix.slice(0, -1)));
+}
+
 const [root, portText] = process.argv.slice(2);
 const { config } = loadProject(root);
 // KV namespaces and buckets are kept in .lyrcloud/storage/ while developing. AI calls go to the real
@@ -39,6 +47,9 @@ function toEvent(req, body, port) {
   const cookies = headers.cookie ? headers.cookie.split(/;\s*/) : undefined;
   delete headers.cookie;
   headers.host = `${config.name || 'localhost'}.dev.lyr`;
+  // Lyrcloud Access: locally, protected paths act as if you'd signed in (LYRCLOUD_DEV_EMAIL, or dev@localhost).
+  for (const name of Object.keys(headers)) if (name.startsWith('lyr-access-')) delete headers[name];
+  if (isProtected(config.access, url.pathname)) headers['lyr-access-email'] = process.env.LYRCLOUD_DEV_EMAIL || 'dev@localhost';
   return {
     version: '2.0',
     rawPath: url.pathname,

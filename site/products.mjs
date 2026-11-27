@@ -68,23 +68,28 @@ lyrcloud waf rule create \\
   },
   {
     slug: 'zero-trust',
-    icon: '🔐',
+    icon: '🛡',
     name: 'Zero Trust Access',
-    group: 'Network & access',
-    tagline: 'Replace your VPN with identity-aware access.',
-    summary: 'Protect internal apps, SSH, and private networks with per-request identity and device checks.',
+    group: 'Security',
+    tagline: 'Only the right people get in.',
+    summary: 'Put any edge function, or just some of its paths, behind Lyrcloud sign-in with an allow-list of emails and domains. Every decision is logged.',
     features: [
-      ['Access policies', 'Allow by identity provider group, device posture, location, or time of day.'],
-      ['Secure web gateway', 'Filter DNS and HTTP traffic for every employee, on any network.'],
-      ['Private tunnels', 'Outbound-only connectors expose internal services without opening firewall ports.'],
-      ['Browser isolation', 'Render risky sites remotely so malicious code never touches the device.'],
-      ['Device posture', 'Require disk encryption, OS versions, or managed devices before granting access.'],
-      ['Audit logs', 'Every access decision logged and exportable to your SIEM.'],
+      ['Allow-lists', 'Allow exact emails or whole domains such as <code>@yourcompany.com</code>. You, the owner, always get in.'],
+      ['Protect some paths or all', 'Lock <code>/admin</code> and leave the rest public, or protect the whole function.'],
+      ['Checked before your code runs', 'Requests without a valid session never reach your function. Forged identity headers are removed.'],
+      ['Identity in your code', 'Your function reads the signed-in email from the <code>lyr-access-email</code> header.'],
+      ['Audit log', '<code>lyrcloud access log</code> shows every sign-in, allowed or refused, with time, path and IP. Kept 90 days.'],
+      ['Device posture & tunnels', 'Coming soon.'],
     ],
-    code: `# Expose an internal dashboard without opening ports
-lyrcloud tunnel create internal-grafana
-lyrcloud tunnel route internal-grafana grafana.corp.example.com
-lyrcloud access policy add grafana.corp.example.com --allow group:sre`,
+    code: `// lyrcloud.json
+{
+  "name": "team-dashboard",
+  "main": "index.js",
+  "access": {
+    "allow": ["ada@example.com", "@yourcompany.com"],
+    "paths": ["/admin"]
+  }
+}`,
   },
   {
     slug: 'ai',
