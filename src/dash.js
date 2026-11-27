@@ -1497,6 +1497,9 @@ const domainStatus = (status) => {
   const [cls, label] = DOMAIN_STATUS[status] || ['pending', status];
   return `<span class="status ${cls}">${cls === 'ok' ? '●' : cls === 'bad' ? '✕' : '◌'} ${esc(label)}</span>`;
 };
+// The registrar's latest word on an in-flight order, or why it failed.
+const domainNote = (item) => (item.status === 'failed' ? item.failureReason
+  : ['registering', 'transferring'].includes(item.status) ? item.operationMessage : null) || '';
 const shortDate = (iso) => (iso ? new Date(iso).toLocaleDateString(undefined, { dateStyle: 'medium' }) : '—');
 
 // Countries the registrar accepts (ISO 3166-1), named in the visitor's language.
@@ -2128,7 +2131,7 @@ function adminDomainsTab(isSuper) {
       <div class="panel-head"><h2>All domains</h2><span class="muted">${data.domains.length}</span></div>
       ${data.domains.length ? `<div class="table-scroll"><table class="table">
         <thead><tr><th>Domain</th><th>Owner</th><th>Status</th><th>Expires</th><th>Auto-renew</th></tr></thead>
-        <tbody>${data.domains.map((item) => `<tr><td><a class="link mono" href="#/domains/${encodeURIComponent(item.domain)}">${esc(item.domain)}</a></td><td>${esc(item.ownerEmail || '—')}</td><td>${domainStatus(item.status)}</td><td>${shortDate(item.expiresAt)}</td><td>${item.autoRenew ? 'On' : 'Off'}</td></tr>`).join('')}</tbody>
+        <tbody>${data.domains.map((item) => `<tr><td><a class="link mono" href="#/domains/${encodeURIComponent(item.domain)}">${esc(item.domain)}</a></td><td>${esc(item.ownerEmail || '—')}</td><td>${domainStatus(item.status)}${domainNote(item) ? `<br><small class="muted">${esc(domainNote(item))}</small>` : ''}</td><td>${shortDate(item.expiresAt)}</td><td>${item.autoRenew ? 'On' : 'Off'}</td></tr>`).join('')}</tbody>
       </table></div>` : '<p class="muted">No domains sold yet.</p>'}
     </section>
     <section class="panel">
