@@ -2794,6 +2794,15 @@ function serviceForm(service) {
         <label class="field">Health check path<input name="healthPath" value="${esc(service?.healthPath || '/')}" /></label>
       </div>
       <label class="field">Environment variables (NAME=value, one per line)<textarea name="env" rows="3" class="mono">${esc(envText(service?.env))}</textarea></label>
+      <details class="registry-box"${service?.privateRegistry ? ' open' : ''}>
+        <summary>Private image (Docker Hub, GHCR, GitLab, Quay…)${service?.privateRegistry ? ` · signed in as <span class="mono">${esc(service.registryUser)}</span> at ${esc(service.registryServer)}` : ''}</summary>
+        <div class="field-grid">
+          <label class="field">Registry user<input name="registryUser" autocomplete="off" value="${esc(service?.registryUser || '')}" placeholder="your Docker Hub or GitHub user" /></label>
+          <label class="field">Password or access token<input name="registryPassword" type="password" autocomplete="new-password" placeholder="${service?.privateRegistry ? 'leave blank to keep the saved one' : 'a read-only token is best'}" /></label>
+        </div>
+        ${service?.privateRegistry ? '<label class="inline-check"><input type="checkbox" name="registryOff" /> The image is public now: forget the login</label>' : ''}
+        <p class="muted small">The login is stored only in your own cloud account (AWS Secrets Manager or the container app’s secrets), never by Lyrcloud. Google Cloud: use Artifact Registry in your project instead; it needs no password.</p>
+      </details>
       <div class="row"><button class="btn primary" type="submit">${edit ? 'Redeploy' : 'Deploy'}</button><span class="muted small">${IMAGE_HELP[cloud.detail?.cluster?.provider || 'aws']}</span></div>
     </form>`;
 }
@@ -2927,14 +2936,22 @@ const parseEnv = (text) => {
   }
   return env;
 };
-const serviceBody = (data) => ({
-  image: String(data.get('image') || '').trim(),
-  port: Number(data.get('port')),
-  size: String(data.get('size')),
-  count: Number(data.get('count')),
-  healthPath: String(data.get('healthPath') || '/').trim() || '/',
-  env: parseEnv(data.get('env')),
-});
+const serviceBody = (data) => {
+  const body = {
+    image: String(data.get('image') || '').trim(),
+    port: Number(data.get('port')),
+    size: String(data.get('size')),
+    count: Number(data.get('count')),
+    healthPath: String(data.get('healthPath') || '/').trim() || '/',
+    env: parseEnv(data.get('env')),
+  };
+  const user = String(data.get('registryUser') || '').trim();
+  const password = String(data.get('registryPassword') || '');
+  if (data.get('registryOff')) body.registry = null;
+  else if (password) body.registry = { username: user, password };
+  else if (user && !document.querySelector('.registry-box summary .mono')) throw new Error('Add the registry password or token too.');
+  return body;
+};
 const findCloudService = (id) => cloud.detail?.services.find((s) => s.id === id);
 
 async function cloudRun(target, request, message, after) {

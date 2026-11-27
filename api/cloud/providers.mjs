@@ -7,6 +7,7 @@
 // Services (serverless clusters only) are Cloud Run services / container apps with a public HTTPS address.
 // Statuses: creating, updating, ready, failed, deleting, deleted.
 import { azureGroup } from './federation.mjs';
+import { registryServer } from './rules.mjs';
 
 export const GKE_API = 'https://container.googleapis.com/v1';
 export const RUN_API = 'https://run.googleapis.com/v2';
@@ -110,6 +111,9 @@ export const gcp = {
     return { status: 'deleting' };
   },
   async deployService(ctx, cluster, service, { create }) {
+    if (service.privateRegistry) {
+      throw new ProviderError(400, 'Cloud Run pulls private images only from Artifact Registry in your project (no password needed): push the image there and use its address, like us-docker.pkg.dev/your-project/repo/app:1.0.');
+    }
     const base = `${RUN_API}/${gcpLocation(ctx.connection, cluster)}/services`;
     if (create) await call(ctx, 'POST', `${base}?serviceId=${runName(cluster, service)}`, runBody(service));
     else await call(ctx, 'PATCH', `${base}/${runName(cluster, service)}`, runBody(service));
@@ -157,15 +161,20 @@ export function aksBody(cluster) {
   };
 }
 
-export function containerAppBody(cluster, service) {
+// password: the registry password to store with the app (a container app secret in the customer's account).
+export function containerAppBody(cluster, service, password = null) {
   const port = service.port || 80;
+  const registry = service.privateRegistry && password ? {
+    secrets: [{ name: 'registry-password', value: password }],
+    registries: [{ server: registryServer(service.image), username: service.registryUser, passwordSecretRef: 'registry-password' }],
+  } : {};
   return {
     location: cluster.region,
     tags: { lyrcloud: 'managed' },
     properties: {
       environmentId: cluster.outputs.EnvironmentId,
       workloadProfileName: 'Consumption',
-      configuration: { ingress: { external: true, targetPort: port, transport: 'auto' } },
+      configuration: { ingress: { external: true, targetPort: port, transport: 'auto' }, ...registry },
       template: {
         containers: [{
           name: 'app',
@@ -220,8 +229,16 @@ export const azure = {
     await call(ctx, 'DELETE', url);
     return { status: 'deleting' };
   },
-  async deployService(ctx, cluster, service, { create }) {
-    await call(ctx, 'PUT', `${groupUrl(ctx.connection)}/providers/Microsoft.App/containerApps/${appName(cluster, service)}?api-version=${APP_VERSION}`, containerAppBody(cluster, service));
+  async deployService(ctx, cluster, service, { create, registry }) {
+    const url = `${groupUrl(ctx.connection)}/providers/Microsoft.App/containerApps/${appName(cluster, service)}`;
+    let password = registry?.password || null;
+    if (service.privateRegistry && !password && !create) {
+      // Keep the stored password: Azure doesn't return secrets with the app, only through listSecrets.
+      const secrets = await call(ctx, 'POST', `${url}/listSecrets?api-version=${APP_VERSION}`);
+      password = secrets?.value?.find((s) => s.name === 'registry-password')?.value || null;
+      if (!password) throw new ProviderError(400, 'Enter the registry password again to redeploy this private image.');
+    }
+    await call(ctx, 'PUT', `${url}?api-version=${APP_VERSION}`, containerAppBody(cluster, service, password));
     return { status: create ? 'creating' : 'updating' };
   },
   async refreshService(ctx, cluster, service) {

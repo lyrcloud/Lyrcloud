@@ -2028,3 +2028,12 @@ a.stat:hover {
   font-size: 0.78rem;
   white-space: pre;
 }
+.registry-box {
+  padding: 10px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+}
+.registry-box summary {
+  cursor: pointer;
+  font-weight: 600;
+}

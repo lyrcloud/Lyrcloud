@@ -66,6 +66,11 @@ export function serviceError(body, { partial = false } = {}) {
   if ('size' in body && !SERVICE_SIZES[body.size]) return [400, `Size must be one of ${Object.keys(SERVICE_SIZES).join(', ')}.`];
   if ('count' in body && !(Number.isInteger(body.count) && body.count >= 0 && body.count <= 20)) return [400, 'Run 0 to 20 copies.'];
   if ('healthPath' in body && !/^\/[\w./-]{0,200}$/.test(String(body.healthPath))) return [400, 'Health check path must start with /.'];
+  if ('registry' in body && body.registry !== null) {
+    const { username, password } = body.registry || {};
+    if (typeof username !== 'string' || !username.trim() || username.length > 200) return [400, 'Enter the registry user name (Docker Hub user, GitHub user, …).'];
+    if (typeof password !== 'string' || !password || password.length > 2000) return [400, 'Enter the registry password or access token.'];
+  }
   if ('env' in body) {
     if (!body.env || typeof body.env !== 'object' || Array.isArray(body.env)) return [400, 'Environment must be an object of NAME: value.'];
     const entries = Object.entries(body.env);
@@ -141,6 +146,12 @@ export function accessRoleTemplate(lyrcloudAccountId) {
                     'iam:PutRolePolicy', 'iam:DeleteRolePolicy', 'iam:GetRolePolicy', 'iam:ListRolePolicies', 'iam:ListAttachedRolePolicies', 'iam:PassRole',
                     'iam:CreateInstanceProfile', 'iam:DeleteInstanceProfile', 'iam:GetInstanceProfile', 'iam:AddRoleToInstanceProfile', 'iam:RemoveRoleFromInstanceProfile', 'iam:ListInstanceProfilesForRole'],
                   Resource: [{ 'Fn::Sub': `arn:aws:iam::\${AWS::AccountId}:role/${IAM_PREFIX}*` }, { 'Fn::Sub': `arn:aws:iam::\${AWS::AccountId}:instance-profile/${IAM_PREFIX}*` }],
+                },
+                {
+                  Sid: 'OwnSecrets',
+                  Effect: 'Allow',
+                  Action: ['secretsmanager:CreateSecret', 'secretsmanager:DeleteSecret', 'secretsmanager:UpdateSecret', 'secretsmanager:PutSecretValue', 'secretsmanager:DescribeSecret', 'secretsmanager:TagResource', 'secretsmanager:GetResourcePolicy'],
+                  Resource: { 'Fn::Sub': `arn:aws:secretsmanager:*:\${AWS::AccountId}:secret:${IAM_PREFIX}*` },
                 },
                 {
                   Sid: 'ServiceLinkedRoles',
@@ -274,14 +285,33 @@ export function clusterTemplate({ id, name, kind, zones, nodeType = 't3.medium',
 }
 
 // A public container service on a serverless cluster: load balancer -> Fargate tasks.
-export function serviceTemplate({ id, clusterName, vpcId, subnetIds, executionRoleArn, name, image, port = 80, size = 'small', count = 1, env = {}, healthPath = '/' }) {
+export function serviceTemplate({ id, clusterName, vpcId, subnetIds, executionRoleArn, name, image, port = 80, size = 'small', count = 1, env = {}, healthPath = '/', privateRegistry = false }) {
   const { cpu, memory } = SERVICE_SIZES[size];
   // Load balancer and target group names: unique in the region and at most 32 characters.
   const full = `lyrcloud-${id}`;
+  // A private image: its registry login is a stack parameter (NoEcho, never stored by Lyrcloud) kept in a
+  // Secrets Manager secret in the customer's account, which only this service's tasks can read.
+  const registry = privateRegistry ? {
+    RegistrySecret: {
+      Type: 'AWS::SecretsManager::Secret',
+      Properties: { Name: `${full}-registry`, Description: `Registry login for ${name}`, SecretString: { Ref: 'RegistryLogin' }, Tags: tags(`${full}-registry`) },
+    },
+    RegistryAccess: {
+      Type: 'AWS::IAM::Policy',
+      Properties: {
+        PolicyName: `${full}-registry`,
+        Roles: [String(executionRoleArn).split('/').pop()],
+        PolicyDocument: { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: 'secretsmanager:GetSecretValue', Resource: { Ref: 'RegistrySecret' } }] },
+      },
+    },
+  } : {};
   return {
     AWSTemplateFormatVersion: '2010-09-09',
     Description: `Lyrcloud service ${name} on ${clusterName}. Managed from the Lyrcloud dashboard.`,
+    // RegistryLogin: {"username":…,"password":…} as ECS reads it, JSON-encoded by Lyrcloud (registryLogin).
+    ...(privateRegistry ? { Parameters: { RegistryLogin: { Type: 'String', NoEcho: true } } } : {}),
     Resources: {
+      ...registry,
       Logs: { Type: 'AWS::Logs::LogGroup', Properties: { LogGroupName: `/lyrcloud/${clusterName}/${name}`, RetentionInDays: 14 } },
       BalancerSecurity: {
         Type: 'AWS::EC2::SecurityGroup',
@@ -311,6 +341,7 @@ export function serviceTemplate({ id, clusterName, vpcId, subnetIds, executionRo
           Family: full, Cpu: String(cpu), Memory: String(memory), NetworkMode: 'awsvpc', RequiresCompatibilities: ['FARGATE'], ExecutionRoleArn: executionRoleArn,
           ContainerDefinitions: [{
             Name: name, Image: image, Essential: true,
+            ...(privateRegistry ? { RepositoryCredentials: { CredentialsParameter: { Ref: 'RegistrySecret' } } } : {}),
             PortMappings: [{ ContainerPort: port, Protocol: 'tcp' }],
             Environment: Object.entries(env).map(([Name, Value]) => ({ Name, Value })),
             LogConfiguration: { LogDriver: 'awslogs', Options: { 'awslogs-group': { Ref: 'Logs' }, 'awslogs-region': { Ref: 'AWS::Region' }, 'awslogs-stream-prefix': name } },
@@ -319,7 +350,7 @@ export function serviceTemplate({ id, clusterName, vpcId, subnetIds, executionRo
       },
       Service: {
         Type: 'AWS::ECS::Service',
-        DependsOn: 'Listener',
+        DependsOn: privateRegistry ? ['Listener', 'RegistryAccess'] : 'Listener',
         Properties: {
           ServiceName: name, Cluster: clusterName, TaskDefinition: { Ref: 'Task' }, DesiredCount: count,
           CapacityProviderStrategy: [{ CapacityProvider: 'FARGATE', Weight: 1 }],
@@ -335,6 +366,14 @@ export function serviceTemplate({ id, clusterName, vpcId, subnetIds, executionRo
 }
 
 // The CloudFormation console link that creates the access role with this customer's ExternalId filled in.
+// The registry server of an image: its first part when that's a host name, else Docker Hub.
+export function registryServer(image) {
+  const first = String(image).split('/')[0];
+  return String(image).includes('/') && (first.includes('.') || first.includes(':') || first === 'localhost') ? first : 'index.docker.io';
+}
+
+export const registryLogin = ({ username, password }) => JSON.stringify({ username: username.trim(), password });
+
 export function launchUrl(templateUrl, externalId) {
   const params = new URLSearchParams({ templateURL: templateUrl, stackName: 'lyrcloud-access', param_ExternalId: externalId });
   return `https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/review?${params}`;

@@ -47,6 +47,8 @@ import {
   launchUrl,
   MAX_CLUSTERS,
   MAX_SERVICES_PER_CLUSTER,
+  registryLogin,
+  registryServer,
   roleArnFrom,
   serviceError,
   serviceEstimate,
@@ -241,6 +243,7 @@ const publicService = (item) => ({
   id: item.id, clusterId: item.clusterId, name: item.name, image: item.image, port: item.port, size: item.size, count: item.count,
   env: item.env || {}, healthPath: item.healthPath, status: item.status, failureReason: item.failureReason || null,
   url: item.outputs?.Url || null, estimate: serviceEstimate(item), createdAt: item.createdAt, updatedAt: item.updatedAt || null,
+  privateRegistry: Boolean(item.privateRegistry), registryUser: item.registryUser || null, registryServer: item.privateRegistry ? registryServer(item.image) : null,
 });
 
 // ---------------------------------------------------------------- refresh from CloudFormation
@@ -640,8 +643,8 @@ async function createRemoteService(event, cluster, who, ctx) {
   if (siblings.length >= MAX_SERVICES_PER_CLUSTER) return error(409, `A cluster can run up to ${MAX_SERVICES_PER_CLUSTER} services.`);
   if (siblings.some((row) => row.name === name)) return error(409, `This cluster already has a service called ${name}.`);
   const id = shortId();
-  const item = { ...serviceKey(id), row: 'service', id, clusterId: cluster.id, ownerId: who.userId, provider: cluster.provider, region: cluster.region, name, ...serviceConfig(body), status: 'creating', createdAt: now() };
-  const state = await ctx.ops.deployService(ctx, fresh, item, { create: true });
+  const item = { ...serviceKey(id), row: 'service', id, clusterId: cluster.id, ownerId: who.userId, provider: cluster.provider, region: cluster.region, name, ...serviceConfig(body), ...registryFields(body.registry), status: 'creating', createdAt: now() };
+  const state = await ctx.ops.deployService(ctx, fresh, item, { create: true, registry: body.registry });
   const saved = { ...item, status: state.status };
   await put(saved);
   return json(200, { service: publicService(saved) });
@@ -660,8 +663,14 @@ const serviceConfig = (body, base = {}) => ({
 
 const serviceTemplateFor = (cluster, service) => serviceTemplate({
   id: service.id, clusterName: cluster.outputs.ClusterName, vpcId: cluster.outputs.VpcId, subnetIds: String(cluster.outputs.SubnetIds).split(','),
-  executionRoleArn: cluster.outputs.ExecutionRoleArn, name: service.name, ...serviceConfig(service),
+  executionRoleArn: cluster.outputs.ExecutionRoleArn, name: service.name, ...serviceConfig(service), privateRegistry: Boolean(service.privateRegistry),
 });
+
+// A private registry login: what the row keeps (never the password) and the CloudFormation parameters.
+const registryFields = (registry, current = {}) => (registry === null ? { privateRegistry: false, registryUser: null }
+  : registry ? { privateRegistry: true, registryUser: registry.username.trim() } : { privateRegistry: Boolean(current.privateRegistry), registryUser: current.registryUser || null });
+const registryParameters = (registry, fields) => (!fields.privateRegistry ? []
+  : registry ? [{ ParameterKey: 'RegistryLogin', ParameterValue: registryLogin(registry) }] : [{ ParameterKey: 'RegistryLogin', UsePreviousValue: true }]);
 
 async function createService(event, cluster, who, credentials) {
   if (cluster.kind !== 'serverless') return error(400, 'Lyrcloud deploys services to serverless clusters. On Kubernetes, deploy with kubectl (see the cluster page).');
@@ -681,11 +690,12 @@ async function createService(event, cluster, who, credentials) {
   await ensureLinkedRoles('service', credentials);
   const item = {
     ...serviceKey(id), row: 'service', id, clusterId: cluster.id, ownerId: who.userId, region: cluster.region, name, ...serviceConfig(body),
-    stackName: `lyrcloud-svc-${cluster.name}-${name}`.slice(0, 128), status: 'creating', createdAt: now(),
+    ...registryFields(body.registry), stackName: `lyrcloud-svc-${cluster.name}-${name}`.slice(0, 128), status: 'creating', createdAt: now(),
   };
   try {
     await clients.cloudformation(cluster.region, credentials).send(new CreateStackCommand({
       StackName: item.stackName, TemplateBody: JSON.stringify(serviceTemplateFor(fresh, item)), OnFailure: 'ROLLBACK',
+      Parameters: registryParameters(body.registry, item),
       Tags: [{ Key: 'lyrcloud', Value: 'managed' }, { Key: 'lyrcloud:service', Value: name }],
     }));
   } catch (err) {
@@ -711,17 +721,17 @@ async function serviceRoutes(event, method, path, who) {
     if (refused) return error(...refused);
     if (!['ready', 'failed'].includes(item.status)) return error(409, 'Wait until the last change finishes.');
     const cluster = await getItem(clusterKey(item.clusterId));
-    const next = { ...item, ...serviceConfig(body, item) };
+    const next = { ...item, ...serviceConfig(body, item), ...registryFields(body.registry, item) };
     try {
-      await clients.cloudformation(item.region, credentials).send(new UpdateStackCommand({ StackName: item.stackName, TemplateBody: JSON.stringify(serviceTemplateFor(cluster, next)) }));
+      await clients.cloudformation(item.region, credentials).send(new UpdateStackCommand({ StackName: item.stackName, TemplateBody: JSON.stringify(serviceTemplateFor(cluster, next)), Parameters: registryParameters(body.registry, next) }));
     } catch (err) {
       if (err.name === 'ValidationError' && /No updates/.test(err.message)) return json(200, { service: publicService(item) });
       const message = awsMessage(err);
       if (message) return error(400, message);
       throw err;
     }
-    const { image, port, size, count, env: vars, healthPath } = next;
-    return json(200, { service: publicService(await update(serviceKey(item.id), { image, port, size, count, env: vars, healthPath, status: 'updating', updatedAt: now() })) });
+    const { image, port, size, count, env: vars, healthPath, privateRegistry, registryUser } = next;
+    return json(200, { service: publicService(await update(serviceKey(item.id), { image, port, size, count, env: vars, healthPath, privateRegistry, registryUser, status: 'updating', updatedAt: now() })) });
   }
   if (method === 'DELETE') {
     await clients.cloudformation(item.region, credentials).send(new DeleteStackCommand({ StackName: item.stackName }));
@@ -739,10 +749,10 @@ async function remoteServiceRoutes(event, method, item) {
     const refused = serviceError(body, { partial: true });
     if (refused) return error(...refused);
     if (!['ready', 'failed'].includes(item.status)) return error(409, 'Wait until the last change finishes.');
-    const next = { ...item, ...serviceConfig(body, item) };
-    const state = await ctx.ops.deployService(ctx, cluster, next, { create: false });
-    const { image, port, size, count, env: vars, healthPath } = next;
-    return json(200, { service: publicService(await update(serviceKey(item.id), { image, port, size, count, env: vars, healthPath, status: state.status, updatedAt: now() })) });
+    const next = { ...item, ...serviceConfig(body, item), ...registryFields(body.registry, item) };
+    const state = await ctx.ops.deployService(ctx, cluster, next, { create: false, registry: body.registry });
+    const { image, port, size, count, env: vars, healthPath, privateRegistry, registryUser } = next;
+    return json(200, { service: publicService(await update(serviceKey(item.id), { image, port, size, count, env: vars, healthPath, privateRegistry, registryUser, status: state.status, updatedAt: now() })) });
   }
   if (method === 'DELETE') {
     await ctx.ops.deleteService(ctx, cluster, item);

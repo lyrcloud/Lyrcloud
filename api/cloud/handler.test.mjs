@@ -334,3 +334,39 @@ test('only the super admin switches cloud features, and customers see them', asy
   assert.deepEqual((await call(SUPER, 'PUT', '/admin/cloud/settings', { upsell: true, hosting: 'yes' })).body.features, { upsell: true, hosting: false });
   assert.equal((await call(ALICE, 'GET', '/cloud')).body.features.upsell, true);
 });
+
+test('private registry images: the login goes into the customer’s account, never into Lyrcloud', async () => {
+  await connect(ALICE);
+  const { id } = (await call(ALICE, 'POST', '/cloud/clusters', { name: 'apps', provider: 'aws', region: 'eu-west-1', kind: 'serverless' })).body.cluster;
+  finish('eu-west-1', 'lyrcloud-cluster-apps', { ClusterName: 'lyrcloud-apps', VpcId: 'vpc-1', SubnetIds: 'subnet-a,subnet-b', ExecutionRoleArn: 'arn:aws:iam::111122223333:role/lyrcloud-x-exec' });
+  assert.equal((await call(ALICE, 'POST', `/cloud/clusters/${id}/services`, { name: 'web', image: 'acme/private:1', registry: { username: 'acme' } })).status, 400, 'password needed');
+  const svc = await call(ALICE, 'POST', `/cloud/clusters/${id}/services`, { name: 'web', image: 'acme/private:1', registry: { username: ' acme ', password: 'p"a\\ss' } });
+  assert.equal(svc.status, 200);
+  assert.deepEqual([svc.body.service.privateRegistry, svc.body.service.registryUser, svc.body.service.registryServer], [true, 'acme', 'index.docker.io']);
+  const create = calls.filter((c) => c.name === 'CreateStackCommand').at(-1);
+  assert.deepEqual(create.input.Parameters, [{ ParameterKey: 'RegistryLogin', ParameterValue: '{"username":"acme","password":"p\\"a\\\\ss"}' }]);
+  const template = stacks.get('eu-west-1|lyrcloud-svc-apps-web').template;
+  assert.equal(template.Parameters.RegistryLogin.NoEcho, true);
+  assert.equal(template.Resources.RegistrySecret.Properties.Name, `lyrcloud-${svc.body.service.id}-registry`, 'inside the role’s lyrcloud-* secrets');
+  assert.deepEqual(template.Resources.RegistryAccess.Properties.Roles, ['lyrcloud-x-exec']);
+  assert.deepEqual(template.Resources.Task.Properties.ContainerDefinitions[0].RepositoryCredentials, { CredentialsParameter: { Ref: 'RegistrySecret' } });
+  assert.equal(JSON.stringify([...tables.cloud.values()]).includes('p\\"a'), false, 'the password isn’t stored');
+
+  finish('eu-west-1', 'lyrcloud-svc-apps-web', { Url: 'http://lb' });
+  const row = tables.cloud.get(`service#${svc.body.service.id}|service`);
+  row.status = 'ready';
+  await call(ALICE, 'PUT', `/cloud/services/${row.id}`, { image: 'acme/private:2' });
+  assert.deepEqual(calls.filter((c) => c.name === 'UpdateStackCommand').at(-1).input.Parameters, [{ ParameterKey: 'RegistryLogin', UsePreviousValue: true }], 'keeps the stored login');
+  tables.cloud.get(`service#${row.id}|service`).status = 'ready';
+  await call(ALICE, 'PUT', `/cloud/services/${row.id}`, { image: 'nginx', registry: null });
+  const update = calls.filter((c) => c.name === 'UpdateStackCommand').at(-1);
+  assert.deepEqual(update.input.Parameters, []);
+  assert.equal(JSON.parse(update.input.TemplateBody).Resources.RegistrySecret, undefined, 'public again: the secret goes');
+});
+
+test('the access role may manage only lyrcloud-* secrets', async () => {
+  const { accessRoleTemplate } = await import('./rules.mjs');
+  const statement = accessRoleTemplate('479664683751').Resources.Role.Properties.Policies[0].PolicyDocument.Statement.find((s) => s.Sid === 'OwnSecrets');
+  assert.deepEqual(statement.Resource, { 'Fn::Sub': 'arn:aws:secretsmanager:*:${AWS::AccountId}:secret:lyrcloud-*' });
+  assert.equal(statement.Action.includes('secretsmanager:GetSecretValue'), false, 'Lyrcloud can write logins but never read them back');
+});

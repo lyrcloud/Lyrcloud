@@ -118,6 +118,7 @@ clients.fetch = async (url, init = {}) => {
     if (!app || u.pathname.split('/')[2] !== app.subscriptionId || group !== app.group) return reply(403, { error: { message: 'AuthorizationFailed' } });
     const path = u.pathname.split('/providers/')[1];
     if (!path) return reply(200, { name: group });
+    if (path.endsWith('/listSecrets')) return reply(200, { value: app.resources.get(path.replace('/listSecrets', '')).properties.configuration.secrets || [] });
     if (init.method === 'PUT') return app.resources.set(path, { ...body, properties: { ...body.properties, provisioningState: 'InProgress' } }), reply(200, { id: `/x/${path}` });
     if (init.method === 'DELETE') return app.resources.delete(path), reply(202, {});
     const resource = app.resources.get(path);
@@ -248,4 +249,30 @@ test('names and images for the other clouds', () => {
   assert.deepEqual(body.template.scaling, { minInstanceCount: 2, maxInstanceCount: 3 });
   assert.deepEqual(body.template.containers[0].env, [{ name: 'A', value: '1' }]);
   assert.equal(body.template.containers[0].startupProbe.httpGet.path, '/health');
+});
+
+test('private images: Azure keeps the password with the app; Cloud Run points to Artifact Registry', async () => {
+  const { connectionId } = (await call(ALICE, 'POST', '/cloud/connections/azure')).body.connection;
+  const ids = { tenantId: '11111111-1111-1111-1111-111111111111', subscriptionId: '22222222-2222-2222-2222-222222222222', clientId: '33333333-3333-3333-3333-333333333333' };
+  const app = azureApps[ids.clientId] = { ...ids, group: `lyrcloud-${connectionId}`, resources: new Map() };
+  await call(ALICE, 'PUT', '/cloud/connections/azure', ids);
+  const env = await call(ALICE, 'POST', '/cloud/clusters', { name: 'apps', provider: 'azure', region: 'eastus', kind: 'serverless' });
+  app.resources.get('Microsoft.App/managedEnvironments/lyrcloud-apps').properties.provisioningState = 'Succeeded';
+  const svc = await call(ALICE, 'POST', `/cloud/clusters/${env.body.cluster.id}/services`, { name: 'api', image: 'ghcr.io/acme/api:1', registry: { username: 'acme', password: 'ghp_secret' } });
+  assert.equal(svc.status, 200, JSON.stringify(svc.body));
+  const config = app.resources.get('Microsoft.App/containerApps/apps-api').properties.configuration;
+  assert.deepEqual(config.registries, [{ server: 'ghcr.io', username: 'acme', passwordSecretRef: 'registry-password' }]);
+  assert.deepEqual(config.secrets, [{ name: 'registry-password', value: 'ghp_secret' }]);
+  app.resources.get('Microsoft.App/containerApps/apps-api').properties.provisioningState = 'Succeeded';
+  tables.cloud.get(`service#${svc.body.service.id}|service`).status = 'ready';
+  assert.equal((await call(ALICE, 'PUT', `/cloud/services/${svc.body.service.id}`, { image: 'ghcr.io/acme/api:2' })).status, 200);
+  assert.deepEqual(app.resources.get('Microsoft.App/containerApps/apps-api').properties.configuration.secrets, [{ name: 'registry-password', value: 'ghp_secret' }], 'kept on redeploy');
+  assert.equal(JSON.stringify([...tables.cloud.values()]).includes('ghp_secret'), false);
+
+  const gcp = (await call(ALICE, 'POST', '/cloud/connections/gcp')).body.connection;
+  gcpProjects['123456789'] = { projectId: 'acme-prod', connectionId: gcp.connectionId, services: new Map(), clusters: new Map(), public: new Set() };
+  await call(ALICE, 'PUT', '/cloud/connections/gcp', { projectId: 'acme-prod', projectNumber: '123456789' });
+  const run = await call(ALICE, 'POST', '/cloud/clusters', { name: 'web', provider: 'gcp', region: 'us-central1', kind: 'serverless' });
+  const refused = await call(ALICE, 'POST', `/cloud/clusters/${run.body.cluster.id}/services`, { name: 'site', image: 'acme/private', registry: { username: 'a', password: 'b' } });
+  assert.deepEqual([refused.status, /Artifact Registry/.test(refused.body.error)], [400, true]);
 });
