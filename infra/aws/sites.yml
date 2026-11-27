@@ -97,6 +97,46 @@ Resources:
           SslSupportMethod: sni-only
           MinimumProtocolVersion: TLSv1.2_2021
 
+  # Cloud apps (Cloud Run, Container Apps, AWS load balancers, Lyrcloud Cloud services) route by their own
+  # host name, so this one sends the origin its own Host instead of the visitor's.
+  AppDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: Lyrcloud CDN - customer cloud apps
+        ConnectionMode: tenant-only
+        Enabled: true
+        HttpVersion: http2and3
+        TenantConfig:
+          ParameterDefinitions:
+            - Name: origin
+              Definition:
+                StringSchema:
+                  Required: true
+                  Comment: Host name of the customer's cloud app (its own HTTPS address)
+        Origins:
+          - Id: customer
+            DomainName: '{{origin}}'
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              HTTPSPort: 443
+              HTTPPort: 80
+              OriginReadTimeout: 30
+        DefaultCacheBehavior:
+          TargetOriginId: customer
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 4cc15a8a-d715-48a4-82b8-cc0b614638fe # UseOriginCacheControlHeaders-QueryStrings
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # Managed-AllViewerExceptHostHeader
+        # Each tenant brings its own certificate; the distribution only sets how it's served.
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+
   FunctionDistribution:
     Type: AWS::CloudFront::Distribution
     Properties:
@@ -147,3 +187,5 @@ Outputs:
     Value: !Ref ProxyDistribution
   FunctionDistributionId:
     Value: !Ref FunctionDistribution
+  AppDistributionId:
+    Value: !Ref AppDistribution

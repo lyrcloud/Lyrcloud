@@ -214,6 +214,7 @@ const itemsOf = (ownerId) => collect(QueryCommand, {
 const sites = createSites({
   ddb, TABLE, FUNCTIONS_TABLE: env.FUNCTIONS_TABLE_NAME || '', PROXY_DISTRIBUTION_ID: env.PROXY_DISTRIBUTION_ID || '',
   FUNCTION_DISTRIBUTION_ID: env.FUNCTION_DISTRIBUTION_ID || '', itemsOf, isStaff, json: (...a) => json(...a), error: (...a) => error(...a), parseJson: (e) => parseJson(e),
+  APP_DISTRIBUTION_ID: env.APP_DISTRIBUTION_ID || '',
 });
 
 // Runs `work` over `items`, `limit` at a time.

@@ -737,7 +737,7 @@ const cdnBadge = (cdn) => {
   const [cls, label] = CDN_STATUS[cdn.status] || ['pending', cdn.status];
   return `<span class="status ${cls}">${cls === 'ok' ? '●' : cls === 'bad' ? '✕' : '◌'} CDN ${esc(label)}</span>`;
 };
-const cdnOrigin = (cdn) => (cdn.mode === 'function' ? `Edge Function <code>${esc(cdn.fn)}</code>` : `Your server <code>${esc(cdn.origin)}</code>`);
+const cdnOrigin = (cdn) => (cdn.mode === 'function' ? `Edge Function <code>${esc(cdn.fn)}</code>` : cdn.mode === 'app' ? `Cloud app <code>${esc(cdn.origin)}</code>` : `Your server <code>${esc(cdn.origin)}</code>`);
 
 function nameserverPanel(site) {
   const list = `<ul class="ns-list">${site.nameservers.map((ns) => `<li><code>${esc(ns)}</code><button class="btn small" data-action="copy" data-value="${esc(ns)}">Copy</button></li>`).join('')}</ul>`;
@@ -806,7 +806,8 @@ const siteViews = {
     }
     const apex = (site.records || []).find((record) => record.label === '@' && record.type === 'A' && !record.managed);
     const fnOptions = (sites.fns || []).map((name) => `<option value="${esc(name)}"${cdn?.fn === name ? ' selected' : ''}>${esc(name)}</option>`).join('');
-    const mode = cdn?.mode || 'proxy';
+    const appOrigin = sessionStorage.getItem('lyr.appOrigin');
+    const mode = cdn?.mode || (appOrigin ? 'app' : 'proxy');
     const busy = cdn && cdn.status !== 'live' && cdn.status !== 'error';
     const form = `
       <form class="panel" data-form="site-cdn">
@@ -814,9 +815,10 @@ const siteViews = {
         <div class="plan-options">
           <label class="plan-option"><input type="radio" name="mode" value="proxy"${mode === 'proxy' ? ' checked' : ''}${cdn && cdn.mode !== 'proxy' ? ' disabled' : ''} /><span><b>Your own server</b><small>Visitors reach your server through the CDN. Your server must answer HTTPS for ${esc(site.domain)}.</small></span></label>
           <label class="plan-option"><input type="radio" name="mode" value="function"${mode === 'function' ? ' checked' : ''}${cdn && cdn.mode !== 'function' ? ' disabled' : ''} /><span><b>An Edge Function</b><small>Serve a function or static site you deployed with <code>lyrcloud deploy</code>.</small></span></label>
+          ${appOrigin || cdn?.mode === 'app' ? `<label class="plan-option"><input type="radio" name="mode" value="app"${mode === 'app' ? ' checked' : ''}${cdn && cdn.mode !== 'app' ? ' disabled' : ''} /><span><b>A cloud app</b><small>A Lyrcloud Cloud service, Cloud Run, Container Apps or a load balancer: the CDN calls it at its own address.</small></span></label>` : ''}
         </div>
-        <label class="field">Server address (for your own server)
-          <input name="origin" placeholder="203.0.113.10 or origin.example.net" value="${esc(cdn?.mode === 'proxy' ? cdn.origin : apex?.values[0] || '')}" autocomplete="off" />
+        <label class="field">Server or app address
+          <input name="origin" placeholder="203.0.113.10 or origin.example.net" value="${esc(cdn?.mode === 'proxy' || cdn?.mode === 'app' ? cdn.origin : appOrigin || apex?.values[0] || '')}" autocomplete="off" />
         </label>
         <label class="field">Edge Function
           ${sites.fns?.length ? `<select name="fn">${fnOptions}</select>` : `<input name="fn" placeholder="${sites.fnsLoading ? 'Loading your functions…' : 'Deploy one with lyrcloud deploy first'}" value="${esc(cdn?.fn || '')}" autocomplete="off" />`}
@@ -2757,6 +2759,7 @@ function serviceRow(service) {
       <div class="service-main">
         <div><b class="mono">${esc(service.name)}</b> ${cloudStatus(service.status)}<div class="muted small mono">${esc(service.image)} · port ${service.port} · ${service.count} × ${esc(SERVICE_SIZES[service.size]?.label || service.size)}</div>
           ${service.url ? `<a class="link" href="${esc(service.url)}" target="_blank" rel="noopener">${esc(service.url)} ↗</a>` : ''}
+          ${service.url && service.status === 'ready' && cloud.data?.features?.upsell ? `<div class="upsell"><button class="btn small primary" data-action="cloud-upsell" data-url="${esc(service.url)}">Put it on your own domain with the CDN →</button><span class="muted small">HTTPS, caching and DDoS protection in front of it. <a class="link" href="#/domains">Need a domain?</a></span></div>` : ''}
           ${service.failureReason ? `<p class="form-error">${esc(service.failureReason)}</p>` : ''}</div>
         <div class="row tight"><span class="muted small">≈ ${usd(service.estimate.monthly)}/mo</span>
           <button class="btn small" data-action="cloud-edit-service" data-id="${service.id}"${CLOUD_BUSY.includes(service.status) ? ' disabled' : ''}>${editing ? 'Close' : 'Change'}</button>
@@ -2884,7 +2887,9 @@ async function loadAdminCloud() {
 function adminCloudTab() {
   if (adminCloud.error) return `<section class="panel"><p class="form-error">${esc(adminCloud.error)}</p></section>`;
   if (!adminCloud.data) return '<section class="panel"><p class="muted">Loading…</p></section>';
-  const { connections, clusters, services } = adminCloud.data;
+  const { connections, clusters, services, features = {} } = adminCloud.data;
+  const isSuper = profile?.role === 'superadmin';
+  const toggle = (name, label, help) => settingRow(label, help, `<label class="inline-check"><input type="checkbox" data-action="cloud-feature" data-feature="${name}"${features[name] ? ' checked' : ''}${isSuper ? '' : ' disabled'} /> ${features[name] ? 'On' : 'Off'}</label>`);
   const stat = (label, value) => `<div class="stat"><span>${label}</span><strong>${value}</strong></div>`;
   return `
     <div class="stat-grid">
@@ -2893,6 +2898,11 @@ function adminCloudTab() {
       ${stat('Services', services.length)}
       ${stat('Customer spend (est. / mo)', usd(clusters.reduce((s, c) => s + c.estimate.monthly, 0) + services.reduce((s, v) => s + v.estimate.monthly, 0)))}
     </div>
+    <section class="panel">
+      <div class="panel-head"><h2>Cloud features</h2></div>
+      ${toggle('upsell', 'Domain + CDN offer on services', 'Each running service shows “Put it on your own domain with the Lyrcloud CDN”, which opens Sites with the service as a cloud-app origin. Needs the lyrcloud-sites AppDistribution (deploy-sites.sh, then deploy-domains.sh).')}
+      ${toggle('hosting', 'Managed hosting', 'Customers deploy apps on Lyrcloud’s own AWS account, without a cloud account of their own, paid with Lyrpay. Needs the hosting account set up first (scripts/deploy-hosting.sh).')}
+    </section>
     <section class="panel">
       <div class="panel-head"><h2>Clusters</h2></div>
       ${clusters.length ? `<div class="table-scroll"><table class="table"><thead><tr><th>Name</th><th>Owner</th><th>Region</th><th>Type</th><th>Status</th></tr></thead>
@@ -2958,6 +2968,11 @@ const cloudClickActions = {
     cloud.data = null;
     return cluster.status === 'deleted' ? go('#/cloud') : loadCloudCluster(currentRoute.clusterId);
   }),
+  'cloud-upsell': (target) => {
+    sessionStorage.setItem('lyr.appOrigin', new URL(target.dataset.url).host);
+    toast('Pick the domain (or add one), then open CDN & HTTPS: the app is filled in.');
+    go('#/');
+  },
   'cloud-copy-script': async (target) => {
     const script = cloud.data?.connections?.[target.dataset.provider]?.setupScript || '';
     try {
@@ -2984,6 +2999,8 @@ const cloudClickActions = {
 
 const cloudChangeActions = {
   'cloud-estimate': () => updateClusterEstimate(),
+  'cloud-feature': (target) => cloudRun(target, () => cloudApi('/admin/cloud/settings', { method: 'PUT', body: JSON.stringify({ [target.dataset.feature]: target.checked }) }),
+    `${target.dataset.feature === 'upsell' ? 'Domain + CDN offer' : 'Managed hosting'} ${target.checked ? 'on' : 'off'}`, () => { adminCloud.data = null; cloud.data = null; loadAdminCloud(); }),
   'cloud-provider': (target) => {
     cloud.formProvider = target.value;
     render();
@@ -3678,6 +3695,7 @@ const formActions = {
   'site-cdn': async (form, data) => {
     const mode = String(data.get('mode') || 'proxy');
     const body = mode === 'function' ? { mode, fn: String(data.get('fn') || '').trim() } : { mode, origin: String(data.get('origin') || '').trim() };
+    if (mode === 'app') sessionStorage.removeItem('lyr.appOrigin');
     const button = form.querySelector('[type="submit"]');
     button.disabled = true;
     try {

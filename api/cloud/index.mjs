@@ -24,6 +24,7 @@
 //   POST   /cloud/clusters/{id}/pay               open a Lyrpay payment for a month of Kubernetes management (fees.mjs)
 //   POST   /cloud/clusters/{id}/payment           check that payment; a paid new cluster gets built
 //   GET    /admin/cloud                           every connection, cluster and service (staff)
+//   PUT    /admin/cloud/settings                  { upsell?, hosting? } switch features on or off (super admin)
 import { randomBytes } from 'node:crypto';
 import { CloudFormationClient, CreateStackCommand, DeleteStackCommand, DescribeStackEventsCommand, DescribeStacksCommand, UpdateStackCommand } from '@aws-sdk/client-cloudformation';
 import { DescribeAvailabilityZonesCommand, EC2Client } from '@aws-sdk/client-ec2';
@@ -768,7 +769,25 @@ async function overview(who) {
     plan: who.plan,
     limits: who.staff ? null : (await import('./fees.mjs')).limitsFor(who.plan),
     kubernetesFeeCents: KUBERNETES_FEE_CENTS,
+    features: await getFeatures(),
   });
+}
+
+// Features the super admin switches on: the "your domain + CDN" upsell on services, and managed hosting.
+const SETTINGS_KEY = { pk: '#settings', sk: 'cloud' };
+export const FEATURES = ['upsell', 'hosting'];
+async function getFeatures() {
+  const row = (await getItem(SETTINGS_KEY)) || {};
+  return Object.fromEntries(FEATURES.map((name) => [name, row[name] === true]));
+}
+
+async function saveSettings(event, who) {
+  if (who.role !== 'superadmin') return error(403, 'Only the super admin switches cloud features.');
+  const body = parseJson(event) || {};
+  const next = { ...(await getFeatures()) };
+  for (const name of FEATURES) if (typeof body[name] === 'boolean') next[name] = body[name];
+  await put({ ...SETTINGS_KEY, ...next, updatedAt: now(), updatedBy: who.email });
+  return json(200, { features: next });
 }
 
 async function admin(who) {
@@ -782,6 +801,7 @@ async function admin(who) {
   } while (ExclusiveStartKey);
   const byKind = (row) => items.filter((item) => item.row === row);
   return json(200, {
+    features: await getFeatures(),
     connections: byKind('connection').map((item) => ({ provider: item.provider || 'aws', ownerEmail: item.ownerEmail || null, accountId: item.accountId || item.projectId || item.subscriptionId || null, status: item.roleArn || item.connectedAt ? 'connected' : 'pending', createdAt: item.createdAt })),
     clusters: byKind('cluster').map((item) => ({ ...publicCluster(item), ownerEmail: item.ownerEmail || null })),
     services: byKind('service').map(publicService),
@@ -798,6 +818,7 @@ export const handler = async (event) => {
     if (!who) return error(401, 'unauthorized');
     if (who.profile.disabled === true && who.role !== 'superadmin') return error(403, 'This account has been disabled.');
     if (path === '/admin/cloud' && method === 'GET') return await admin(who);
+    if (path === '/admin/cloud/settings' && method === 'PUT') return await saveSettings(event, who);
     if (path === '/cloud' && method === 'GET') return await overview(who);
     if (path === '/cloud/connections/aws') return await connectionRoutes(event, method, who);
     if (path === '/cloud/connections/gcp' || path === '/cloud/connections/azure') return await federatedConnectionRoutes(event, method, who, path.split('/').pop());

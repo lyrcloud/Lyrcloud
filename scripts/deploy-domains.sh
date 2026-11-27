@@ -39,6 +39,7 @@ sites_output() {
 }
 proxy_dist="$(sites_output ProxyDistributionId)"; [[ "$proxy_dist" == None ]] && proxy_dist=""
 function_dist="$(sites_output FunctionDistributionId)"; [[ "$function_dist" == None ]] && function_dist=""
+app_dist="$(sites_output AppDistributionId)"; [[ "$app_dist" == None ]] && app_dist=""
 [[ -n "$proxy_dist" ]] && echo "CDN for sites is on (proxy $proxy_dist, functions $function_dist)." || echo "No lyrcloud-sites stack: the CDN for sites stays off."
 
 work="$(mktemp -d)"
@@ -68,7 +69,7 @@ aws cloudformation deploy \
   --no-fail-on-empty-changeset \
   --parameter-overrides "LambdaCodeS3Key=$key" "ArtifactsBucketName=$ARTIFACTS_BUCKET" "UserPoolId=$pool" "UserPoolClientId=$client" \
     "SubdomainZone=$sub_zone" "SubdomainZoneId=$zone_id" \
-    "ProxyDistributionId=$proxy_dist" "FunctionDistributionId=$function_dist"
+    "ProxyDistributionId=$proxy_dist" "FunctionDistributionId=$function_dist" "AppDistributionId=$app_dist"
 
 if [[ -n "${DNA_API_KEY:-}" && -n "${DNA_RESELLER_ID:-}" ]]; then
   # Read from the environment by Python, so the keys never appear in a command line or the shell history.

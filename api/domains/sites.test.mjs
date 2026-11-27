@@ -125,7 +125,7 @@ resolver.current = {
 
 const json = (statusCode, body) => ({ statusCode, body: JSON.stringify(body) });
 const sites = createSites({
-  ddb, TABLE: 'domains', FUNCTIONS_TABLE: 'functions', PROXY_DISTRIBUTION_ID: 'EPROXY', FUNCTION_DISTRIBUTION_ID: 'EFUNC',
+  ddb, TABLE: 'domains', FUNCTIONS_TABLE: 'functions', PROXY_DISTRIBUTION_ID: 'EPROXY', FUNCTION_DISTRIBUTION_ID: 'EFUNC', APP_DISTRIBUTION_ID: 'EAPP',
   itemsOf: async (ownerId) => [...table.values()].filter((item) => item.ownerId === ownerId),
   isStaff: (role) => role === 'admin', json, error: (status, message) => json(status, { error: message }),
   parseJson: (event) => JSON.parse(event.body || '{}'),
@@ -317,4 +317,19 @@ test('www pointing elsewhere stays out of the CDN', async () => {
 test('a domain registered here can’t be removed as a site', async () => {
   await sites.addSite({ domain: 'bought.com', ownerId: 'alice', source: 'registered', importRecords: false });
   assert.equal((await call(ALICE, 'DELETE', '/domains/sites/bought.com')).status, 409);
+});
+
+test('CDN in front of a cloud app: its own address, on the distribution that keeps the app’s Host', async () => {
+  await activeSite();
+  assert.equal((await call(ALICE, 'PUT', '/domains/sites/shop.com/cdn', { mode: 'app', origin: '203.0.113.10' })).status, 400, 'an app has a host name');
+  assert.equal((await call(ALICE, 'PUT', '/domains/sites/shop.com/cdn', { mode: 'app', origin: 'shop.com' })).status, 400);
+  const res = await call(ALICE, 'PUT', '/domains/sites/shop.com/cdn', { mode: 'app', origin: 'https://web-site-abc.a.run.app/' });
+  assert.equal(res.status, 200);
+  assert.deepEqual([res.body.site.cdn.mode, res.body.site.cdn.origin], ['app', 'web-site-abc.a.run.app']);
+  certs.get('arn:aws:acm:us-east-1:1:certificate/shop.com').status = 'ISSUED';
+  await call(ALICE, 'GET', '/domains/sites/shop.com');
+  const tenant = tenants.get('dt_1');
+  assert.equal(tenant.DistributionId, 'EAPP');
+  assert.deepEqual(tenant.Parameters, [{ Name: 'origin', Value: 'web-site-abc.a.run.app' }]);
+  assert.equal((await call(ALICE, 'PUT', '/domains/sites/shop.com/cdn', { mode: 'proxy', origin: '203.0.113.10' })).status, 409, 'turn it off before switching');
 });

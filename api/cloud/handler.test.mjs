@@ -327,3 +327,10 @@ test('if a paid cluster can’t be built, the fee goes back to the customer', as
   assert.equal([...lyrpayments.values()][0].status, 'refunded');
   assert.equal(result.body.cluster.fee.active, false);
 });
+
+test('only the super admin switches cloud features, and customers see them', async () => {
+  assert.deepEqual((await call(ALICE, 'GET', '/cloud')).body.features, { upsell: false, hosting: false }, 'off until switched on');
+  assert.equal((await call(ALICE, 'PUT', '/admin/cloud/settings', { upsell: true })).status, 403);
+  assert.deepEqual((await call(SUPER, 'PUT', '/admin/cloud/settings', { upsell: true, hosting: 'yes' })).body.features, { upsell: true, hosting: false });
+  assert.equal((await call(ALICE, 'GET', '/cloud')).body.features.upsell, true);
+});

@@ -7,7 +7,8 @@
 //   DELETE /domains/sites/{domain}                remove it (CDN off first; not for domains registered here)
 //   PUT    /domains/sites/{domain}/records        { type, name, values[], ttl? } create or replace a record set
 //   DELETE /domains/sites/{domain}/records?type=&name=
-//   PUT    /domains/sites/{domain}/cdn            { mode: 'proxy', origin } | { mode: 'function', fn } turn the CDN on
+//   PUT    /domains/sites/{domain}/cdn            { mode: 'proxy', origin } | { mode: 'function', fn } | { mode: 'app', origin } turn the CDN on
+//                                                 ('app': a cloud app such as Cloud Run, sent its own Host instead of the visitor's)
 //                                                 or change the origin; { mode: 'off' } turns it off
 //   POST   /domains/sites/{domain}/purge          { paths?: ['/a', '/b*'] } clear the CDN cache (everything by default)
 //
@@ -114,7 +115,7 @@ export async function currentRecords(domain) {
 // ---------------------------------------------------------------- the sites service
 
 export function createSites(ctx) {
-  const { ddb, TABLE, FUNCTIONS_TABLE, PROXY_DISTRIBUTION_ID, FUNCTION_DISTRIBUTION_ID } = ctx;
+  const { ddb, TABLE, FUNCTIONS_TABLE, PROXY_DISTRIBUTION_ID, FUNCTION_DISTRIBUTION_ID, APP_DISTRIBUTION_ID } = ctx;
   const getItem = async (key, table = TABLE) => (await ddb.send(new GetCommand({ TableName: table, Key: key }))).Item;
   const putItem = (item, condition) => ddb.send(new PutCommand({ TableName: TABLE, Item: item, ...(condition || {}) }));
   async function save(site, set, remove = []) {
@@ -316,6 +317,13 @@ export function createSites(ctx) {
       }
       return { mode: 'proxy', origin: host, originHost: host };
     }
+    if (body?.mode === 'app') {
+      if (!APP_DISTRIBUTION_ID) throw new SiteError(503, 'Putting cloud apps behind the CDN isn’t switched on yet.');
+      const host = String(body.origin || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/[/:].*$/, '').replace(/\.$/, '');
+      if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(host) || isIP(host)) throw new SiteError(400, 'Enter your app’s own address, like web-abc.a.run.app.');
+      if ([site.domain, `www.${site.domain}`].includes(host)) throw new SiteError(400, 'Use the app’s own address, not this domain.');
+      return { mode: 'app', origin: host, originHost: host };
+    }
     if (body?.mode === 'function') {
       const fn = String(body.fn || '').trim().toLowerCase();
       if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(fn)) throw new SiteError(400, 'Choose one of your Edge Functions.');
@@ -323,7 +331,7 @@ export function createSites(ctx) {
       if (!item || item.ownerId !== site.ownerId) throw new SiteError(404, `You don’t have an Edge Function called ${fn}.`);
       return { mode: 'function', fn };
     }
-    throw new SiteError(400, 'Send { "mode": "proxy", "origin": "…" }, { "mode": "function", "fn": "…" } or { "mode": "off" }.');
+    throw new SiteError(400, 'Send { "mode": "proxy", "origin": "…" }, { "mode": "app", "origin": "…" }, { "mode": "function", "fn": "…" } or { "mode": "off" }.');
   }
 
   // Which hosts the CDN covers: the domain, and www unless www points somewhere other than the site.
@@ -336,8 +344,8 @@ export function createSites(ctx) {
     return target === site.domain ? [site.domain, www] : [site.domain];
   }
 
-  const originParam = (cdn) => (cdn.mode === 'proxy' ? [{ Name: 'origin', Value: cdn.originHost }] : [{ Name: 'fn', Value: cdn.fn }]);
-  const distributionFor = (mode) => (mode === 'proxy' ? PROXY_DISTRIBUTION_ID : FUNCTION_DISTRIBUTION_ID);
+  const originParam = (cdn) => (cdn.mode === 'function' ? [{ Name: 'fn', Value: cdn.fn }] : [{ Name: 'origin', Value: cdn.originHost }]);
+  const distributionFor = (mode) => (mode === 'proxy' ? PROXY_DISTRIBUTION_ID : mode === 'app' ? APP_DISTRIBUTION_ID : FUNCTION_DISTRIBUTION_ID);
   const tenantName = (domain) => `site-${domain.replace(/[^a-z0-9-]/g, '-')}`.slice(0, 120);
 
   // An IP origin gets lyr-origin.<domain> in the site's own zone, since CloudFront origins are host names.
@@ -351,8 +359,8 @@ export function createSites(ctx) {
     if (!cdnOn()) throw new SiteError(503, 'The Lyrcloud CDN isn’t switched on yet.');
     if (site.status !== 'active') throw new SiteError(409, 'Point the domain at Lyrcloud’s name servers first. The CDN can be turned on once they’re in place.');
     if (site.cdn && site.cdn.status === 'removing') throw new SiteError(409, 'The CDN is still turning off. Try again in a few minutes.');
-    if (site.cdn && ['proxy', 'function'].includes(body?.mode) && site.cdn.mode !== body.mode) {
-      throw new SiteError(409, 'Turn the CDN off before switching between your own server and an Edge Function.');
+    if (site.cdn && ['proxy', 'function', 'app'].includes(body?.mode) && site.cdn.mode !== body.mode) {
+      throw new SiteError(409, 'Turn the CDN off before switching between your own server, a cloud app and an Edge Function.');
     }
     const settings = await cdnSettings(site, body);
     if (site.cdn) {

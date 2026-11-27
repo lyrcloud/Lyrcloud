@@ -50,6 +50,10 @@ Parameters:
     Type: String
     Default: ''
     Description: The lyrcloud-sites Edge Functions distribution.
+  AppDistributionId:
+    Type: String
+    Default: ''
+    Description: The lyrcloud-sites distribution for cloud apps (origin's own Host). Blank hides that option.
 
 Resources:
   DomainsTable:
@@ -202,6 +206,7 @@ Resources:
           FUNCTIONS_TABLE_NAME: !Ref FunctionsTableName
           PROXY_DISTRIBUTION_ID: !Ref ProxyDistributionId
           FUNCTION_DISTRIBUTION_ID: !Ref FunctionDistributionId
+          APP_DISTRIBUTION_ID: !Ref AppDistributionId
       Code:
         S3Bucket: !Ref ArtifactsBucketName
         S3Key: !Ref LambdaCodeS3Key

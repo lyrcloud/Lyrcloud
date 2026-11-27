@@ -176,6 +176,10 @@ Resources:
     Type: AWS::ApiGatewayV2::Route
     Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /admin/cloud', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
 
+  AdminSettingsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'PUT /admin/cloud/settings', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+
   Stage:
     Type: AWS::ApiGatewayV2::Stage
     Properties:
