@@ -21,6 +21,8 @@
 //   GET    /cloud/services/{id}                   a service, refreshed
 //   PUT    /cloud/services/{id}                   { image?, port?, size?, count?, env?, healthPath? } redeploy with changes
 //   DELETE /cloud/services/{id}                   remove it
+//   POST   /cloud/clusters/{id}/apply             { manifests } apply Kubernetes YAML or JSON (server-side apply, kube.mjs)
+//   GET    /cloud/clusters/{id}/workloads         deployments and services running on a Kubernetes cluster
 //   POST   /cloud/clusters/{id}/pay               open a Lyrpay payment for a month of Kubernetes management (fees.mjs)
 //   POST   /cloud/clusters/{id}/payment           check that payment; a paid new cluster gets built
 //   GET    /admin/cloud                           every connection, cluster and service (staff)
@@ -57,6 +59,7 @@ import {
 } from './rules.mjs';
 import { azureAccessToken, azureSetupScript, CONNECTION_RE, FederationError, gcpAccessToken, gcpSetupScript, identity } from './federation.mjs';
 import { PROVIDER_OPS, ProviderError } from './providers.mjs';
+import { applyManifests, eksToken, KubeError, parseManifests, workloads } from './kube.mjs';
 
 const env = process.env;
 const TABLE = env.TABLE_NAME;
@@ -473,6 +476,32 @@ async function buildCluster(item) {
   return built;
 }
 
+// ---------------------------------------------------------------- Kubernetes manifests (kube.mjs)
+
+async function kubeAccess(item) {
+  const connection = await getItem(connectionKey(item.ownerId, item.provider));
+  if (item.provider !== 'aws') {
+    const ctx = await providerContext(connection);
+    return ctx.ops.kubeAccess(ctx, item);
+  }
+  const { Endpoint, CertificateAuthority, ClusterName } = item.outputs || {};
+  if (!Endpoint || !CertificateAuthority) throw new KubeError(409, 'The cluster isn’t running yet.');
+  const credentials = await credentialsFor(connection);
+  return { server: Endpoint, ca: Buffer.from(CertificateAuthority, 'base64').toString('utf8'), token: await eksToken(credentials, item.region, ClusterName) };
+}
+
+async function kubeRoutes(event, method, kind, item) {
+  if (item.kind !== 'kubernetes') return error(400, 'Manifests are for Kubernetes clusters; serverless clusters run services.');
+  if (item.status !== 'ready') return error(409, 'Wait until the cluster is ready.');
+  if (kind === '/workloads' && method === 'GET') return json(200, await workloads(await kubeAccess(item)));
+  if (kind === '/apply' && method === 'POST') {
+    const docs = parseManifests(parseJson(event)?.manifests);
+    const results = await applyManifests(await kubeAccess(item), docs);
+    return json(results.every((r) => r.ok) ? 200 : 207, { results });
+  }
+  return error(404, 'not_found');
+}
+
 // ---------------------------------------------------------------- Kubernetes management fee (fees.mjs)
 
 async function openFeePayment(cluster, who) {
@@ -545,7 +574,7 @@ async function ownedCluster(id, who) {
 
 async function clusterRoutes(event, method, path, who) {
   if (path === '/cloud/clusters' && method === 'POST') return createCluster(event, who);
-  const match = path.match(/^\/cloud\/clusters\/([^/]+)(\/services|\/pay|\/payment)?$/);
+  const match = path.match(/^\/cloud\/clusters\/([^/]+)(\/services|\/pay|\/payment|\/apply|\/workloads)?$/);
   if (!match) return error(404, 'not_found');
   const item = await ownedCluster(match[1], who);
   if (!item) return error(404, 'That cluster isn’t in your account.');
@@ -559,7 +588,8 @@ async function clusterRoutes(event, method, path, who) {
     }
     return error(409, 'Pay for the cluster first; Lyrcloud builds it once Lyrpay confirms.');
   }
-  if ((method === 'PUT' || (method === 'POST' && match[2] === '/services')) && feeBlocked(item, who)) return feeBlocked(item, who);
+  if ((method === 'PUT' || (method === 'POST' && ['/services', '/apply'].includes(match[2]))) && feeBlocked(item, who)) return feeBlocked(item, who);
+  if (match[2] === '/apply' || match[2] === '/workloads') return kubeRoutes(event, method, match[2], item);
   if (item.provider !== 'aws') return remoteClusterRoutes(event, method, match, item, who);
   const connection = await getItem(connectionKey(item.ownerId));
   const credentials = await credentialsFor(connection);
@@ -836,7 +866,7 @@ export const handler = async (event) => {
     if (path.startsWith('/cloud/services/')) return await serviceRoutes(event, method, path, who);
     return error(404, 'not_found');
   } catch (err) {
-    if (err instanceof CloudError || err instanceof FederationError || err instanceof ProviderError) return error(err.status, err.message);
+    if (err instanceof CloudError || err instanceof FederationError || err instanceof ProviderError || err instanceof KubeError) return error(err.status, err.message);
     const message = awsMessage(err);
     if (message) return error(400, message);
     console.error('Cloud API failed', err);

@@ -2037,3 +2037,17 @@ a.stat:hover {
   cursor: pointer;
   font-weight: 600;
 }
+.apply-results {
+  display: grid;
+  gap: 4px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 0.9rem;
+}
+.apply-results .ok {
+  color: var(--success);
+}
+.apply-results .bad {
+  color: var(--danger, #d0263e);
+}

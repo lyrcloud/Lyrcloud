@@ -8,6 +8,7 @@
 // Statuses: creating, updating, ready, failed, deleting, deleted.
 import { azureGroup } from './federation.mjs';
 import { registryServer } from './rules.mjs';
+import { fromKubeconfig, KubeError } from './kube.mjs';
 
 export const GKE_API = 'https://container.googleapis.com/v1';
 export const RUN_API = 'https://run.googleapis.com/v2';
@@ -138,6 +139,12 @@ export const gcp = {
     await call(ctx, 'DELETE', `${RUN_API}/${gcpLocation(ctx.connection, cluster)}/services/${runName(cluster, service)}`);
     return { status: 'deleting' };
   },
+  // Kubernetes API access for kube.mjs: the cluster's endpoint and CA, and the service account's token.
+  async kubeAccess(ctx, cluster) {
+    const data = await call(ctx, 'GET', `${GKE_API}/${gcpLocation(ctx.connection, cluster)}/clusters/${gkeName(cluster)}`);
+    if (!data?.endpoint) throw new KubeError(409, 'The cluster isn’t running yet.');
+    return { server: `https://${data.endpoint}`, ca: Buffer.from(data.masterAuth?.clusterCaCertificate || '', 'base64').toString('utf8'), token: ctx.token };
+  },
   kubectl: (cluster, connection) => `gcloud container clusters get-credentials ${gkeName(cluster)} --region ${cluster.region} --project ${connection.projectId}\nkubectl get nodes`,
 };
 
@@ -251,6 +258,12 @@ export const azure = {
   async deleteService(ctx, cluster, service) {
     await call(ctx, 'DELETE', `${groupUrl(ctx.connection)}/providers/Microsoft.App/containerApps/${appName(cluster, service)}?api-version=${APP_VERSION}`);
     return { status: 'deleting' };
+  },
+  async kubeAccess(ctx, cluster) {
+    const data = await call(ctx, 'POST', `${groupUrl(ctx.connection)}/providers/Microsoft.ContainerService/managedClusters/${aksName(cluster)}/listClusterAdminCredential?api-version=${AKS_VERSION}`);
+    const kubeconfig = data?.kubeconfigs?.[0]?.value;
+    if (!kubeconfig) throw new KubeError(409, 'The cluster isn’t running yet.');
+    return fromKubeconfig(Buffer.from(kubeconfig, 'base64').toString('utf8'));
   },
   kubectl: (cluster, connection) => `az aks get-credentials --resource-group ${azureGroup(connection.connectionId)} --name ${aksName(cluster)} --subscription ${connection.subscriptionId}\nkubectl get nodes`,
 };

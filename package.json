@@ -9,7 +9,7 @@
     "check": "node scripts/check.mjs",
     "create:s3": "bash scripts/create-s3.sh",
     "deploy:aws": "bash scripts/deploy-aws.sh",
-    "test": "node --test api/account/roles.test.mjs api/account/handler.test.mjs api/account/lyrbot.test.mjs api/account/messages.test.mjs api/github-bridge/index.test.mjs api/projects/rules.test.mjs api/projects/handler.test.mjs api/domains/rules.test.mjs api/domains/lyrdns.test.mjs api/domains/lyrca.test.mjs api/domains/handler.test.mjs api/domains/sites.test.mjs api/domains/plans.test.mjs api/functions/rules.test.mjs api/functions/handler.test.mjs api/functions/storage.test.mjs api/functions/ai.test.mjs api/functions/access.test.mjs api/functions/security.test.mjs api/functions/cdn.test.mjs api/cloud/rules.test.mjs api/cloud/handler.test.mjs api/cloud/providers.test.mjs"
+    "test": "node --test api/account/roles.test.mjs api/account/handler.test.mjs api/account/lyrbot.test.mjs api/account/messages.test.mjs api/github-bridge/index.test.mjs api/projects/rules.test.mjs api/projects/handler.test.mjs api/domains/rules.test.mjs api/domains/lyrdns.test.mjs api/domains/lyrca.test.mjs api/domains/handler.test.mjs api/domains/sites.test.mjs api/domains/plans.test.mjs api/functions/rules.test.mjs api/functions/handler.test.mjs api/functions/storage.test.mjs api/functions/ai.test.mjs api/functions/access.test.mjs api/functions/security.test.mjs api/functions/cdn.test.mjs api/cloud/rules.test.mjs api/cloud/handler.test.mjs api/cloud/providers.test.mjs api/cloud/kube.test.mjs"
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.133.0",

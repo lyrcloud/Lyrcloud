@@ -253,7 +253,7 @@ export function clusterTemplate({ id, name, kind, zones, nodeType = 't3.medium',
         },
       },
     });
-    Object.assign(outputs, { ClusterName: { Value: { Ref: 'Cluster' } }, Endpoint: { Value: { 'Fn::GetAtt': ['Cluster', 'Endpoint'] } } });
+    Object.assign(outputs, { ClusterName: { Value: { Ref: 'Cluster' } }, Endpoint: { Value: { 'Fn::GetAtt': ['Cluster', 'Endpoint'] } }, CertificateAuthority: { Value: { 'Fn::GetAtt': ['Cluster', 'CertificateAuthorityData'] } } });
   } else {
     Object.assign(resources, {
       Cluster: {

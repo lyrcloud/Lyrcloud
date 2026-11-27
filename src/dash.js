@@ -2865,6 +2865,21 @@ kubectl get nodes` : esc(detail.kubectl || '')}</pre>
         <p class="muted small">${cluster.provider === 'aws' ? `Run these as <span class="mono">${esc(cluster.adminArn)}</span>. Services of type LoadBalancer get a public AWS load balancer.` : `Run these in ${cluster.provider === 'gcp' ? 'Google' : 'Azure'} Cloud Shell, or anywhere their CLI is signed in to your account.`}</p>
         ${cluster.provider === 'gcp' ? '' : `<form class="row" data-form="cloud-resize"><label class="inline-check">${cluster.provider === 'azure' ? 'Nodes' : 'Workers'} <input name="nodes" type="number" min="1" max="20" value="${cluster.nodes}" /></label><button class="btn" type="submit">Resize</button></form>`}
       </section>` : ''}
+    ${kube && ready ? `
+      <section class="panel">
+        <div class="panel-head"><h2>Deploy to Kubernetes</h2><span class="muted small">YAML or JSON · several manifests separated by ---</span></div>
+        <form class="stack" data-form="cloud-apply">
+          <textarea name="manifests" rows="10" class="mono" placeholder="apiVersion: apps/v1&#10;kind: Deployment&#10;metadata:&#10;  name: web&#10;spec: …">${esc(cloud.manifests || '')}</textarea>
+          <div class="row"><button class="btn primary" type="submit">Apply</button><span class="muted small">Deployments, Services, Ingresses, ConfigMaps, Secrets, Jobs and more, applied with server-side apply. For Helm, paste the output of <code>helm template</code>.</span></div>
+        </form>
+        ${cloud.applyResults ? `<ul class="apply-results">${cloud.applyResults.map((r) => `<li class="${r.ok ? 'ok' : 'bad'}">${r.ok ? '✓' : '✕'} <b>${esc(r.kind)}</b> <span class="mono">${r.namespace ? `${esc(r.namespace)}/` : ''}${esc(r.name)}</span> · ${esc(r.result)}</li>`).join('')}</ul>` : ''}
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>Running</h2><button class="btn small" data-action="cloud-workloads">${cloud.workloads ? 'Refresh' : 'Show what’s running'}</button></div>
+        ${cloud.workloads ? `
+          ${cloud.workloads.deployments.length ? `<div class="table-scroll"><table class="table"><thead><tr><th>Deployment</th><th>Ready</th><th>Image</th></tr></thead><tbody>${cloud.workloads.deployments.map((d) => `<tr><td class="mono">${esc(d.namespace)}/${esc(d.name)}</td><td>${d.ready} / ${d.wanted}</td><td class="mono small">${esc(d.image)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="muted">No deployments yet.</p>'}
+          ${cloud.workloads.services.length ? `<div class="table-scroll"><table class="table"><thead><tr><th>Service</th><th>Type</th><th>Address</th></tr></thead><tbody>${cloud.workloads.services.map((v) => `<tr><td class="mono">${esc(v.namespace)}/${esc(v.name)}</td><td>${esc(v.type)} · ${esc(v.ports)}</td><td class="mono small">${v.address ? esc(v.address) : '<span class="muted">—</span>'}</td></tr>`).join('')}</tbody></table></div>` : ''}` : ''}
+      </section>` : ''}
     ${!kube && ready ? `
       <section class="panel">
         <div class="panel-head"><h2>Services</h2><span class="muted">${services.length}</span></div>
@@ -2990,6 +3005,7 @@ const cloudClickActions = {
     toast('Pick the domain (or add one), then open CDN & HTTPS: the app is filled in.');
     go('#/');
   },
+  'cloud-workloads': (target) => cloudRun(target, () => cloudApi(`/cloud/clusters/${currentRoute.clusterId}/workloads`), '', (result) => { cloud.workloads = result; render(); }),
   'cloud-copy-script': async (target) => {
     const script = cloud.data?.connections?.[target.dataset.provider]?.setupScript || '';
     try {
@@ -3052,6 +3068,15 @@ const cloudFormActions = {
       button.disabled = false;
       showFormError(form, error.message);
     });
+  },
+  'cloud-apply': (form, data) => {
+    cloud.manifests = String(data.get('manifests') || '');
+    cloudRun(form.querySelector('[type="submit"]'), () => cloudApi(`/cloud/clusters/${currentRoute.clusterId}/apply`, { method: 'POST', body: JSON.stringify({ manifests: cloud.manifests }) }),
+      '', ({ results }) => {
+        cloud.applyResults = results;
+        toast(results.every((r) => r.ok) ? `Applied ${results.length} manifest${results.length === 1 ? '' : 's'}` : 'Some manifests weren’t applied; see why below.');
+        render();
+      });
   },
   'cloud-resize': (form, data) => cloudRun(form.querySelector('[type="submit"]'),
     () => cloudApi(`/cloud/clusters/${currentRoute.clusterId}`, { method: 'PUT', body: JSON.stringify({ nodes: Number(data.get('nodes')) }) }), 'Resizing…', () => loadCloudCluster(currentRoute.clusterId)),
