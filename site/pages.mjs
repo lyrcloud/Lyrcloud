@@ -36,7 +36,7 @@ const plans = [
     price: '$0',
     period: '/month',
     blurb: 'For prototypes, personal sites, and early product launches.',
-    items: ['100k edge function requests/day', 'Storage, AI, Access & Security for edge functions', 'Domain CDN, TLS & DDoS protection (coming soon)', 'Community support'],
+    items: ['Global CDN', 'Managed TLS', 'Unmetered DDoS protection', '100k edge function requests/day', 'Community support'],
     cta: ['/sign-up/?plan=launch', 'Start for free'],
   },
   {
@@ -310,9 +310,9 @@ ${ctaBand(`Try ${product.name} free.`)}
 
 const solutions = [
   ['🛒', 'E-commerce', 'Keep checkout fast on peak days, stop card-testing bots, and personalize storefronts at the edge.', ['cdn', 'security', 'edge-functions']],
-  ['🧩', 'SaaS platforms', 'Run tenant logic at the edge with per-tenant storage and security. Custom domains with automatic TLS for every customer are coming soon.', ['security', 'edge-functions', 'storage']],
+  ['🧩', 'SaaS platforms', 'Offer custom domains with automatic TLS for every customer and run tenant logic close to users.', ['security', 'edge-functions', 'storage']],
   ['🎬', 'Media & streaming', 'Deliver video and large files with zero egress fees and cache hit ratios above 95%.', ['cdn', 'storage']],
-  ['🏛', 'Public sector', 'Protect citizen services with rate limits and a firewall, and give staff secure access without legacy VPNs.', ['security', 'zero-trust']],
+  ['🏛', 'Public sector', 'Protect citizen services from DDoS and give staff secure access without legacy VPNs.', ['security', 'zero-trust']],
   ['🎮', 'Gaming', 'Low-latency APIs, matchmaking state at the edge, and protection against volumetric attacks.', ['edge-functions', 'security']],
   ['🚀', 'Startups', 'Launch on the free plan, add AI features in an afternoon, and scale without re-architecting.', ['ai', 'edge-functions', 'storage']],
 ];
@@ -589,10 +589,9 @@ ${ctaBand()}
 // ---------------------------------------------------------------- Pricing
 
 const comparison = [
-  ['Edge function caching', '✓', '✓', '✓'],
-  ['CDN for your domains', 'Soon', 'Soon', 'Soon'],
-  ['Managed TLS for your domains', 'Soon', 'Soon', 'Soon'],
-  ['DDoS protection for your domains', 'Soon', 'Soon', 'Soon'],
+  ['Global CDN & caching', '✓', '✓', '✓'],
+  ['Managed TLS certificates', '✓', '✓', '✓'],
+  ['Unmetered DDoS protection', '✓', '✓', '✓'],
   ['Custom domains', '3', 'Unlimited', 'Unlimited'],
   ['Edge function requests', '100k / day', '10M / month', 'Custom'],
   ['Managed WAF rulesets', '—', '✓', '✓'],
@@ -606,13 +605,13 @@ const comparison = [
 
 const faqs = [
   ['Is the Launch plan really free?', 'Yes. Launch is free forever for personal and hobby projects. You only pay when you upgrade.'],
-  ['When can I put my domain behind the CDN?', 'Soon. Global CDN, free TLS certificates and DDoS protection for your own domains are being built now. Edge functions already get caching, rate limits and a firewall today.'],
+  ['Do you charge for bandwidth?', 'No. CDN bandwidth and DDoS mitigation are unmetered on every plan.'],
   ['Can I change plans later?', 'Anytime, from the dashboard. Upgrades take effect immediately and are prorated.'],
   ['Do you offer annual billing?', 'Yes — annual billing on Scale saves two months. Enterprise contracts are annual.'],
 ];
 
 const domainFaqs = [
-  ['What’s included with every domain?', 'Free WHOIS privacy and DNS with a simple record editor. One-click CDN, TLS and DDoS protection for your domain is coming soon.'],
+  ['What’s included with every domain?', 'Free WHOIS privacy, Lyrcloud DNS with a simple record editor, and one-click setup as a Lyrcloud website with CDN, TLS and DDoS protection.'],
   ['How does renewal work?', 'Auto-renew is on by default: we charge the card you paid with 30 days before the domain expires, then renew it. Turn it off any time in the dashboard, or renew early for up to five years.'],
   ['Can I move a domain I already own?', 'Yes. Unlock it at your current registrar, get its transfer (EPP) code and start a transfer in the dashboard. A transfer adds a year to the registration and usually takes 5–7 days. Your site keeps its current DNS while it moves.'],
   ['What if the registry rejects my order?', 'You’re refunded in full, automatically. You only pay for a domain we actually register or transfer for you.'],
@@ -659,7 +658,7 @@ ${pageHero({
       <section class="section tight">
         <a class="lyr-teaser glass-card" href="/lyr/"><span class="eyebrow">Preview</span><b>Coming later: .lyr names</b><span>See how Lyrcloud’s own extension works →</span></a>
       </section>
-${ctaBand('Already have a domain?', 'Coming soon: put it on Lyrcloud for a global CDN, free TLS and DDoS protection, wherever it’s registered.')}
+${ctaBand('Already have a domain?', 'Put it on Lyrcloud for a global CDN, free TLS and DDoS protection, wherever it’s registered.')}
     </main>`,
 };
 
@@ -768,7 +767,7 @@ const pricingPage = {
 ${pageHero({
   eyebrow: 'Pricing',
   title: 'Start free. Scale when traffic grows.',
-  lede: 'Edge functions free to start, with no surprise bills. CDN, TLS and DDoS protection for your domains are coming soon.',
+  lede: 'Unmetered bandwidth and DDoS protection on every plan. No surprise bills.',
 })}
       <section class="section pricing-section tight">
         ${pricingCards()}
@@ -811,7 +810,7 @@ ${pageHero({
 })}
       <section class="section">
         <div class="card-grid three">
-          <article class="feature-card compact"><h3>Secure by default</h3><p>Protection should not be an add-on. Every edge function gets rate limits, a firewall and TLS from the start.</p></article>
+          <article class="feature-card compact"><h3>Secure by default</h3><p>Protection should not be an add-on. Every plan ships with DDoS mitigation and TLS turned on.</p></article>
           <article class="feature-card compact"><h3>Developer first</h3><p>Great infrastructure gets out of the way. We obsess over the CLI, the docs, and the first five minutes.</p></article>
           <article class="feature-card compact"><h3>One network</h3><p>Every product runs everywhere, so you never trade latency for features.</p></article>
         </div>

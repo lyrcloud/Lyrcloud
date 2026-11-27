@@ -222,7 +222,7 @@ const canManage = (actorRole, targetRole) =>
   targetRole === 'user' ? isStaff(actorRole) : targetRole === 'admin' ? actorRole === 'superadmin' : false;
 
 const PLAN_INFO = {
-  launch: { name: 'Launch', price: '$0', blurb: 'Edge functions with caching, rate limits and a firewall.', features: ['100k edge function requests/day', 'Edge caching and firewall', 'Domain CDN, TLS & DDoS (coming soon)', '5 custom firewall rules'] },
+  launch: { name: 'Launch', price: '$0', blurb: 'CDN, TLS and DDoS protection for every site.', features: ['Global CDN', 'Free TLS certificates', 'Unmetered DDoS protection', '5 custom firewall rules'] },
   scale: { name: 'Scale', price: '$29/mo', blurb: 'Adds the managed WAF and image optimization.', features: ['Everything in Launch', 'Managed WAF rules', 'Image optimization', 'Priority email support'] },
   enterprise: { name: 'Enterprise', price: 'Custom', blurb: 'SLAs, bot management and dedicated support.', features: ['Everything in Scale', '100% uptime SLA', 'Advanced bot management', 'Dedicated support engineer'] },
 };
