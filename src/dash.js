@@ -1,8 +1,8 @@
 // Lyrcloud dashboard — a dependency-free, hash-routed single-page app.
-// Sign-in is real (Cognito, see src/auth.js). Websites, DNS, and settings are not backed by
-// a server yet: they live in localStorage, and analytics are generated sample data (clearly
-// labeled in the UI). DNS lookups and nameserver checks are real, using public DNS-over-HTTPS.
-import { authFetch, DOMAINS_API_BASE, PROJECTS_API_BASE, redirectToLogin, SITES_DOMAIN } from './auth.js';
+// Sign-in is real (Cognito, see src/auth.js). Sites (DNS, CDN and HTTPS), domains, projects and the
+// admin console use the Lyrcloud APIs. The Edge Functions editor here is still a local preview kept in
+// localStorage; real functions are deployed with the lyrcloud CLI.
+import { authFetch, DOMAINS_API_BASE, FUNCTIONS_API_BASE, PROJECTS_API_BASE, redirectToLogin, SITES_DOMAIN } from './auth.js';
 import { avatarHtml, cacheProfile, imageFileToAvatar } from './avatar.js';
 import { logo } from './logo.js';
 import { endSession, getSession } from './session.js';
@@ -90,34 +90,6 @@ function confirmed(target, message) {
 
 // ------------------------------------------------------------------ state
 
-const NAMESERVER_NAMES = ['ada', 'bea', 'cruz', 'dax', 'eli', 'fay', 'gus', 'ivy', 'kai', 'leo', 'max', 'nia', 'oz', 'rae', 'sol', 'zed'];
-
-const nameserversFor = (domain) => {
-  const hash = hashString(domain);
-  const first = NAMESERVER_NAMES[hash % NAMESERVER_NAMES.length];
-  const second = NAMESERVER_NAMES[(hash >>> 8) % NAMESERVER_NAMES.length];
-  return [`${first}.ns.lyrcloud.com`, `${second === first ? 'zed' : second}.ns.lyrcloud.com`];
-};
-
-const defaultWafRules = () => [
-  { id: uid(), name: 'Block known bad paths', expression: 'http.request.uri.path contains "/wp-admin"', action: 'block', enabled: true },
-];
-
-function createZone(name, plan, records = []) {
-  return {
-    id: uid(),
-    name,
-    plan,
-    status: 'pending',
-    createdAt: new Date().toISOString(),
-    nameservers: nameserversFor(name),
-    dns: records,
-    ssl: { mode: 'full', alwaysHttps: true, minTls: '1.2', hsts: false },
-    security: { underAttack: false, botFight: true, managedWaf: plan !== 'launch', rules: defaultWafRules() },
-    caching: { level: 'standard', browserTtl: '4h', devMode: false, lastPurge: null },
-  };
-}
-
 const sampleWorkerCode = `export default {
   async fetch(request) {
     const url = new URL(request.url);
@@ -137,7 +109,7 @@ function loadState() {
     const stored = JSON.parse(localStorage.getItem(STORE_KEY));
     if (stored && stored.owner === session.email) return stored;
   } catch {}
-  return { owner: session.email, plan: 'launch', zones: [], workers: [] };
+  return { owner: session.email, plan: 'launch', workers: [] };
 }
 
 const state = loadState();
@@ -147,45 +119,7 @@ const save = () => {
   } catch {}
 };
 
-const findZone = (name) => state.zones.find((zone) => zone.name === name);
 const findWorker = (id) => state.workers.find((worker) => worker.id === id);
-
-// ------------------------------------------------------------------ DNS over HTTPS
-
-async function dohQuery(name, type) {
-  const response = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(name)}&type=${type}`);
-  if (!response.ok) throw new Error(`DNS lookup failed (${response.status})`);
-  const data = await response.json();
-  return data.Answer || [];
-}
-
-const TYPE_CODES = { 1: 'A', 5: 'CNAME', 15: 'MX', 16: 'TXT', 28: 'AAAA', 2: 'NS' };
-
-async function scanRecords(domain) {
-  const lookups = [
-    [domain, 'A'], [domain, 'AAAA'], [domain, 'MX'], [domain, 'TXT'],
-    [`www.${domain}`, 'CNAME'], [`www.${domain}`, 'A'],
-  ];
-  const results = await Promise.allSettled(lookups.map(([name, type]) => dohQuery(name, type)));
-  const records = [];
-  const seen = new Set();
-  for (const result of results) {
-    if (result.status !== 'fulfilled') continue;
-    for (const answer of result.value) {
-      const type = TYPE_CODES[answer.type];
-      if (!type || type === 'NS') continue;
-      const name = answer.name.replace(/\.$/, '');
-      // A CNAME chain also returns the target's A records under the target name; keep only this zone.
-      if (name !== domain && !name.endsWith(`.${domain}`)) continue;
-      const content = answer.data.replace(/\.$/, '').replace(/^"|"$/g, '');
-      const key = `${type}|${name}|${content}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      records.push({ id: uid(), type, name, content, ttl: 'auto', proxied: ['A', 'AAAA', 'CNAME'].includes(type) });
-    }
-  }
-  return records;
-}
 
 // ------------------------------------------------------------------ sample analytics
 
@@ -308,15 +242,12 @@ function sidebar(route) {
   ];
   accountLinks.splice(3, 0, ['#/plans', 'Plans', icons.plans, route.view === 'plans']);
   if (isStaff(profile?.role)) accountLinks.push(['#/admin', 'Admin console', icons.users, route.view === 'admin' || route.view === 'users']);
-  const zone = route.zone && findZone(route.zone);
+  const zone = route.view === 'zone' && route.zone ? { name: route.zone } : null;
   const zoneLinks = zone
     ? [
         ['overview', 'Overview', icons.overview],
-        ['analytics', 'Analytics', icons.analytics],
         ['dns', 'DNS', icons.dns],
-        ['ssl', 'SSL/TLS', icons.ssl],
-        ['security', 'Security', icons.security],
-        ['caching', 'Caching', icons.caching],
+        ['cdn', 'CDN & HTTPS', icons.caching],
       ].map(([tab, label, icon]) => [`#/zones/${encodeURIComponent(zone.name)}/${tab}`, label, icon, route.tab === tab])
     : [];
 
@@ -335,15 +266,15 @@ function sidebar(route) {
 }
 
 function topbar(route) {
-  const options = state.zones
-    .map((zone) => `<option value="${esc(zone.name)}"${zone.name === route.zone ? ' selected' : ''}>${esc(zone.name)}</option>`)
+  const list = sites.list || [];
+  const options = list
+    .map((site) => `<option value="${esc(site.domain)}"${site.domain === route.zone ? ' selected' : ''}>${esc(site.domain)}</option>`)
     .join('');
   return `
     <header class="dash-topbar">
       <button class="icon-button sidebar-toggle" data-action="toggle-sidebar" aria-label="Toggle navigation">☰</button>
-      ${state.zones.length ? `<label class="zone-picker"><span class="visually-hidden">Website</span><select data-action="pick-zone"><option value="">All websites</option>${options}</select></label>` : '<span></span>'}
+      ${list.length ? `<label class="zone-picker"><span class="visually-hidden">Site</span><select data-action="pick-zone"><option value="">All sites</option>${options}</select></label>` : '<span></span>'}
       <div class="topbar-right">
-        <span class="preview-pill" title="No backend yet: data is stored in this browser">Preview</span>
         ${isStaff(profile?.role) ? `<a class="role-pill" href="#/admin" title="Open the admin console">${ROLE_LABELS[profile.role]} · Admin</a>` : ''}
         <a class="plan-pill" href="#/plans" title="Change plan">${esc(planName(state.plan))} plan</a>
         ${accountMenu()}
@@ -391,7 +322,7 @@ const pageHead = (title, subtitle = '', actions = '') => `
   </div>`;
 
 const statusBadge = (status) =>
-  status === 'active' ? '<span class="status ok">● Active</span>' : '<span class="status pending">◌ Preview</span>';
+  status === 'active' ? '<span class="status ok">● Active</span>' : '<span class="status pending">◌ Waiting for nameservers</span>';
 
 const toggle = (action, checked, label) => `
   <label class="switch"><input type="checkbox" data-action="${action}"${checked ? ' checked' : ''} /><span class="switch-track"></span><span class="visually-hidden">${label}</span></label>`;
@@ -513,33 +444,37 @@ async function saveProfile(changes, message) {
 
 const views = {
   home() {
-    const zones = state.zones;
+    const list = sites.list || [];
     return `
       ${pageHead(`Welcome back`, esc(session.email), '<a class="btn primary" href="#/add-site">+ Add a site</a>')}
       ${
-        zones.length
-          ? `<section class="panel">
-              <div class="panel-head"><h2>Websites</h2><span class="muted">${zones.length} total</span></div>
+        sites.error
+          ? `<section class="panel"><p class="form-error">${esc(sites.error)}</p><button class="btn" data-action="sites-retry">Try again</button></section>`
+          : !sites.list
+            ? '<section class="panel"><p class="muted">Loading your sites…</p></section>'
+            : list.length
+              ? `<section class="panel">
+              <div class="panel-head"><h2>Sites</h2><span class="muted">${list.length}${sites.limit ? ` of ${sites.limit}` : ''}</span></div>
               <div class="zone-list">
-                ${zones
+                ${list
                   .map(
-                    (zone) => `
-                  <a class="zone-row" href="#/zones/${encodeURIComponent(zone.name)}/overview">
-                    <span class="zone-favicon" aria-hidden="true">${esc(zone.name[0].toUpperCase())}</span>
-                    <span class="zone-name"><b>${esc(zone.name)}</b><small>${esc(planName(zone.plan))} plan · ${zone.dns.length} DNS records</small></span>
-                    ${statusBadge(zone.status)}
+                    (site) => `
+                  <a class="zone-row" href="#/zones/${encodeURIComponent(site.domain)}/overview">
+                    <span class="zone-favicon" aria-hidden="true">${esc(site.domain[0].toUpperCase())}</span>
+                    <span class="zone-name"><b>${esc(site.domain)}</b><small>${site.cdn ? cdnOrigin(site.cdn) : 'DNS only'}</small></span>
+                    ${statusBadge(site.status)} ${cdnBadge(site.cdn)}
                   </a>`,
                   )
                   .join('')}
               </div>
             </section>`
-          : `<section class="panel empty">
+              : `<section class="panel empty">
               <span class="empty-icon" aria-hidden="true">◎</span>
-              <h2>Add your first website</h2>
-              <p>Coming soon: point your domain at Lyrcloud for a global CDN, free TLS and DDoS protection.</p>
+              <h2>Add your first site</h2>
+              <p>Put any domain on Lyrcloud DNS, then turn on the CDN for caching, free HTTPS and DDoS protection.</p>
               <div class="row center">
                 <a class="btn primary" href="#/add-site">Add a site</a>
-                <button class="btn" data-action="add-sample">Explore with a sample site</button>
+                <a class="btn" href="#/domains">Buy a domain</a>
               </div>
             </section>`
       }
@@ -555,43 +490,24 @@ const views = {
       </div>`;
   },
 
-  'add-site'(route) {
-    const step = route.params.get('step') || 'domain';
-    const domain = route.params.get('domain') || '';
-    if (step === 'plan') {
-      const plans = PLAN_IDS.map((id) => [id, PLAN_INFO[id].name, PLAN_INFO[id].price, PLAN_INFO[id].blurb]);
-      return `
-        ${pageHead('Select a plan', `for <b>${esc(domain)}</b>`)}
-        <form class="panel" data-form="choose-plan">
-          <input type="hidden" name="domain" value="${esc(domain)}" />
-          <div class="plan-options">
-            ${plans
-              .map(
-                ([id, name, price, text]) => `
-              <label class="plan-option">
-                <input type="radio" name="plan" value="${id}"${id === state.plan ? ' checked' : ''} />
-                <span><b>${name}</b><strong>${price}</strong><small>${text}</small></span>
-              </label>`,
-              )
-              .join('')}
-          </div>
-          <p class="muted">Billing isn’t connected in the preview, so any plan can be selected for free.</p>
-          <div class="row"><a class="btn" href="#/add-site">Back</a><button class="btn primary" type="submit">Continue</button></div>
-        </form>`;
-    }
+  'add-site'() {
     return `
-      ${pageHead('Add a site', 'Enter your domain. We’ll scan its existing DNS records so nothing breaks when you switch.')}
+      ${pageHead('Add a site', 'Enter a domain you own. We copy its current DNS records so nothing breaks when you switch nameservers.')}
       <form class="panel" data-form="add-domain">
-        <label class="field">Domain<input name="domain" placeholder="example.com" required autocomplete="off" value="${esc(domain)}" /></label>
+        <label class="field">Domain<input name="domain" placeholder="example.com" required autocomplete="off" /></label>
         <p class="form-error" hidden></p>
-        <div class="row"><button class="btn primary" type="submit">Continue</button></div>
+        <div class="row"><button class="btn primary" type="submit">Add site</button></div>
+        <p class="muted small">Domains you buy in <a href="#/domains">Domains</a> are added automatically.</p>
       </form>`;
   },
 
   zone(route) {
-    const zone = findZone(route.zone);
-    if (!zone) return views.missing();
-    return zoneViews[route.tab]?.(zone, route) ?? views.missing();
+    if (sites.detailError && sites.detailFor === route.zone) {
+      return `${pageHead(esc(route.zone))}<section class="panel"><p class="form-error">${esc(sites.detailError)}</p><a class="btn" href="#/">All sites</a></section>`;
+    }
+    const site = sites.detail?.domain === route.zone ? sites.detail : null;
+    if (!site) return `${pageHead(esc(route.zone))}<section class="panel"><p class="muted">Loading…</p></section>`;
+    return siteViews[route.tab]?.(site, route) ?? views.missing();
   },
 
   workers() {
@@ -622,7 +538,6 @@ const views = {
   worker(route) {
     const worker = findWorker(route.worker);
     if (!worker) return views.missing();
-    const routeOptions = state.zones.map((zone) => `<option value="${esc(zone.name)}/*">${esc(zone.name)}/*</option>`).join('');
     return `
       ${pageHead(esc(worker.name), worker.deployedAt ? `Saved ${formatDate(worker.deployedAt)} · preview only, not yet on the network` : 'Draft — not saved yet', `
         <button class="btn danger" data-action="delete-worker" data-id="${worker.id}">Delete</button>
@@ -649,11 +564,7 @@ const views = {
             ? `<ul class="route-list">${worker.routes.map((pattern, index) => `<li><code>${esc(pattern)}</code><button class="btn small" data-action="remove-route" data-id="${worker.id}" data-index="${index}">Remove</button></li>`).join('')}</ul>`
             : '<p class="muted">No routes. The function is reachable on its lyrcloud.dev subdomain only.</p>'
         }
-        ${
-          state.zones.length
-            ? `<form class="row" data-form="add-route" data-id="${worker.id}"><select name="pattern" aria-label="Route">${routeOptions}</select><button class="btn" type="submit">Add route</button></form>`
-            : '<p class="muted">Add a website to attach routes.</p>'
-        }
+        <p class="muted">To serve a deployed function on your own domain, open the site’s <b>CDN & HTTPS</b> page and choose <b>An Edge Function</b>.</p>
       </section>`;
   },
 
@@ -690,12 +601,9 @@ const views = {
         </section>`;
     }).join('');
     return `
-      ${pageHead('Plans', 'Your plan is saved to your Lyrcloud account and used for new websites.')}
+      ${pageHead('Plans', 'Your plan is saved to your Lyrcloud account.')}
       ${profileFailed ? '<p class="form-error">Couldn’t reach your account, so plan changes can’t be saved right now. Reload to try again.</p>' : ''}
       <div class="grid-3 plan-grid">${cards}</div>
-      ${state.zones.length
-        ? `<label class="check-row"><input type="checkbox" id="plan-apply-sites" checked /> Also switch my ${state.zones.length} existing website${state.zones.length === 1 ? '' : 's'} to the new plan</label>`
-        : ''}
       <p class="muted">Billing isn’t connected yet, so every plan is free during the preview.</p>`;
   },
 
@@ -736,213 +644,185 @@ const views = {
   },
 };
 
-const zoneViews = {
-  overview(zone) {
-    const { rows } = sampleSeries(zone.name, '24h');
-    const requests = sum(rows, 'requests');
+// ---- sites: DNS, CDN and HTTPS for any domain (api/domains/sites.mjs)
+
+const sites = { list: null, error: '', loading: false, limit: null, cdnAvailable: false, detail: null, detailFor: null, detailError: '', loadingDetail: false, fns: null, fnsLoading: false, timer: null };
+const findSite = (name) => sites.list?.find((site) => site.domain === name) || (sites.detail?.domain === name ? sites.detail : null);
+
+async function loadSites() {
+  sites.loading = true;
+  try {
+    const data = await domainsApi('/domains/sites');
+    Object.assign(sites, { list: data.sites, limit: data.limit, cdnAvailable: data.cdnAvailable, error: '' });
+  } catch (error) {
+    sites.error = error.message;
+  }
+  sites.loading = false;
+  render();
+}
+
+async function loadSite(name) {
+  sites.loadingDetail = true;
+  sites.detailFor = name;
+  try {
+    sites.detail = (await domainsApi(`/domains/sites/${encodeURIComponent(name)}`)).site;
+    sites.detailError = '';
+    if (sites.list) sites.list = sites.list.map((site) => (site.domain === name ? { ...site, ...sites.detail } : site));
+  } catch (error) {
+    sites.detail = null;
+    sites.detailError = error.message;
+  }
+  sites.loadingDetail = false;
+  if (currentRoute?.view === 'zone' && currentRoute.zone === name) render();
+}
+
+async function loadMyFunctions() {
+  sites.fnsLoading = true;
+  try {
+    sites.fns = (await api('/functions', {}, FUNCTIONS_API_BASE)).functions.map((fn) => fn.name);
+  } catch {
+    sites.fns = [];
+  }
+  sites.fnsLoading = false;
+  if (currentRoute?.view === 'zone') render();
+}
+
+function sitesAfterRender(route) {
+  clearTimeout(sites.timer);
+  if (!DOMAINS_ENABLED) return;
+  if (!sites.list && !sites.loading && !sites.error) loadSites();
+  if (route.view !== 'zone') return;
+  if ((sites.detailFor !== route.zone || (!sites.detail && !sites.detailError)) && !sites.loadingDetail) loadSite(route.zone);
+  if (route.tab === 'cdn' && !sites.fns && !sites.fnsLoading) loadMyFunctions();
+  // Name servers and CDN changes move on by themselves; keep the page fresh meanwhile.
+  const site = sites.detail;
+  if (site && site.domain === route.zone && (site.status !== 'active' || (site.cdn && site.cdn.status !== 'live' && site.cdn.status !== 'error'))) {
+    sites.timer = setTimeout(() => currentRoute.view === 'zone' && currentRoute.zone === site.domain && loadSite(site.domain), site.cdn ? 10_000 : 30_000);
+  }
+}
+
+const CDN_STATUS = {
+  certificate: ['pending', 'Issuing certificate…'], deploying: ['pending', 'Deploying…'], live: ['ok', 'Live'],
+  removing: ['pending', 'Turning off…'], error: ['bad', 'Needs attention'],
+};
+const cdnBadge = (cdn) => {
+  if (!cdn) return '<span class="status">CDN off</span>';
+  const [cls, label] = CDN_STATUS[cdn.status] || ['pending', cdn.status];
+  return `<span class="status ${cls}">${cls === 'ok' ? '●' : cls === 'bad' ? '✕' : '◌'} CDN ${esc(label)}</span>`;
+};
+const cdnOrigin = (cdn) => (cdn.mode === 'function' ? `Edge Function <code>${esc(cdn.fn)}</code>` : `Your server <code>${esc(cdn.origin)}</code>`);
+
+function nameserverPanel(site) {
+  const list = `<ul class="ns-list">${site.nameservers.map((ns) => `<li><code>${esc(ns)}</code><button class="btn small" data-action="copy" data-value="${esc(ns)}">Copy</button></li>`).join('')}</ul>`;
+  if (site.status === 'active') {
+    return `<section class="panel"><div class="panel-head"><h2>Nameservers</h2><span class="status ok">● In use</span></div>${list}</section>`;
+  }
+  if (site.registered) {
+    return `<section class="panel callout"><h2>Setting up Lyrcloud DNS</h2><p>${esc(site.domain)} was registered with these nameservers. The registry usually publishes them within an hour.</p>${list}</section>`;
+  }
+  return `
+    <section class="panel callout">
+      <h2>Last step: change your nameservers</h2>
+      <p>At the registrar where you bought <b>${esc(site.domain)}</b>, replace its nameservers with these four. Remove any others.</p>
+      ${list}
+      <p class="muted">We copied the records ${esc(site.domain)} has today, so it keeps working after the switch. Check the <a href="#/zones/${encodeURIComponent(site.domain)}/dns">DNS records</a> first, especially for email. The change usually takes effect within an hour and sometimes takes up to a day. This page updates by itself.${site.checkedAt ? ` Last checked ${formatDate(site.checkedAt)}.` : ''}</p>
+    </section>`;
+}
+
+const siteViews = {
+  overview(site) {
+    const cdn = site.cdn;
     return `
-      ${pageHead(esc(zone.name), `${statusBadge(zone.status)} · ${esc(planName(zone.plan))} plan`, `<a class="btn" href="https://${esc(zone.name)}" target="_blank" rel="noopener">Visit site ↗</a>`)}
-      ${
-        zone.status !== 'active'
-          ? `<section class="panel callout">
-              <h2>Preview: keep your current nameservers</h2>
-              <p><b>Don’t change your nameservers for this site.</b> Lyrcloud doesn’t host DNS for websites added here yet, so there are no Lyrcloud nameservers to point to; changing them would take ${esc(zone.name)} offline. This page is a preview kept in your browser.</p>
-              <p class="muted">Domains you buy or transfer in <a href="#/domains">Domains</a> are real: their DNS is managed there. Edge Functions, Storage, AI, Access, Security and caching are live through the <a href="/developers/">lyrcloud CLI</a>.</p>
-              <div class="row">
-                <button class="btn" data-action="force-active" title="Preview only">Mark active (preview)</button>
-              </div>
-            </section>`
-          : ''
-      }
-      <div class="stat-grid">
-        <div class="stat"><span>Requests · 24h</span><strong>${compact.format(requests)}</strong></div>
-        <div class="stat"><span>Cached</span><strong>${((sum(rows, 'cached') / requests) * 100).toFixed(1)}%</strong></div>
-        <div class="stat"><span>Bandwidth</span><strong>${formatBytes(sum(rows, 'bandwidth'))}</strong></div>
-        <div class="stat"><span>Threats blocked</span><strong>${compact.format(sum(rows, 'threats'))}</strong></div>
-      </div>
-      <p class="sample-note">Sample data — real analytics appear once traffic flows through Lyrcloud.</p>
-      <div class="grid-2">
-        <section class="panel">
-          <div class="panel-head"><h2>Quick actions</h2></div>
-          ${settingRow('Under Attack mode', 'Challenge every visitor during a DDoS attack.', toggle('under-attack', zone.security.underAttack, 'Under Attack mode'))}
-          ${settingRow('Development mode', 'Bypass the cache for 3 hours while you test changes.', toggle('dev-mode', zone.caching.devMode, 'Development mode'))}
-          ${settingRow('Purge cache', 'Remove every cached file from all edge locations.', '<button class="btn" data-action="purge-all">Purge everything</button>')}
-        </section>
-        <section class="panel">
-          <div class="panel-head"><h2>Domain</h2></div>
-          <dl class="facts">
-            <dt>Plan</dt><dd>${planSelect('zone-plan', zone.plan, ' aria-label="Plan for this site"')}</dd>
-            <dt>Nameservers</dt><dd>${zone.registered ? zone.nameservers.map((ns) => `<code>${esc(ns)}</code>`).join('<br>') : '<span class="muted">Keep your current ones (preview)</span>'}</dd>
-            <dt>SSL/TLS</dt><dd>${esc(zone.ssl.mode)}</dd>
-            <dt>DNS records</dt><dd>${zone.dns.length}</dd>
-            <dt>Added</dt><dd>${formatDate(zone.createdAt)}</dd>
-          </dl>
-          <button class="btn danger" data-action="delete-zone">Remove site from Lyrcloud</button>
-        </section>
-      </div>`;
+      ${pageHead(esc(site.domain), `${statusBadge(site.status)} · ${cdnBadge(cdn)}`, `<a class="btn" href="https://${esc(site.domain)}" target="_blank" rel="noopener">Visit site ↗</a>`)}
+      ${nameserverPanel(site)}
+      <section class="panel">
+        <div class="panel-head"><h2>CDN & HTTPS</h2>${cdnBadge(cdn)}</div>
+        ${cdn
+          ? `<p>${cdnOrigin(cdn)} is served through Lyrcloud’s CDN at ${cdn.hosts.map((host) => `<code>${esc(host)}</code>`).join(' and ')}.${cdn.message ? ` <span class="muted">${esc(cdn.message)}</span>` : ''}</p>`
+          : `<p class="muted">${site.status === 'active' ? 'Put the site behind the CDN for caching, free HTTPS certificates and DDoS protection.' : 'Available once the nameservers point at Lyrcloud.'}</p>`}
+        <a class="btn${cdn ? '' : ' primary'}" href="#/zones/${encodeURIComponent(site.domain)}/cdn">${cdn ? 'Manage CDN' : 'Set up the CDN'}</a>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>Site</h2></div>
+        <dl class="facts">
+          <dt>DNS</dt><dd>Lyrcloud DNS (Amazon Route 53)</dd>
+          <dt>Added</dt><dd>${formatDate(site.createdAt)}</dd>
+          ${site.registered ? '<dt>Registration</dt><dd>Registered with Lyrcloud · <a href="#/domains/' + encodeURIComponent(site.domain) + '">Manage domain</a></dd>' : ''}
+        </dl>
+        ${site.registered ? '' : '<button class="btn danger" data-action="delete-zone">Remove site from Lyrcloud</button>'}
+      </section>`;
   },
 
-  analytics(zone, route) {
-    const range = RANGES[route.params.get('range')] ? route.params.get('range') : '24h';
-    const { rows, stepHours } = sampleSeries(zone.name, range);
-    const base = `#/zones/${encodeURIComponent(zone.name)}/analytics`;
+  dns(site) {
+    const records = site.records || [];
+    const managed = records.filter((record) => record.managed);
+    const editable = records.filter((record) => !record.managed);
     return `
-      ${pageHead('Analytics', esc(zone.name), `
-        <div class="segmented" role="group" aria-label="Time range">
-          ${Object.keys(RANGES).map((key) => `<a href="${base}?range=${key}"${key === range ? ' aria-current="true"' : ''}>${key}</a>`).join('')}
-        </div>`)}
-      <p class="sample-note">Sample data — real analytics appear once traffic flows through Lyrcloud.</p>
-      <div class="grid-2">
-        <section class="panel">${areaChart({ id: 'requests', rows, key: 'requests', label: 'Requests', format: compact.format, stepHours })}</section>
-        <section class="panel">${areaChart({ id: 'bandwidth', rows, key: 'bandwidth', label: 'Bandwidth', format: formatBytes, stepHours })}</section>
-        <section class="panel">${areaChart({ id: 'cached', rows, key: 'cached', label: 'Cached requests', format: compact.format, stepHours })}</section>
-        <section class="panel">${areaChart({ id: 'threats', rows, key: 'threats', label: 'Threats blocked', format: compact.format, stepHours })}</section>
-      </div>`;
+      ${pageHead('DNS records', `Live records for <b>${esc(site.domain)}</b> on Lyrcloud DNS.`)}
+      ${site.status !== 'active' && !site.registered ? '<p class="notice">These records go live once the domain’s nameservers point at Lyrcloud.</p>' : ''}
+      <section class="panel">${recordEditor(editable)}</section>
+      ${managed.length ? `
+        <section class="panel">
+          <div class="panel-head"><h2>Managed by Lyrcloud</h2></div>
+          <p class="muted small">The CDN serves these names, and the certificate records keep HTTPS renewing. Turn the CDN off to change them.</p>
+          <div class="table-scroll"><table class="table"><thead><tr><th>Type</th><th>Name</th><th>Value</th><th>For</th></tr></thead>
+          <tbody>${managed.map((record) => `<tr><td><span class="type-tag">${record.type}</span></td><td class="mono">${esc(record.label)}</td><td class="mono wrap">${record.values.map(esc).join('<br>')}</td><td>${record.managed === 'cdn' ? 'CDN' : 'HTTPS certificate'}</td></tr>`).join('')}</tbody></table></div>
+        </section>` : ''}`;
   },
 
-  dns(zone) {
-    const types = ['A', 'AAAA', 'CNAME', 'MX', 'TXT'];
-    // Domains bought through Lyrcloud have real DNS; send people to the records that actually resolve.
-    if (zone.registered && zone.lyrcloudDns) {
-      return `
-        ${pageHead('DNS records', `<b>${esc(zone.name)}</b> is registered with Lyrcloud and uses live Lyrcloud DNS.`)}
-        <section class="panel callout"><p>Records for this domain are live, not preview data.</p><a class="btn primary" href="#/domains/${encodeURIComponent(zone.name)}">Manage DNS records</a></section>`;
+  cdn(site) {
+    const cdn = site.cdn;
+    const head = pageHead('CDN & HTTPS', `Caching, free HTTPS and DDoS protection for <b>${esc(site.domain)}</b>`);
+    if (!sites.cdnAvailable && !cdn) return `${head}<section class="panel"><p class="muted">The CDN is being switched on. Check back shortly.</p></section>`;
+    if (site.status !== 'active') {
+      return `${head}<section class="panel callout"><h2>Nameservers first</h2><p>The CDN can be turned on once ${esc(site.domain)} uses Lyrcloud’s nameservers.</p><a class="btn" href="#/zones/${encodeURIComponent(site.domain)}/overview">See the nameservers</a></section>`;
     }
-    return `
-      ${pageHead('DNS records', `Manage records for <b>${esc(zone.name)}</b>. Proxied records get CDN and security; DNS-only records resolve straight to your server.`)}
-      <section class="panel">
-        <form class="dns-form" data-form="add-record">
-          <select name="type" aria-label="Type">${types.map((type) => `<option>${type}</option>`).join('')}</select>
-          <input name="name" placeholder="Name (@ for root)" required aria-label="Name" />
-          <input name="content" placeholder="IPv4 address, target, or value" required aria-label="Content" />
-          <label class="inline-check"><input type="checkbox" name="proxied" checked /> Proxied</label>
-          <button class="btn primary" type="submit">Add record</button>
-        </form>
-        <p class="form-error" hidden></p>
-        ${
-          zone.dns.length
-            ? `<div class="table-scroll"><table class="table">
-                <thead><tr><th>Type</th><th>Name</th><th>Content</th><th>Proxy</th><th>TTL</th><th></th></tr></thead>
-                <tbody>${zone.dns
-                  .map(
-                    (record) => `<tr>
-                      <td><span class="type-tag">${record.type}</span></td>
-                      <td class="mono">${esc(record.name)}</td>
-                      <td class="mono wrap">${esc(record.content)}</td>
-                      <td>${['A', 'AAAA', 'CNAME'].includes(record.type) ? `<button class="proxy-toggle ${record.proxied ? 'on' : ''}" data-action="toggle-proxy" data-id="${record.id}">${record.proxied ? '☁ Proxied' : '○ DNS only'}</button>` : '<span class="muted">DNS only</span>'}</td>
-                      <td>${esc(record.ttl)}</td>
-                      <td><button class="btn small" data-action="delete-record" data-id="${record.id}" aria-label="Delete record">Delete</button></td>
-                    </tr>`,
-                  )
-                  .join('')}</tbody></table></div>`
-            : '<p class="muted">No DNS records yet.</p>'
-        }
-      </section>`;
-  },
-
-  ssl(zone) {
-    const modes = [
-      ['off', 'Off', 'No encryption. Not recommended.'],
-      ['flexible', 'Flexible', 'Encrypts browser → Lyrcloud only.'],
-      ['full', 'Full', 'End-to-end, accepts self-signed origin certificates.'],
-      ['strict', 'Full (strict)', 'End-to-end with a valid origin certificate. Most secure.'],
-    ];
-    return `
-      ${pageHead('SSL/TLS', `Encryption settings for <b>${esc(zone.name)}</b>`)}
-      <section class="panel">
-        <div class="panel-head"><h2>Encryption mode</h2></div>
+    const apex = (site.records || []).find((record) => record.label === '@' && record.type === 'A' && !record.managed);
+    const fnOptions = (sites.fns || []).map((name) => `<option value="${esc(name)}"${cdn?.fn === name ? ' selected' : ''}>${esc(name)}</option>`).join('');
+    const mode = cdn?.mode || 'proxy';
+    const busy = cdn && cdn.status !== 'live' && cdn.status !== 'error';
+    const form = `
+      <form class="panel" data-form="site-cdn">
+        <div class="panel-head"><h2>${cdn ? 'Origin' : 'Turn on the CDN'}</h2>${cdnBadge(cdn)}</div>
         <div class="plan-options">
-          ${modes
-            .map(
-              ([id, name, text]) => `
-            <label class="plan-option">
-              <input type="radio" name="ssl-mode" value="${id}" data-action="ssl-mode"${zone.ssl.mode === id ? ' checked' : ''} />
-              <span><b>${name}</b><small>${text}</small></span>
-            </label>`,
-            )
-            .join('')}
+          <label class="plan-option"><input type="radio" name="mode" value="proxy"${mode === 'proxy' ? ' checked' : ''}${cdn && cdn.mode !== 'proxy' ? ' disabled' : ''} /><span><b>Your own server</b><small>Visitors reach your server through the CDN. Your server must answer HTTPS for ${esc(site.domain)}.</small></span></label>
+          <label class="plan-option"><input type="radio" name="mode" value="function"${mode === 'function' ? ' checked' : ''}${cdn && cdn.mode !== 'function' ? ' disabled' : ''} /><span><b>An Edge Function</b><small>Serve a function or static site you deployed with <code>lyrcloud deploy</code>.</small></span></label>
         </div>
-      </section>
+        <label class="field">Server address (for your own server)
+          <input name="origin" placeholder="203.0.113.10 or origin.example.net" value="${esc(cdn?.mode === 'proxy' ? cdn.origin : apex?.values[0] || '')}" autocomplete="off" />
+        </label>
+        <label class="field">Edge Function
+          ${sites.fns?.length ? `<select name="fn">${fnOptions}</select>` : `<input name="fn" placeholder="${sites.fnsLoading ? 'Loading your functions…' : 'Deploy one with lyrcloud deploy first'}" value="${esc(cdn?.fn || '')}" autocomplete="off" />`}
+        </label>
+        <p class="form-error" hidden></p>
+        <div class="row">
+          <button class="btn primary" type="submit"${busy ? ' disabled' : ''}>${cdn ? 'Save origin' : 'Turn on the CDN'}</button>
+          ${cdn ? `<button class="btn danger" type="button" data-action="site-cdn-off"${cdn.status === 'removing' ? ' disabled' : ''}>Turn off the CDN</button>` : ''}
+        </div>
+        <p class="muted small">${cdn ? 'To switch between your own server and an Edge Function, turn the CDN off first.' : `Covers ${esc(site.domain)} and www. We issue a free HTTPS certificate first, then move traffic, so HTTPS keeps working throughout. It takes about 5 to 15 minutes.`}</p>
+      </form>`;
+    const status = cdn ? `
       <section class="panel">
-        <div class="panel-head"><h2>Edge certificates</h2><span class="status ok">● Universal certificate active</span></div>
-        ${settingRow('Always use HTTPS', 'Redirect every HTTP request to HTTPS.', toggle('always-https', zone.ssl.alwaysHttps, 'Always use HTTPS'))}
-        ${settingRow('HSTS', 'Tell browsers to only ever connect over HTTPS.', toggle('hsts', zone.ssl.hsts, 'HSTS'))}
-        ${settingRow('Minimum TLS version', 'Reject connections using older protocol versions.', `
-          <select data-action="min-tls">${['1.0', '1.1', '1.2', '1.3'].map((version) => `<option${zone.ssl.minTls === version ? ' selected' : ''}>${version}</option>`).join('')}</select>`)}
-      </section>`;
-  },
-
-  security(zone) {
-    const random = seededRandom(hashString(`${zone.name}:events`));
-    const countries = ['US', 'DE', 'BR', 'IN', 'CN', 'RU', 'NL', 'VN'];
-    const paths = ['/wp-login.php', '/.env', '/api/login', '/xmlrpc.php', '/admin', '/checkout'];
-    const actions = ['Block', 'Managed challenge', 'Block', 'JS challenge'];
-    const events = Array.from({ length: 8 }, (_, index) => ({
-      time: new Date(Date.now() - (index * 7 + Math.floor(random() * 6)) * 60_000),
-      ip: `${Math.floor(random() * 200) + 20}.${Math.floor(random() * 255)}.${Math.floor(random() * 255)}.${Math.floor(random() * 255)}`,
-      country: countries[Math.floor(random() * countries.length)],
-      path: paths[Math.floor(random() * paths.length)],
-      action: actions[Math.floor(random() * actions.length)],
-    }));
-    return `
-      ${pageHead('Security', `Firewall and bot protection for <b>${esc(zone.name)}</b>`)}
+        <div class="panel-head"><h2>Status</h2>${cdnBadge(cdn)}</div>
+        <ol class="steps">
+          <li class="${['deploying', 'live'].includes(cdn.status) ? 'done' : cdn.status === 'certificate' ? 'current' : ''}">HTTPS certificate issued (free, renews automatically)</li>
+          <li class="${cdn.status === 'live' ? 'done' : cdn.status === 'deploying' ? 'current' : ''}">Deployed to CloudFront edge locations</li>
+          <li class="${cdn.status === 'live' ? 'done' : ''}">Traffic for ${cdn.hosts.map(esc).join(' and ')} goes through the CDN${cdn.liveAt ? ` · since ${formatDate(cdn.liveAt)}` : ''}</li>
+        </ol>
+        ${cdn.message ? `<p class="${cdn.status === 'error' ? 'form-error' : 'muted'}">${esc(cdn.message)}</p>` : ''}
+        <p class="muted small">HTTP always redirects to HTTPS (TLS 1.2 or newer). AWS Shield Standard protects against network-layer DDoS attacks. Only responses your origin marks cacheable with <code>Cache-Control</code> are cached.</p>
+      </section>` : '';
+    const purge = cdn?.status === 'live' ? `
       <section class="panel">
-        ${settingRow('Under Attack mode', 'Show an interstitial challenge to every visitor.', toggle('under-attack', zone.security.underAttack, 'Under Attack mode'))}
-        ${settingRow('Bot fight mode', 'Challenge requests that match known bot patterns.', toggle('bot-fight', zone.security.botFight, 'Bot fight mode'))}
-        ${settingRow('Managed WAF rules', zone.plan === 'launch' ? 'Available on Scale and Enterprise plans.' : 'OWASP core ruleset and Lyrcloud managed rules.', zone.plan === 'launch' ? '<button class="btn small" data-action="zone-upgrade">Upgrade to Scale</button>' : toggle('managed-waf', zone.security.managedWaf, 'Managed WAF rules'))}
-      </section>
-      <section class="panel">
-        <div class="panel-head"><h2>Custom rules</h2><span class="muted">${zone.security.rules.length} of 5 used</span></div>
-        <ul class="rule-list">
-          ${zone.security.rules
-            .map(
-              (rule) => `<li>
-                <div><b>${esc(rule.name)}</b><code>${esc(rule.expression)}</code></div>
-                <span class="type-tag">${esc(rule.action)}</span>
-                <label class="switch"><input type="checkbox" data-action="toggle-rule" data-id="${rule.id}"${rule.enabled ? ' checked' : ''} /><span class="switch-track"></span><span class="visually-hidden">Enable ${esc(rule.name)}</span></label>
-                <button class="btn small" data-action="delete-rule" data-id="${rule.id}">Delete</button>
-              </li>`,
-            )
-            .join('')}
-        </ul>
-        ${
-          zone.security.rules.length < 5
-            ? `<form class="rule-form" data-form="add-rule">
-                <input name="name" placeholder="Rule name" required aria-label="Rule name" />
-                <input name="expression" placeholder='ip.geo.country eq "XX"' required aria-label="Expression" class="mono" />
-                <select name="action" aria-label="Action"><option value="block">block</option><option value="challenge">challenge</option><option value="allow">allow</option><option value="log">log</option></select>
-                <button class="btn primary" type="submit">Add rule</button>
-              </form>`
-            : ''
-        }
-      </section>
-      <section class="panel">
-        <div class="panel-head"><h2>Recent security events</h2><span class="sample-note inline">Sample data</span></div>
-        <div class="table-scroll"><table class="table">
-          <thead><tr><th>Time</th><th>Action</th><th>Country</th><th>IP</th><th>Path</th></tr></thead>
-          <tbody>${events.map((event) => `<tr><td>${event.time.toLocaleTimeString()}</td><td>${event.action}</td><td>${event.country}</td><td class="mono">${event.ip}</td><td class="mono">${event.path}</td></tr>`).join('')}</tbody>
-        </table></div>
-      </section>`;
-  },
-
-  caching(zone) {
-    return `
-      ${pageHead('Caching', `Cache configuration for <b>${esc(zone.name)}</b>`)}
-      <section class="panel">
-        <div class="panel-head"><h2>Purge cache</h2>${zone.caching.lastPurge ? `<span class="muted">Last purge ${formatDate(zone.caching.lastPurge)}</span>` : ''}</div>
+        <div class="panel-head"><h2>Purge cache</h2></div>
         <form class="row" data-form="purge-urls">
-          <input name="urls" placeholder="https://${esc(zone.name)}/styles.css" aria-label="URL to purge" class="grow" required />
-          <button class="btn" type="submit">Purge URL</button>
+          <input name="paths" placeholder="/styles.css, /blog/*" aria-label="Paths to purge" class="grow" />
+          <button class="btn" type="submit">Purge paths</button>
           <button class="btn danger" type="button" data-action="purge-all">Purge everything</button>
         </form>
-      </section>
-      <section class="panel">
-        ${settingRow('Caching level', 'How query strings affect what is cached.', `
-          <select data-action="cache-level">${[['basic', 'No query string'], ['standard', 'Standard'], ['aggressive', 'Ignore query string']].map(([value, label]) => `<option value="${value}"${zone.caching.level === value ? ' selected' : ''}>${label}</option>`).join('')}</select>`)}
-        ${settingRow('Browser cache TTL', 'How long browsers keep cached resources.', `
-          <select data-action="browser-ttl">${['30m', '1h', '4h', '1d', '7d', '30d'].map((ttl) => `<option${zone.caching.browserTtl === ttl ? ' selected' : ''}>${ttl}</option>`).join('')}</select>`)}
-        ${settingRow('Development mode', 'Temporarily bypass the cache so changes show up immediately.', toggle('dev-mode', zone.caching.devMode, 'Development mode'))}
-      </section>`;
+        <p class="muted small">Purges reach every edge location within a few minutes.</p>
+      </section>` : '';
+    return `${head}${status}${form}${purge}`;
   },
 };
 
@@ -1573,23 +1453,9 @@ async function searchDomains(query) {
   render();
 }
 
-// Registered domains show up as active websites, with the registrar's real nameservers.
+// Domains registered here get their site (Lyrcloud DNS) on the server; refresh the list to show it.
 function syncDomainSites(list = domains.data?.domains || []) {
-  let changed = false;
-  for (const item of list) {
-    if (item.status !== 'active') continue;
-    let zone = findZone(item.domain);
-    if (!zone) {
-      zone = createZone(item.domain, state.plan, []);
-      state.zones.push(zone);
-      changed = true;
-    }
-    if (zone.status !== 'active' || !zone.registered || String(zone.nameservers) !== String(item.nameservers)) {
-      Object.assign(zone, { status: 'active', registered: true, lyrcloudDns: item.lyrcloudDns, nameservers: item.nameservers.length ? item.nameservers : zone.nameservers });
-      changed = true;
-    }
-  }
-  if (changed) save();
+  if (sites.list && list.some((item) => item.status === 'active' && item.lyrcloudDns && !findSite(item.domain))) loadSites();
 }
 
 function domainsAfterRender(route) {
@@ -1828,7 +1694,7 @@ function domainView(route) {
         <section class="panel">
           <div class="panel-head"><h2>Nameservers</h2>${item.lyrcloudDns ? '<span class="status ok">● Lyrcloud DNS</span>' : ''}</div>
           <ul class="ns-list">${item.nameservers.map((ns) => `<li><code>${esc(ns)}</code></li>`).join('') || '<li class="muted">—</li>'}</ul>
-          ${findZone(item.domain) ? `<a class="link" href="#/zones/${encodeURIComponent(item.domain)}/overview">Open as a website →</a>` : ''}
+          ${findSite(item.domain) ? `<a class="link" href="#/zones/${encodeURIComponent(item.domain)}/overview">CDN & HTTPS for this domain →</a>` : ''}
         </section>
       </div>
       ${item.lyrcloudDns ? `
@@ -2146,9 +2012,11 @@ function adminDomainsTab(isSuper) {
 // ---- actions
 
 // The DNS editor serves both registered domains and name.lyr.cloud subdomains.
-const recordTarget = () => (currentRoute.view === 'subdomain'
-  ? { base: `/domains/subdomains/${encodeURIComponent(currentRoute.label)}`, records: domains.sub?.records, reload: () => loadSubdomain(currentRoute.label) }
-  : { base: `/domains/${encodeURIComponent(currentRoute.domain)}`, records: domains.detail?.records, reload: () => loadDomainDetail(currentRoute.domain) });
+const recordTarget = () => (currentRoute.view === 'zone'
+  ? { base: `/domains/sites/${encodeURIComponent(currentRoute.zone)}`, records: sites.detail?.records, reload: () => loadSite(currentRoute.zone) }
+  : currentRoute.view === 'subdomain'
+    ? { base: `/domains/subdomains/${encodeURIComponent(currentRoute.label)}`, records: domains.sub?.records, reload: () => loadSubdomain(currentRoute.label) }
+    : { base: `/domains/${encodeURIComponent(currentRoute.domain)}`, records: domains.detail?.records, reload: () => loadDomainDetail(currentRoute.domain) });
 const recordFor = (type, label) => recordTarget().records?.find((record) => record.type === type && record.label === label);
 
 // ---- .lyr registry (preview): names Lyrcloud answers for itself through its own DNS resolver.
@@ -2596,6 +2464,7 @@ function render() {
   if (currentRoute.view === 'settings') showProfile();
   if (PROJECTS_ENABLED && currentRoute.view.startsWith('project')) projectsAfterRender(currentRoute);
   if (isDomainView(currentRoute.view)) domainsAfterRender(currentRoute);
+  sitesAfterRender(currentRoute);
   if (isAdminView() && profile && isStaff(profile.role)) {
     if (!adminUsers.list && !adminUsers.loading && !adminUsers.error) loadUsers();
     if (currentRoute.params.get('tab') === 'settings' && !adminSettings.data && !adminSettings.loading) loadAdminSettings();
@@ -2749,7 +2618,7 @@ async function adminAction(target, request, message) {
   }
 }
 
-async function setAccountPlan(plan, applyToSites) {
+async function setAccountPlan(plan) {
   try {
     profile = { ...profile, ...(await api('/me', { method: 'PUT', body: JSON.stringify({ plan }) })) };
   } catch (error) {
@@ -2758,15 +2627,10 @@ async function setAccountPlan(plan, applyToSites) {
     return;
   }
   state.plan = plan;
-  if (applyToSites) {
-    for (const zone of state.zones) {
-      zone.plan = plan;
-      zone.security.managedWaf = plan !== 'launch';
-    }
-  }
   save();
+  sites.list = null; // the site limit depends on the plan
   render();
-  toast(`You’re now on the ${planName(plan)} plan${applyToSites && state.zones.length ? ', and so are your websites' : ''}`);
+  toast(`You’re now on the ${planName(plan)} plan`);
 }
 
 const go = (hash) => {
@@ -2778,74 +2642,54 @@ window.addEventListener('hashchange', render);
 
 // ------------------------------------------------------------------ actions
 
-const currentZone = () => currentRoute.zone && findZone(currentRoute.zone);
-
-const updateZone = (mutate, message) => {
-  const zone = currentZone();
-  if (!zone) return;
-  mutate(zone);
-  save();
-  render();
-  if (message) toast(message);
-};
-
 const clickActions = {
   'toggle-sidebar': () => app.classList.toggle('sidebar-open'),
-  'add-sample': () => {
-    if (findZone('example.com')) return go('#/zones/example.com/overview');
-    const zone = createZone('example.com', state.plan, [
-      { id: uid(), type: 'A', name: 'example.com', content: '93.184.215.14', ttl: 'auto', proxied: true },
-      { id: uid(), type: 'CNAME', name: 'www.example.com', content: 'example.com', ttl: 'auto', proxied: true },
-      { id: uid(), type: 'TXT', name: 'example.com', content: 'v=spf1 -all', ttl: 'auto', proxied: false },
-    ]);
-    zone.status = 'active';
-    state.zones.push(zone);
-    save();
-    go('#/zones/example.com/overview');
-  },
   copy: (target) => {
     navigator.clipboard?.writeText(target.dataset.value).then(() => toast('Copied to clipboard'), () => toast('Copy failed'));
   },
-  'check-ns': async (target) => {
-    const zone = currentZone();
-    const result = document.getElementById('ns-result');
+  'sites-retry': () => {
+    sites.error = '';
+    sites.list = null;
+    render();
+  },
+  'purge-all': async (target) => {
+    if (!confirmed(target, 'Purge every cached file for this site?')) return;
     target.disabled = true;
-    result.textContent = 'Checking public DNS…';
     try {
-      const current = (await dohQuery(zone.name, 'NS')).map((answer) => answer.data.replace(/\.$/, '').toLowerCase());
-      if (zone.nameservers.every((ns) => current.includes(ns))) {
-        updateZone((item) => { item.status = 'active'; }, `${zone.name} is now active on Lyrcloud`);
-        return;
-      }
-      result.innerHTML = current.length
-        ? `Currently using: ${current.map((ns) => `<code>${esc(ns)}</code>`).join(', ')}. Not updated yet.`
-        : 'No nameservers found for this domain yet.';
+      await domainsApi(`/domains/sites/${encodeURIComponent(currentRoute.zone)}/purge`, { method: 'POST', body: '{}' });
+      toast('Purging everything. It reaches every edge location within a few minutes.');
     } catch (error) {
-      result.textContent = `Couldn’t reach public DNS: ${error.message}`;
+      toast(error.message);
     }
     target.disabled = false;
   },
-  'force-active': () => updateZone((zone) => { zone.status = 'active'; }, 'Marked active (preview only)'),
-  'purge-all': (target) => {
-    if (!confirmed(target, 'Purge every cached file for this site?')) return;
-    updateZone((zone) => { zone.caching.lastPurge = new Date().toISOString(); }, 'Purge requested for all files');
+  'site-cdn-off': async (target) => {
+    if (!confirmed(target, 'Turn off the CDN? Traffic goes straight to your server again.')) return;
+    target.disabled = true;
+    try {
+      sites.detail = { ...sites.detail, ...(await domainsApi(`/domains/sites/${encodeURIComponent(currentRoute.zone)}/cdn`, { method: 'PUT', body: JSON.stringify({ mode: 'off' }) })).site };
+      toast('Turning the CDN off');
+      loadSite(currentRoute.zone);
+    } catch (error) {
+      target.disabled = false;
+      toast(error.message);
+    }
   },
-  'delete-zone': (target) => {
-    const zone = currentZone();
-    if (!confirmed(target, `Remove ${zone.name} from Lyrcloud? DNS records and settings will be deleted.`)) return;
-    state.zones = state.zones.filter((item) => item.id !== zone.id);
-    for (const worker of state.workers) worker.routes = worker.routes.filter((pattern) => !pattern.startsWith(`${zone.name}/`));
-    save();
-    toast(`${zone.name} removed`);
-    go('#/');
+  'delete-zone': async (target) => {
+    const name = currentRoute.zone;
+    if (!confirmed(target, `Remove ${name} from Lyrcloud? Its DNS zone and records are deleted. Change its nameservers away from Lyrcloud first.`)) return;
+    target.disabled = true;
+    try {
+      await domainsApi(`/domains/sites/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      sites.list = sites.list?.filter((site) => site.domain !== name) || null;
+      sites.detail = null;
+      toast(`${name} removed`);
+      go('#/');
+    } catch (error) {
+      target.disabled = false;
+      toast(error.message);
+    }
   },
-  'toggle-proxy': (target) =>
-    updateZone((zone) => {
-      const record = zone.dns.find((item) => item.id === target.dataset.id);
-      record.proxied = !record.proxied;
-    }),
-  'delete-record': (target) => updateZone((zone) => { zone.dns = zone.dns.filter((item) => item.id !== target.dataset.id); }, 'Record deleted'),
-  'delete-rule': (target) => updateZone((zone) => { zone.security.rules = zone.security.rules.filter((rule) => rule.id !== target.dataset.id); }, 'Rule deleted'),
   'new-worker': () => {
     const name = prompt('Function name (lowercase letters, numbers, dashes)', `function-${state.workers.length + 1}`);
     if (!name) return;
@@ -2880,9 +2724,8 @@ const clickActions = {
   },
   'set-account-plan': (target) => {
     target.disabled = true;
-    setAccountPlan(target.dataset.plan, document.getElementById('plan-apply-sites')?.checked ?? false);
+    setAccountPlan(target.dataset.plan);
   },
-  'zone-upgrade': () => updateZone((zone) => { zone.plan = 'scale'; zone.security.managedWaf = true; }, 'Upgraded this site to Scale: managed WAF rules are on'),
   'admin-refresh': () => {
     adminDomains.data = null;
     adminDomains.error = '';
@@ -3015,8 +2858,7 @@ const clickActions = {
     endSession();
   },
   reset: (target) => {
-    if (!confirmed(target, 'Delete all websites and functions stored in this browser?')) return;
-    state.zones = [];
+    if (!confirmed(target, 'Delete the preview functions stored in this browser?')) return;
     state.workers = [];
     save();
     go('#/');
@@ -3044,26 +2886,7 @@ const changeActions = {
     }
   },
   'pick-zone': (target) => go(target.value ? `#/zones/${encodeURIComponent(target.value)}/overview` : '#/'),
-  'under-attack': (target) => updateZone((zone) => { zone.security.underAttack = target.checked; }, `Under Attack mode ${target.checked ? 'on' : 'off'}`),
-  'dev-mode': (target) => updateZone((zone) => { zone.caching.devMode = target.checked; }, `Development mode ${target.checked ? 'on' : 'off'}`),
-  'bot-fight': (target) => updateZone((zone) => { zone.security.botFight = target.checked; }, 'Bot fight mode updated'),
-  'managed-waf': (target) => updateZone((zone) => { zone.security.managedWaf = target.checked; }, 'Managed rules updated'),
-  'toggle-rule': (target) =>
-    updateZone((zone) => {
-      zone.security.rules.find((rule) => rule.id === target.dataset.id).enabled = target.checked;
-    }, 'Rule updated'),
-  'ssl-mode': (target) => updateZone((zone) => { zone.ssl.mode = target.value; }, 'Encryption mode updated'),
-  'always-https': (target) => updateZone((zone) => { zone.ssl.alwaysHttps = target.checked; }, 'Saved'),
-  hsts: (target) => updateZone((zone) => { zone.ssl.hsts = target.checked; }, 'Saved'),
-  'min-tls': (target) => updateZone((zone) => { zone.ssl.minTls = target.value; }, `Minimum TLS set to ${target.value}`),
-  'cache-level': (target) => updateZone((zone) => { zone.caching.level = target.value; }, 'Caching level updated'),
-  'browser-ttl': (target) => updateZone((zone) => { zone.caching.browserTtl = target.value; }, 'Browser cache TTL updated'),
-  'account-plan': (target) => setAccountPlan(target.value, false),
-  'zone-plan': (target) =>
-    updateZone((zone) => {
-      zone.plan = target.value;
-      zone.security.managedWaf = target.value !== 'launch';
-    }, `This site is now on the ${planName(target.value)} plan`),
+  'account-plan': (target) => setAccountPlan(target.value),
   'admin-role-filter': (target) => {
     adminFilter.role = target.value;
     render();
@@ -3074,14 +2897,6 @@ const showFormError = (form, message) => {
   const node = form.querySelector('.form-error') || form.parentElement.querySelector('.form-error');
   node.textContent = message;
   node.hidden = false;
-};
-
-const RECORD_VALIDATORS = {
-  A: [/^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/, 'Enter a valid IPv4 address.'],
-  AAAA: [/^[0-9a-f:]+$/i, 'Enter a valid IPv6 address.'],
-  CNAME: [DOMAIN_RE, 'Enter a valid hostname.'],
-  MX: [/^\d{1,5}\s+\S+$/, 'Use "priority hostname", e.g. "10 mail.example.com".'],
-  TXT: [/^.{1,2048}$/s, 'TXT content is required.'],
 };
 
 const formActions = {
@@ -3182,52 +2997,46 @@ const formActions = {
   'add-domain': async (form, data) => {
     const domain = String(data.get('domain')).trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/^www\./, '');
     if (!DOMAIN_RE.test(domain)) return showFormError(form, 'Enter a valid domain like example.com.');
-    if (findZone(domain)) return showFormError(form, `${domain} is already in your account.`);
-    go(`#/add-site?step=plan&domain=${encodeURIComponent(domain)}`);
-  },
-  'choose-plan': async (form, data) => {
-    const domain = String(data.get('domain'));
-    if (!DOMAIN_RE.test(domain) || findZone(domain)) return go('#/add-site');
     const button = form.querySelector('[type="submit"]');
     button.disabled = true;
-    button.textContent = 'Scanning DNS records…';
-    let records = [];
+    button.textContent = 'Copying DNS records…';
     try {
-      records = await scanRecords(domain);
-    } catch {}
-    state.zones.push(createZone(domain, String(data.get('plan')), records));
-    save();
-    toast(records.length ? `Imported ${records.length} DNS records` : 'No existing DNS records found');
-    go(`#/zones/${encodeURIComponent(domain)}/overview`);
-  },
-  'add-record': (form, data) => {
-    const zone = currentZone();
-    const type = String(data.get('type'));
-    const rawName = String(data.get('name')).trim().toLowerCase();
-    const name = rawName === '@' || rawName === zone.name ? zone.name : `${rawName.replace(new RegExp(`\\.${zone.name.replace(/\./g, '\\.')}$`), '')}.${zone.name}`;
-    const content = String(data.get('content')).trim();
-    if (!DOMAIN_RE.test(name)) return showFormError(form, 'Enter a valid record name.');
-    const [pattern, message] = RECORD_VALIDATORS[type];
-    if (!pattern.test(content)) return showFormError(form, message);
-    if (type === 'CNAME' && zone.dns.some((record) => record.name === name)) return showFormError(form, 'A CNAME cannot share a name with other records.');
-    updateZone((item) => {
-      item.dns.push({ id: uid(), type, name, content, ttl: 'auto', proxied: ['A', 'AAAA', 'CNAME'].includes(type) && data.get('proxied') === 'on' });
-    }, `${type} record added`);
-  },
-  'add-rule': (form, data) =>
-    updateZone((zone) => {
-      zone.security.rules.push({ id: uid(), name: String(data.get('name')).trim(), expression: String(data.get('expression')).trim(), action: String(data.get('action')), enabled: true });
-    }, 'Rule added'),
-  'purge-urls': (form, data) => {
-    const zone = currentZone();
-    let url;
-    try {
-      url = new URL(String(data.get('urls')).trim());
-    } catch {
-      return toast('Enter a full URL including https://');
+      const { site } = await domainsApi('/domains/sites', { method: 'POST', body: JSON.stringify({ domain }) });
+      sites.list = [...(sites.list || []).filter((item) => item.domain !== site.domain), site];
+      toast(`${site.domain} added`);
+      go(`#/zones/${encodeURIComponent(site.domain)}/overview`);
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = 'Add site';
+      showFormError(form, error.message);
     }
-    if (url.hostname !== zone.name && !url.hostname.endsWith(`.${zone.name}`)) return toast(`URL must be on ${zone.name}`);
-    updateZone((item) => { item.caching.lastPurge = new Date().toISOString(); }, `Purge requested for ${url.pathname}`);
+  },
+  'site-cdn': async (form, data) => {
+    const mode = String(data.get('mode') || 'proxy');
+    const body = mode === 'function' ? { mode, fn: String(data.get('fn') || '').trim() } : { mode, origin: String(data.get('origin') || '').trim() };
+    const button = form.querySelector('[type="submit"]');
+    button.disabled = true;
+    try {
+      sites.detail = { ...sites.detail, ...(await domainsApi(`/domains/sites/${encodeURIComponent(currentRoute.zone)}/cdn`, { method: 'PUT', body: JSON.stringify(body) })).site };
+      toast(sites.detail.cdn?.status === 'live' ? 'Origin saved' : 'Turning on the CDN');
+      loadSite(currentRoute.zone);
+    } catch (error) {
+      button.disabled = false;
+      showFormError(form, error.message);
+    }
+  },
+  'purge-urls': async (form, data) => {
+    const paths = String(data.get('paths') || '').split(/[\s,]+/).map((p) => p.trim()).filter(Boolean)
+      .map((p) => { try { return p.startsWith('http') ? new URL(p).pathname : p; } catch { return p; } })
+      .map((p) => (p.startsWith('/') ? p : `/${p}`));
+    if (!paths.length) return toast('Enter one or more paths, like /styles.css');
+    try {
+      await domainsApi(`/domains/sites/${encodeURIComponent(currentRoute.zone)}/purge`, { method: 'POST', body: JSON.stringify({ paths }) });
+      toast(`Purging ${paths.length} path${paths.length === 1 ? '' : 's'}`);
+      form.reset();
+    } catch (error) {
+      toast(error.message);
+    }
   },
   'add-route': (form, data) => {
     const worker = findWorker(form.dataset.id);

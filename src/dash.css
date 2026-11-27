@@ -1859,3 +1859,38 @@ a.stat:hover {
   font-weight: 650;
   white-space: nowrap;
 }
+
+/* Sites: CDN progress */
+.steps {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.steps li {
+  position: relative;
+  padding-left: 28px;
+  color: var(--muted);
+}
+.steps li::before {
+  content: '○';
+  position: absolute;
+  left: 4px;
+}
+.steps li.current {
+  color: var(--warn-ink);
+  font-weight: 600;
+}
+.steps li.current::before {
+  content: '◌';
+}
+.steps li.done {
+  color: var(--success);
+}
+.steps li.done::before {
+  content: '●';
+}
+.zone-row .status + .status {
+  margin-left: 8px;
+}
