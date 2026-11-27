@@ -5,8 +5,8 @@
 //   export default { fetch(request, env, ctx) { return new Response('hi'); } }
 //
 // (or a bare function), hands it a standard Request and turns the Response it returns back into an
-// API Gateway result. `env` holds the function's variables (LYR_VARS) and storage bindings (LYR_BINDINGS:
-// KV namespaces and object buckets, which call the platform function with this function's token), and
+// API Gateway result. `env` holds the function's variables (LYR_VARS) and bindings (LYR_BINDINGS: KV
+// namespaces, object buckets and the AI Gateway, which call the platform function with this function's token), and
 // nothing from Lambda's own environment. ctx.waitUntil(promise) work finishes before the invocation ends.
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -116,11 +116,33 @@ export class Bucket {
   }
 }
 
+// env.AI: chat models and embeddings through the Lyrcloud AI Gateway.
+//   await env.AI.run('claude-haiku-4.5', { prompt: 'Hi' })   -> { response, usage, model, cached }
+//   await env.AI.run('claude-sonnet-4.6', { messages, system, max_tokens }, { cache: 3600 })
+//   await env.AI.embed('titan-embed-v2', ['text', ...])      -> { data: [[...]], dimensions }
+export class AI {
+  #call;
+  constructor(call) {
+    this.#call = call;
+  }
+  run(model, input, options = {}) {
+    if (typeof model === 'object' && model !== null) return this.#call({ op: 'ai.run', model: undefined, input: model, options: input || {} });
+    return this.#call({ op: 'ai.run', model, input, options });
+  }
+  embed(model, input, options = {}) {
+    if (Array.isArray(model) || (typeof model === 'string' && input === undefined)) return this.#call({ op: 'ai.embed', model: undefined, input: model, options: {} });
+    return this.#call({ op: 'ai.embed', model, input, options });
+  }
+  models() {
+    return this.#call({ op: 'ai.models' });
+  }
+}
+
 // Builds `env`: the variables plus one binding object per entry in `bindings` ([{ binding, type, name }]).
 export function makeEnv(vars, bindings, call) {
   const env = { ...vars };
   for (const { binding, type, name } of bindings || []) {
-    env[binding] = type === 'kv' ? new KVNamespace(name, call) : new Bucket(name, call);
+    env[binding] = type === 'kv' ? new KVNamespace(name, call) : type === 'ai' ? new AI(call) : new Bucket(name, call);
   }
   return Object.freeze(env);
 }

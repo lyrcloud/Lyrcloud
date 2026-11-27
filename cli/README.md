@@ -48,6 +48,18 @@ await env.FILES.list({ prefix: 'notes/' }); // { objects, truncated, cursor }
 
 Values can be up to 256 KB and files up to 4 MB. `lyrcloud dev` keeps the data in `.lyrcloud/storage/`. From the terminal: `lyrcloud kv list|get|put|delete <ns>`, `lyrcloud bucket list|put|get|delete <bucket>`, and `lyrcloud storage`.
 
+## AI
+
+Add `"ai": "AI"` to `lyrcloud.json`:
+
+```js
+const { response, usage } = await env.AI.run('claude-haiku-4.5', { prompt: 'Hi', max_tokens: 200 });
+await env.AI.run('claude-sonnet-4.6', { system, messages }, { cache: 3600, fallback: 'nova-lite' });
+const { data } = await env.AI.embed(['text one', 'text two'], { dimensions: 256 });
+```
+
+`lyrcloud ai models` lists the models your plan includes, `lyrcloud ai run "prompt"` asks one, and `lyrcloud ai usage` shows this month's tokens. In `lyrcloud dev`, AI calls go to the real gateway on your account.
+
 ## lyrcloud.json
 
 ```json
@@ -57,6 +69,7 @@ Values can be up to 256 KB and files up to 4 MB. `lyrcloud dev` keeps the data i
   "vars": { "GREETING": "Hello" },
   "kv": { "CACHE": "cache" },
   "buckets": { "FILES": "uploads" },
+  "ai": "AI",
   "exclude": ["fixtures"]
 }
 ```

@@ -5,13 +5,23 @@ import { createServer } from 'node:http';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { loadProject } from './project.mjs';
+import { api } from './api.mjs';
 import { bindingsOf, localStorage } from './local-storage.mjs';
 import { makeEnv, run } from './runtime.mjs';
 
 const [root, portText] = process.argv.slice(2);
 const { config } = loadProject(root);
-// KV namespaces and buckets are kept in .lyrcloud/storage/ while developing.
-const env = makeEnv(config.vars || {}, bindingsOf(config), localStorage(root));
+// KV namespaces and buckets are kept in .lyrcloud/storage/ while developing. AI calls go to the real
+// Lyrcloud AI Gateway as you (there's no local model), and count against your plan.
+const local = localStorage(root);
+const call = (request) => {
+  if (request.op === 'ai.models') return api('GET', '/ai/models').then((out) => out.models);
+  if (request.op === 'ai.run' || request.op === 'ai.embed') {
+    return api('POST', request.op === 'ai.run' ? '/ai/run' : '/ai/embed', { body: { model: request.model, input: request.input, options: request.options } });
+  }
+  return local(request);
+};
+const env = makeEnv(config.vars || {}, bindingsOf(config), call);
 
 let mod;
 let loadError = null;

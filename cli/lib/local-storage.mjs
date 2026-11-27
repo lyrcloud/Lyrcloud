@@ -135,9 +135,10 @@ export function localStorage(root) {
   };
 }
 
-// lyrcloud.json "kv" / "buckets" maps -> [{ binding, type, name }].
+// lyrcloud.json "ai" / "kv" / "buckets" -> [{ binding, type, name }].
 export function bindingsOf(config) {
   const out = [];
+  if (typeof config.ai === 'string') out.push({ binding: config.ai, type: 'ai', name: 'ai' });
   for (const [binding, name] of Object.entries(config.kv || {})) out.push({ binding, type: 'kv', name });
   for (const [binding, name] of Object.entries(config.buckets || {})) out.push({ binding, type: 'bucket', name });
   return out;

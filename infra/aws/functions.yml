@@ -122,8 +122,20 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:Query]
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:UpdateItem]
                 Resource: !GetAtt DataTable.Arn
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${UsersTableName}'
+              # AI Gateway: only the catalog in api/functions/ai.mjs (US inference profiles route to any US region).
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.amazon.nova-*'
+                  - 'arn:aws:bedrock:*::foundation-model/anthropic.claude-*'
+                  - 'arn:aws:bedrock:*::foundation-model/amazon.nova-*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0'
               - Effect: Allow
                 Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
                 Resource: !Sub '${ObjectsBucket.Arn}/*'
@@ -144,12 +156,13 @@ Resources:
       Handler: functions/platform.handler
       Role: !GetAtt PlatformRole.Arn
       MemorySize: 512
-      Timeout: 15
+      Timeout: 60 # AI calls can take a while; functions themselves stop at 25 s
       Environment:
         Variables:
           DATA_TABLE_NAME: !Ref DataTable
           OBJECTS_BUCKET: !Ref ObjectsBucket
           PLATFORM_SECRET_NAME: !Ref PlatformSecret
+          USERS_TABLE_NAME: !Ref UsersTableName
       Code:
         S3Bucket: !Ref ArtifactsBucketName
         S3Key: !Ref LambdaCodeS3Key
@@ -244,7 +257,7 @@ Resources:
                   - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${LyrCaSecretName}-*'
                   - !Ref PlatformSecret
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:Query]
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:UpdateItem]
                 Resource: !GetAtt DataTable.Arn
               - Effect: Allow
                 Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
@@ -252,6 +265,15 @@ Resources:
               - Effect: Allow
                 Action: s3:ListBucket
                 Resource: !GetAtt ObjectsBucket.Arn
+              # AI Gateway: only the catalog in api/functions/ai.mjs (US inference profiles route to any US region).
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.amazon.nova-*'
+                  - 'arn:aws:bedrock:*::foundation-model/anthropic.claude-*'
+                  - 'arn:aws:bedrock:*::foundation-model/amazon.nova-*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0'
 
   ApiFunction:
     Type: AWS::Lambda::Function
@@ -287,7 +309,7 @@ Resources:
       ProtocolType: HTTP
       CorsConfiguration:
         AllowOrigins: !Ref AllowedOrigins
-        AllowMethods: [GET, PUT, DELETE, OPTIONS]
+        AllowMethods: [GET, PUT, POST, DELETE, OPTIONS]
         AllowHeaders: [Authorization, Content-Type]
 
   JwtAuthorizer:
@@ -334,6 +356,12 @@ Resources:
   StorageDeleteRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties: { ApiId: !Ref ControlApi, RouteKey: 'DELETE /storage/{proxy+}', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  AiGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref ControlApi, RouteKey: 'GET /ai/{proxy+}', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  AiPostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref ControlApi, RouteKey: 'POST /ai/{proxy+}', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
   AdminRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties: { ApiId: !Ref ControlApi, RouteKey: 'GET /admin/{proxy+}', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }

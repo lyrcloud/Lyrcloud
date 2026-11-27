@@ -42,6 +42,11 @@ ${bold('Storage')}
   bucket get <bucket> <key> [--out path]   Download a file
   bucket delete <bucket> <key>             Delete a file
 
+${bold('AI')}
+  ai models                        Models you can use on your plan
+  ai run [model] "<prompt>" [--system s] [--max-tokens n]   Ask a model
+  ai usage [--month YYYY-MM]       Tokens used this month, by model
+
 ${bold('Options')}
   -h, --help               Show help
   -v, --version            Show the version
@@ -54,7 +59,7 @@ function parseArgs(argv) {
   const positional = [];
   const flags = {};
   const aliases = { f: 'follow', y: 'yes', p: 'port', h: 'help', v: 'version', n: 'name' };
-  const valued = new Set(['port', 'since', 'name', 'prefix', 'ttl', 'file', 'out', 'type']);
+  const valued = new Set(['port', 'since', 'name', 'prefix', 'ttl', 'file', 'out', 'type', 'system', 'max-tokens', 'month']);
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--') {
@@ -217,7 +222,7 @@ async function deploy(_, flags) {
   }
   console.log(dim(`Uploading ${files.length} file${files.length === 1 ? '' : 's'} (${formatBytes(projectSize(files))}, ${formatBytes(zip.length)} zipped)…`));
   const started = Date.now();
-  const { function: fn } = await api('PUT', `/functions/${name}`, { body: { code: zip.toString('base64'), main: config.main, vars: config.vars || {}, kv: config.kv, buckets: config.buckets } });
+  const { function: fn } = await api('PUT', `/functions/${name}`, { body: { code: zip.toString('base64'), main: config.main, vars: config.vars || {}, kv: config.kv, buckets: config.buckets, ai: config.ai } });
   ok(`Deployed ${bold(name)} ${dim(`in ${((Date.now() - started) / 1000).toFixed(1)}s`)}`);
   console.log(`  ${cyan(fn.url)}`);
   if (fn.deploys === 1) {
@@ -414,7 +419,38 @@ async function bucketCommand([action, bucket, key, file], flags) {
   throw new UsageError(`Usage: lyrcloud ${usage}`);
 }
 
-const COMMANDS = { login, logout, whoami, init, dev, deploy, list, ls: list, logs, tail: logs, delete: remove, rm: remove, storage, kv: kvCommand, bucket: bucketCommand, buckets: bucketCommand };
+// ---------------------------------------------------------------- AI
+
+async function aiCommand([action, ...rest], flags) {
+  if (action === 'models') {
+    const { models, plan } = await api('GET', '/ai/models');
+    table(models.map((m) => [m.name, m.kind, m.available ? m.note : `${m.note} ${dim('(not on your plan)')}`]), ['MODEL', 'KIND', '']);
+    console.log(dim(`\nYou’re on the ${plan} plan. Use a model with env.AI.run('<model>', { prompt }) or lyrcloud ai run.`));
+    return;
+  }
+  if (action === 'usage') {
+    const usage = await api('GET', '/ai/usage', { query: { month: flags.month } });
+    if (!usage.models.length) console.log(dim(`No AI use in ${usage.month}.`));
+    else table(usage.models.map((m) => [m.model, m.requests, m.inputTokens.toLocaleString('en-US'), m.outputTokens.toLocaleString('en-US'), m.cachedRequests]), ['MODEL', 'REQUESTS', 'INPUT TOKENS', 'OUTPUT TOKENS', 'CACHED']);
+    const pct = Math.min(100, Math.round((usage.weightedTokens / usage.limits.monthlyTokens) * 100));
+    console.log(dim(`\n${usage.weightedTokens.toLocaleString('en-US')} of ${usage.limits.monthlyTokens.toLocaleString('en-US')} plan tokens used in ${usage.month} (${pct}%), up to ${usage.limits.perMinute} requests a minute.`));
+    return;
+  }
+  if (action === 'run') {
+    const [model, prompt] = rest.length > 1 ? rest : [undefined, rest[0]];
+    if (!prompt) throw new UsageError('Usage: lyrcloud ai run [model] "<prompt>"');
+    const input = { prompt };
+    if (typeof flags.system === 'string') input.system = flags.system;
+    if (flags['max-tokens'] !== undefined) input.max_tokens = Number(flags['max-tokens']);
+    const out = await api('POST', '/ai/run', { body: { model, input } });
+    console.log(out.response);
+    console.error(dim(`\n${out.model} · ${out.usage.input_tokens} in / ${out.usage.output_tokens} out${out.cached ? ' · cached' : ''}`));
+    return;
+  }
+  throw new UsageError('Usage: lyrcloud ai models | run [model] "<prompt>" | usage');
+}
+
+const COMMANDS = { login, logout, whoami, init, dev, deploy, list, ls: list, logs, tail: logs, delete: remove, rm: remove, storage, kv: kvCommand, bucket: bucketCommand, buckets: bucketCommand, ai: aiCommand };
 
 // ---------------------------------------------------------------- main
 

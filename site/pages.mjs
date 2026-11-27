@@ -363,6 +363,7 @@ const cliCommands = [
   ['lyrcloud kv list|get|put|delete <ns>', 'Read and write a KV namespace your functions use.'],
   ['lyrcloud bucket list|put|get|delete <bucket>', 'Upload, download and list files in a bucket.'],
   ['lyrcloud storage', 'List the namespaces and buckets your functions bind.'],
+  ['lyrcloud ai models | run | usage', 'See the models on your plan, ask one from the terminal, and check this month’s tokens.'],
 ];
 
 const developersPage = {
@@ -435,6 +436,22 @@ return new Response(file.body, {
   headers: { 'content-type': file.httpMetadata.contentType },
 });`)}</code></pre>
         </div>
+      </section>
+
+      <section id="ai" class="section">
+        <div class="section-heading compact">
+          <span class="eyebrow">AI</span>
+          <h2>AI models in your functions</h2>
+          <p>Add <code class="inline">"ai": "AI"</code> to <code class="inline">lyrcloud.json</code>. Run <code class="inline">lyrcloud ai models</code> to see what your plan includes.</p>
+        </div>
+        <pre class="snippet"><code>${escape(`const answer = await env.AI.run('claude-sonnet-4.6', {
+  system: 'You are a helpful support agent.',
+  messages: [{ role: 'user', content: 'Where is my order?' }],
+  max_tokens: 300,
+}, { cache: 600, fallback: ['claude-haiku-4.5', 'nova-lite'] });
+// { response, usage: { input_tokens, output_tokens }, model, cached }
+
+const { data } = await env.AI.embed(['first text', 'second text']);`)}</code></pre>
       </section>
 
       <section id="cli" class="section">

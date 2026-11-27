@@ -91,20 +91,26 @@ lyrcloud access policy add grafana.corp.example.com --allow group:sre`,
     icon: '🤖',
     name: 'AI Gateway & Inference',
     group: 'Developer platform',
-    tagline: 'Build and run AI apps on a global network.',
-    summary: 'Run open models on edge GPUs, route requests across providers, and add caching, rate limits, and observability to every AI call.',
+    tagline: 'Call AI models from your functions with one line.',
+    summary: 'env.AI gives your edge functions chat models and embeddings, with fallbacks, response caching, per-plan limits and usage by model. Models run on Amazon Bedrock.',
     features: [
-      ['Edge inference', 'Serve popular open models for text, embeddings, and images from GPUs near users.'],
-      ['AI gateway', 'One endpoint for multiple model providers with fallbacks and retries.'],
-      ['Prompt caching', 'Cache identical requests at the edge to cut latency and spend.'],
-      ['Vector search', 'Store embeddings and run similarity search beside your functions.'],
-      ['Usage analytics', 'Tokens, cost, and latency per model, per app, per user.'],
-      ['Guardrails', 'Filter prompts and responses with configurable safety policies.'],
+      ['One line to a model', '<code>env.AI.run(model, { prompt })</code> or a full conversation with <code>messages</code> and <code>system</code>.'],
+      ['Fallbacks', 'Pass <code>{ fallback: \'nova-lite\' }</code> and the gateway tries the next model when one is busy or unavailable.'],
+      ['Response caching', 'Pass <code>{ cache: 3600 }</code> and identical requests are answered from cache, free and in milliseconds.'],
+      ['Embeddings', '<code>env.AI.embed(texts)</code> returns Titan vectors in 256, 512 or 1024 dimensions.'],
+      ['Usage by model', '<code>lyrcloud ai usage</code> shows requests and tokens per model, against your plan’s monthly budget.'],
+      ['Guardrails & vector search', 'Coming soon.'],
     ],
-    code: `const answer = await env.AI.run('text-model', {
-  messages: [{ role: 'user', content: 'Summarize this page' }],
-});
-return Response.json(answer);`,
+    code: `// lyrcloud.json: "ai": "AI"
+export default {
+  async fetch(request, env) {
+    const { response } = await env.AI.run('claude-haiku-4.5', {
+      prompt: 'Summarize edge computing in one line.',
+      max_tokens: 100,
+    }, { cache: 3600, fallback: 'nova-lite' });
+    return new Response(response);
+  },
+};`,
   },
   {
     slug: 'storage',

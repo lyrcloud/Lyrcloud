@@ -38,8 +38,14 @@ const BINDING_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 
 // lyrcloud.json "kv": { BINDING: "namespace" } and "buckets": { BINDING: "bucket" } ->
 // [{ binding, type, name }], or a problem. `vars` names can't be reused.
-export function cleanBindings({ kv, buckets } = {}, vars = {}) {
+export function cleanBindings({ kv, buckets, ai } = {}, vars = {}) {
   const out = [];
+  // "ai": "AI" puts the AI Gateway on env.AI.
+  if (ai !== undefined && ai !== null) {
+    if (typeof ai !== 'string' || !BINDING_RE.test(ai)) return [null, '"ai" must be a binding name, such as "AI".'];
+    if (ai in vars) return [null, `${ai} is used twice. Each binding and variable needs its own name.`];
+    out.push({ binding: ai, type: 'ai', name: 'ai' });
+  }
   for (const [type, map] of [['kv', kv], ['bucket', buckets]]) {
     if (map === undefined || map === null) continue;
     if (typeof map !== 'object' || Array.isArray(map)) return [null, `"${type === 'kv' ? 'kv' : 'buckets'}" must map binding names to ${type === 'kv' ? 'namespace' : 'bucket'} names.`];

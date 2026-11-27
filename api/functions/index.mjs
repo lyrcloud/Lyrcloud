@@ -17,6 +17,12 @@
 //   GET    /storage/buckets/{b}/objects          ?prefix=&cursor=&delimiter=  list objects
 //   GET|PUT|DELETE /storage/buckets/{b}/objects/{key}  { body: base64, contentType? }
 //
+// AI Gateway (also env.AI in functions):
+//   GET  /ai/models                 the catalog, marked with what your plan allows
+//   GET  /ai/usage                  ?month=YYYY-MM  tokens by model, and your plan's budget
+//   POST /ai/run                    { model?, input: { prompt | messages, system?, max_tokens? }, options?: { cache? } }
+//   POST /ai/embed                  { model?, input: text | [texts], options?: { dimensions? } }
+//
 // A daily EventBridge rule sends { task: 'renew-certificate' } to keep the *.dev.lyr certificate fresh.
 import { generateKeyPairSync } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -60,7 +66,8 @@ import {
   RUNTIME_ENTRY,
   RUNTIME_HANDLER,
 } from './rules.mjs';
-import { platformSecret } from './platform.mjs';
+import { aiLimitsFor, listModels, usageOf } from './ai.mjs';
+import { performAny, platformSecret } from './platform.mjs';
 import { cleanBindings, perform, signToken, StorageError } from './storage.mjs';
 import { addZipEntry, listZip, ZipError } from './zip.mjs';
 
@@ -75,7 +82,7 @@ const PLATFORM_FUNCTION = env.PLATFORM_FUNCTION;
 const LYR_CA_SECRET_NAME = env.LYR_CA_SECRET_NAME;
 const SUPER_ADMIN_EMAIL = env.SUPER_ADMIN_EMAIL || 'lyrclouds@gmail.com';
 const FUNCTION_MEMORY = Number(env.FUNCTION_MEMORY_MB || 256);
-const FUNCTION_TIMEOUT = Number(env.FUNCTION_TIMEOUT_SECONDS || 15);
+const FUNCTION_TIMEOUT = Number(env.FUNCTION_TIMEOUT_SECONDS || 25); // under API Gateway's 30 s, room for AI calls
 
 export const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), { marshallOptions: { removeUndefinedValues: true } });
 export const lambda = new LambdaClient({});
@@ -348,7 +355,7 @@ async function deploy(event, name, who) {
   if (mainProblem) return error(400, mainProblem);
   const [vars, varsProblem] = cleanVars(body.vars);
   if (varsProblem) return error(400, varsProblem);
-  const [bindings, bindingsProblem] = cleanBindings({ kv: body.kv, buckets: body.buckets }, vars);
+  const [bindings, bindingsProblem] = cleanBindings({ kv: body.kv, buckets: body.buckets, ai: body.ai }, vars);
   if (bindingsProblem) return error(400, bindingsProblem);
   if (typeof body.code !== 'string' || !body.code) return error(400, 'Send the code as a base64 zip in "code".');
   const code = Buffer.from(body.code, 'base64');
@@ -458,7 +465,10 @@ async function storageRoutes(event, method, who) {
     const kv = new Set();
     const buckets = new Set();
     for (const fn of await functionsOf(who.userId)) {
-      for (const binding of fn.bindings || []) (binding.type === 'kv' ? kv : buckets).add(binding.name);
+      for (const binding of fn.bindings || []) {
+        if (binding.type === 'kv') kv.add(binding.name);
+        else if (binding.type === 'bucket') buckets.add(binding.name);
+      }
     }
     return json(200, { kv: [...kv].sort(), buckets: [...buckets].sort() });
   }
@@ -491,6 +501,21 @@ async function storageRoutes(event, method, who) {
       return json(200, await call({ op: 'object.put', key, value: body.body, options: { contentType: body.contentType } }));
     }
     if (key && method === 'DELETE') return json(200, await call({ op: 'object.delete', key }));
+  }
+  return error(404, 'not_found');
+}
+
+async function aiRoutes(event, method, path, who) {
+  if (path === '/ai/models' && method === 'GET') return json(200, { models: listModels(who.plan), plan: who.plan });
+  if (path === '/ai/usage' && method === 'GET') {
+    const when = event.queryStringParameters?.month;
+    if (when && !/^\d{4}-\d{2}$/.test(when)) return error(400, 'Use month=YYYY-MM.');
+    return json(200, { ...(await usageOf(who.userId, when || undefined)), plan: who.plan, limits: aiLimitsFor(who.plan) });
+  }
+  if ((path === '/ai/run' || path === '/ai/embed') && method === 'POST') {
+    const body = parseJson(event);
+    if (!body) return error(400, 'Invalid JSON body.');
+    return json(200, await performAny(who.userId, { op: path === '/ai/run' ? 'ai.run' : 'ai.embed', model: body.model, input: body.input, options: body.options || {} }));
   }
   return error(404, 'not_found');
 }
@@ -530,6 +555,7 @@ export const handler = async (event) => {
     if (path.startsWith('/admin/')) return await adminRoutes(method, path, who);
     if (path === '/functions' || path.startsWith('/functions/')) return await functionRoutes(event, method, path, who);
     if (path === '/storage' || path.startsWith('/storage/')) return await storageRoutes(event, method, who);
+    if (path.startsWith('/ai/')) return await aiRoutes(event, method, path, who);
     return error(404, 'not_found');
   } catch (err) {
     console.error('Functions API failed', err);

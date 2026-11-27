@@ -254,12 +254,12 @@ test('unsigned callers are turned away', async () => {
 
 test('deploying with storage bindings gives the function a token for its owner', async () => {
   const { readToken } = await import('./storage.mjs');
-  const res = parse(await call('PUT', '/functions/stored', { body: { code: code(), kv: { CACHE: 'cache' }, buckets: { FILES: 'uploads' } } }));
+  const res = parse(await call('PUT', '/functions/stored', { body: { code: code(), kv: { CACHE: 'cache' }, buckets: { FILES: 'uploads' }, ai: 'AI' } }));
   assert.equal(res.status, 200, res.error);
-  assert.deepEqual(res.function.bindings.map((b) => b.binding), ['CACHE', 'FILES']);
+  assert.deepEqual(res.function.bindings.map((b) => b.binding), ['AI', 'CACHE', 'FILES']);
   const fnEnv = lambdas.get('lyrfn-stored').env;
   assert.equal(fnEnv.LYR_PLATFORM, 'lyrcloud-functions-platform');
-  assert.deepEqual(JSON.parse(fnEnv.LYR_BINDINGS), [{ binding: 'CACHE', type: 'kv', name: 'cache' }, { binding: 'FILES', type: 'bucket', name: 'uploads' }]);
+  assert.deepEqual(JSON.parse(fnEnv.LYR_BINDINGS), [{ binding: 'AI', type: 'ai', name: 'ai' }, { binding: 'CACHE', type: 'kv', name: 'cache' }, { binding: 'FILES', type: 'bucket', name: 'uploads' }]);
   assert.deepEqual(readToken('test-secret', fnEnv.LYR_TOKEN), { fn: 'stored', owner: 'u1' });
   assert.match(parse(await call('PUT', '/functions/bad', { body: { code: code(), kv: { 'no good': 'x' } } })).error, /valid binding/);
   const storage = parse(await call('GET', '/storage'));
