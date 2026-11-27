@@ -158,7 +158,7 @@ function dnaAnswer(method, path, body, query) {
   const held = (domain) => state.held[domain];
   switch (`${method} ${path}`) {
     case 'GET deposit/accounts/me':
-      return { body: { resellerGroupName: 'Reseller', usdBalance: 500 } };
+      return { body: { resellerGroupName: 'Reseller', usdBalance: state.usdBalance ?? 500 } };
     case 'GET products/tlds':
       return { body: { totalCount: 5, items: [catalogueEntry('com', 16), catalogueEntry('io', 71), catalogueEntry('net', 17), catalogueEntry('ninja', 30), catalogueEntry('org', 15, { attributes: [{ key: 'X', isRequired: true, type: 'Text' }] })] } };
     case 'POST domains/search':
@@ -506,6 +506,18 @@ test('an empty DNA balance refunds the customer without telling them about Lyrcl
   assert.equal(called(REGISTER)[0][3], 'live');
   assert.equal(stripeCalls.filter((item) => item.path === '/refunds').length, 1);
   assert.doesNotMatch(domainItem('wonder.com').failureReason, /balance/i);
+});
+
+test('checkout refuses before charging anyone when the live DNA balance can’t cover the order', async () => {
+  await connectStripe('sk_live_1234567890abcdef');
+  registrarState.usdBalance = 0;
+  const refused = await call(ALICE, 'POST', '/domains/checkout', { action: 'register', domain: 'wonder.com', contact: CONTACT });
+  assert.equal(refused.status, 503);
+  assert.match(refused.body.error, /Nothing was charged/);
+  assert.equal(stripeCalls.filter((item) => item.path === '/checkout/sessions').length, 0);
+  assert.equal(domainItem('wonder.com'), undefined, 'the name isn’t held either');
+  registrarState.usdBalance = 500;
+  assert.equal((await call(ALICE, 'POST', '/domains/checkout', { action: 'register', domain: 'wonder.com', contact: CONTACT })).status, 200);
 });
 
 test('an order the registry did but DNA couldn’t record is never retried or refunded, and is picked up later', async () => {

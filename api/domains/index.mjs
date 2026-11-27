@@ -257,6 +257,20 @@ async function getLyrCa() {
   return lyrCaCache.value;
 }
 
+// Whether the live DNA balance covers `costCents` (USD). If the balance can't be read, checkout goes ahead:
+// a failed order is still refunded, so a registrar hiccup shouldn't stop every sale.
+async function registrarCanPay(costCents) {
+  try {
+    const account = await dna('GET', 'deposit/accounts/me');
+    const enough = Math.round(Number(account?.usdBalance ?? 0) * 100) >= costCents;
+    if (!enough) console.error('REGISTRAR ACCOUNT PROBLEM: top up DNA. Balance', account?.usdBalance, 'USD; this order needs', (costCents / 100).toFixed(2));
+    return enough;
+  } catch (err) {
+    console.error('Couldn’t read the DNA balance before checkout', err);
+    return true;
+  }
+}
+
 // One DNA call, live unless `registrarEnv` is 'test'.
 async function dna(method, path, options, registrarEnv = 'live') {
   const config = await getDnaConfig();
@@ -564,6 +578,10 @@ async function checkout(event, who) {
     costCents = action === 'register' ? q.cost.register + q.cost.renew * (years - 1) : q.cost.transfer;
   }
   if (!Number.isFinite(amount) || amount < 50) return error(400, 'There’s no price for this domain right now.');
+  // Don't take a customer's money when Lyrcloud's registrar account can't pay for the domain.
+  if (stripeMode(stripeConfig.secretKey) === 'live' && !(await registrarCanPay(costCents))) {
+    return error(503, 'Domain purchases are paused for a short while. Nothing was charged — please try again later.');
+  }
 
   const orderId = randomUUID();
   const createdAt = now();
@@ -811,7 +829,7 @@ async function domainRoutes(event, method, path, who) {
 function refusalReason(err) {
   if (err instanceof DnaError && ['Dna.DomainService:Deposit:10001', 'Dna.DomainService:Reseller:10001', 'Lyrcloud:RegistrarAuth', 'Lyrcloud:RegistrarNotConnected'].includes(err.code)) {
     console.error('REGISTRAR ACCOUNT PROBLEM: top up or reconnect DNA', err.code, err.message, JSON.stringify(err.data || {}));
-    return 'Lyrcloud couldn’t complete this purchase with the registry right now';
+    return 'Lyrcloud couldn’t complete this purchase right now';
   }
   return err.message || err.name;
 }
