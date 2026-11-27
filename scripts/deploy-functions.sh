@@ -10,8 +10,8 @@ STACK="${STACK:-lyrcloud-functions}"
 ARTIFACTS_BUCKET="${ARTIFACTS_BUCKET:-lyrcloud-deploy-artifacts}"
 FUNCTIONS_DOMAIN="${FUNCTIONS_DOMAIN:-dev.lyr}"
 
-cmp -s api/functions/zip.mjs cli/lib/zip.mjs || { echo "cli/lib/zip.mjs differs from api/functions/zip.mjs" >&2; exit 1; }
-node --test api/functions/rules.test.mjs api/functions/handler.test.mjs
+for f in zip runtime; do cmp -s "api/functions/$f.mjs" "cli/lib/$f.mjs" || { echo "cli/lib/$f.mjs differs from api/functions/$f.mjs" >&2; exit 1; }; done
+node --test api/functions/rules.test.mjs api/functions/handler.test.mjs api/functions/storage.test.mjs
 
 param() {
   aws cloudformation describe-stacks --stack-name lyrcloud-account-api \
@@ -25,7 +25,7 @@ trap 'rm -rf "$work"' EXIT
 python3 - "$work/code.zip" <<'PY'
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED) as z:
-    for name in ['index', 'router', 'rules', 'runtime', 'zip']:
+    for name in ['index', 'router', 'rules', 'runtime', 'zip', 'platform', 'storage']:
         z.write(f'api/functions/{name}.mjs', f'functions/{name}.mjs')
     for name in ['roles', 'phone']:
         z.write(f'api/account/{name}.mjs', f'account/{name}.mjs')

@@ -111,21 +111,24 @@ return Response.json(answer);`,
     icon: '▣',
     name: 'Storage & Databases',
     group: 'Developer platform',
-    tagline: 'Data that lives where your users are.',
-    summary: 'S3-compatible object storage with zero egress fees, a serverless SQL database, and globally replicated key-value storage.',
+    tagline: 'Keys and files, right beside your code.',
+    summary: 'Key-value namespaces and file buckets your edge functions use through env, managed from the lyrcloud CLI. Each account’s data is kept apart.',
     features: [
-      ['Object storage', 'S3-compatible buckets with no egress fees and automatic edge caching.'],
-      ['Serverless SQL', 'SQLite-compatible databases with read replicas close to every user.'],
-      ['Key-value store', 'Eventually consistent global KV for config, sessions, and feature flags.'],
-      ['Time travel', 'Point-in-time restore for databases up to 30 days back.'],
-      ['Event notifications', 'Trigger functions or queues when objects are created or deleted.'],
-      ['Migration tooling', 'Incrementally copy data from other clouds with no downtime.'],
+      ['Key-value store', '<code>env.CACHE.get/put/list/delete</code> for config, sessions and counters, with optional expiry and metadata.'],
+      ['File buckets', '<code>env.FILES.put/get/list/delete</code> for uploads and assets, up to 4 MB per file, with content types kept.'],
+      ['From the CLI', '<code>lyrcloud kv</code> and <code>lyrcloud bucket</code> read, write and list your data without writing code.'],
+      ['Works offline', '<code>lyrcloud dev</code> keeps the same data in <code>.lyrcloud/</code> in your project, so local and live code match.'],
+      ['Private by default', 'Each function gets a signed token that only opens its owner’s data. Files are encrypted at rest.'],
+      ['Serverless SQL', 'Coming soon: SQL databases for your functions.'],
     ],
-    code: `# Create a bucket and upload a file
-lyrcloud storage bucket create assets
-lyrcloud storage put assets/logo.svg ./logo.svg
-
-# Query a serverless SQL database
-lyrcloud db execute app-db "SELECT count(*) FROM users"`,
+    code: `// lyrcloud.json: "kv": { "CACHE": "cache" }, "buckets": { "FILES": "uploads" }
+export default {
+  async fetch(request, env) {
+    const visits = Number(await env.CACHE.get('visits') ?? 0) + 1;
+    await env.CACHE.put('visits', String(visits));
+    const logo = await env.FILES.get('logo.svg');
+    return new Response(\`Visit #\${visits}\`);
+  },
+};`,
   },
 ];

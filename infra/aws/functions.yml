@@ -55,9 +55,109 @@ Resources:
             - { AttributeName: ownerId, KeyType: HASH }
           Projection: { ProjectionType: ALL }
 
+  # ---------------------------------------------------------------- storage (KV and buckets)
+
+  # KV namespaces: pk "kv#<owner>#<namespace>", sk the key. Expired keys are removed by TTL.
+  DataTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: lyrcloud-functions-data
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+
+  # Buckets: objects at <owner>/<bucket>/<key>. Private; only the platform and API functions read it.
+  ObjectsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'lyrcloud-functions-objects-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+
+  # Signs each function's storage token (see api/functions/storage.mjs signToken).
+  PlatformSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: lyrcloud/functions-platform
+      Description: Signs Lyrcloud Edge Functions storage tokens.
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  PlatformRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: Storage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:Query]
+                Resource: !GetAtt DataTable.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub '${ObjectsBucket.Arn}/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt ObjectsBucket.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref PlatformSecret
+
+  # Called by deployed functions' env bindings.
+  PlatformFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lyrcloud-functions-platform
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      Handler: functions/platform.handler
+      Role: !GetAtt PlatformRole.Arn
+      MemorySize: 512
+      Timeout: 15
+      Environment:
+        Variables:
+          DATA_TABLE_NAME: !Ref DataTable
+          OBJECTS_BUCKET: !Ref ObjectsBucket
+          PLATFORM_SECRET_NAME: !Ref PlatformSecret
+      Code:
+        S3Bucket: !Ref ArtifactsBucketName
+        S3Key: !Ref LambdaCodeS3Key
+
   # ---------------------------------------------------------------- customer functions
 
-  # What customer code runs as: it may write its own logs and nothing else.
+  # What customer code runs as: it may write its own logs and call the platform function (which only
+  # serves the data its signed token allows), and nothing else.
   CustomerFunctionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -75,6 +175,9 @@ Resources:
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/lyrfn-*:*'
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt PlatformFunction.Arn
 
   # ---------------------------------------------------------------- control API (used by the CLI)
 
@@ -137,7 +240,18 @@ Resources:
                 Resource: '*'
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${LyrCaSecretName}-*'
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${LyrCaSecretName}-*'
+                  - !Ref PlatformSecret
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:Query]
+                Resource: !GetAtt DataTable.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub '${ObjectsBucket.Arn}/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt ObjectsBucket.Arn
 
   ApiFunction:
     Type: AWS::Lambda::Function
@@ -158,6 +272,10 @@ Resources:
           INGRESS_API_ID: !Ref IngressApi
           LYR_CA_SECRET_NAME: !Ref LyrCaSecretName
           SUPER_ADMIN_EMAIL: !Ref SuperAdminEmail
+          DATA_TABLE_NAME: !Ref DataTable
+          OBJECTS_BUCKET: !Ref ObjectsBucket
+          PLATFORM_SECRET_NAME: !Ref PlatformSecret
+          PLATFORM_FUNCTION: !Ref PlatformFunction
       Code:
         S3Bucket: !Ref ArtifactsBucketName
         S3Key: !Ref LambdaCodeS3Key
@@ -204,6 +322,18 @@ Resources:
   DeleteRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties: { ApiId: !Ref ControlApi, RouteKey: 'DELETE /functions/{proxy+}', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  StorageListRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref ControlApi, RouteKey: 'GET /storage', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  StorageGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref ControlApi, RouteKey: 'GET /storage/{proxy+}', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  StoragePutRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref ControlApi, RouteKey: 'PUT /storage/{proxy+}', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
+  StorageDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref ControlApi, RouteKey: 'DELETE /storage/{proxy+}', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
   AdminRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties: { ApiId: !Ref ControlApi, RouteKey: 'GET /admin/{proxy+}', Target: !Sub 'integrations/${ControlIntegration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }

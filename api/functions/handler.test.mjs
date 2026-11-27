@@ -12,6 +12,7 @@ import { createRoot } from '../domains/lyrca.mjs';
 Object.assign(process.env, {
   TABLE_NAME: 'functions', USERS_TABLE_NAME: 'users', DOMAINS_TABLE_NAME: 'domains', FUNCTIONS_DOMAIN: 'dev.lyr',
   EXEC_ROLE_ARN: 'arn:aws:iam::1:role/exec', INGRESS_API_ID: 'ingress', LYR_CA_SECRET_NAME: 'ca',
+  PLATFORM_SECRET: 'test-secret', PLATFORM_FUNCTION: 'lyrcloud-functions-platform',
 });
 const { handler, timing } = await import('./index.mjs');
 const { createZip, listZip } = await import('./zip.mjs');
@@ -249,4 +250,18 @@ test('the daily task renews the certificate in place when it is close to expiry'
 test('unsigned callers are turned away', async () => {
   const res = await handler({ requestContext: { http: { method: 'GET', path: '/functions' } } });
   assert.equal(res.statusCode, 401);
+});
+
+test('deploying with storage bindings gives the function a token for its owner', async () => {
+  const { readToken } = await import('./storage.mjs');
+  const res = parse(await call('PUT', '/functions/stored', { body: { code: code(), kv: { CACHE: 'cache' }, buckets: { FILES: 'uploads' } } }));
+  assert.equal(res.status, 200, res.error);
+  assert.deepEqual(res.function.bindings.map((b) => b.binding), ['CACHE', 'FILES']);
+  const fnEnv = lambdas.get('lyrfn-stored').env;
+  assert.equal(fnEnv.LYR_PLATFORM, 'lyrcloud-functions-platform');
+  assert.deepEqual(JSON.parse(fnEnv.LYR_BINDINGS), [{ binding: 'CACHE', type: 'kv', name: 'cache' }, { binding: 'FILES', type: 'bucket', name: 'uploads' }]);
+  assert.deepEqual(readToken('test-secret', fnEnv.LYR_TOKEN), { fn: 'stored', owner: 'u1' });
+  assert.match(parse(await call('PUT', '/functions/bad', { body: { code: code(), kv: { 'no good': 'x' } } })).error, /valid binding/);
+  const storage = parse(await call('GET', '/storage'));
+  assert.deepEqual(storage, { status: 200, kv: ['cache'], buckets: ['uploads'] });
 });

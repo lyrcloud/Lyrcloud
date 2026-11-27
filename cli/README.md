@@ -28,6 +28,26 @@ export default {
 - `ctx.waitUntil(promise)` finishes work after the response is ready.
 - Return a standard `Response`.
 
+## Storage
+
+Name KV namespaces and buckets in `lyrcloud.json`; they appear on `env`:
+
+```json
+{ "kv": { "CACHE": "cache" }, "buckets": { "FILES": "uploads" } }
+```
+
+```js
+await env.CACHE.put('visits', '1', { expirationTtl: 3600, metadata: { by: 'me' } });
+await env.CACHE.get('visits');              // "1"  (or 'json', 'arrayBuffer', 'stream')
+await env.CACHE.list({ prefix: 'user:' });  // { keys, list_complete, cursor }
+
+await env.FILES.put('a.txt', 'hello', { httpMetadata: { contentType: 'text/plain' } });
+const file = await env.FILES.get('a.txt');  // .text() .json() .arrayBuffer() .body
+await env.FILES.list({ prefix: 'notes/' }); // { objects, truncated, cursor }
+```
+
+Values can be up to 256 KB and files up to 4 MB. `lyrcloud dev` keeps the data in `.lyrcloud/storage/`. From the terminal: `lyrcloud kv list|get|put|delete <ns>`, `lyrcloud bucket list|put|get|delete <bucket>`, and `lyrcloud storage`.
+
 ## lyrcloud.json
 
 ```json
@@ -35,6 +55,8 @@ export default {
   "name": "hello-edge",
   "main": "index.js",
   "vars": { "GREETING": "Hello" },
+  "kv": { "CACHE": "cache" },
+  "buckets": { "FILES": "uploads" },
   "exclude": ["fixtures"]
 }
 ```

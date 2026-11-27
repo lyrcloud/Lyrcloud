@@ -31,6 +31,17 @@ ${bold('Commands')}
   logs [name] [-f] [--since 15m]   Show recent logs (-f keeps following)
   delete [name] [--yes]    Take a function down and free its name
 
+${bold('Storage')}
+  storage                          Namespaces and buckets your functions use
+  kv list <ns> [--prefix p]        List keys in a KV namespace
+  kv get <ns> <key>                Print a value
+  kv put <ns> <key> <value> [--ttl 3600]   Store a value (or --file <path>)
+  kv delete <ns> <key>             Delete a key
+  bucket list <bucket> [--prefix p]        List files in a bucket
+  bucket put <bucket> <key> <file>         Upload a file (up to 4 MB)
+  bucket get <bucket> <key> [--out path]   Download a file
+  bucket delete <bucket> <key>             Delete a file
+
 ${bold('Options')}
   -h, --help               Show help
   -v, --version            Show the version
@@ -43,7 +54,7 @@ function parseArgs(argv) {
   const positional = [];
   const flags = {};
   const aliases = { f: 'follow', y: 'yes', p: 'port', h: 'help', v: 'version', n: 'name' };
-  const valued = new Set(['port', 'since', 'name']);
+  const valued = new Set(['port', 'since', 'name', 'prefix', 'ttl', 'file', 'out', 'type']);
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--') {
@@ -206,7 +217,7 @@ async function deploy(_, flags) {
   }
   console.log(dim(`Uploading ${files.length} file${files.length === 1 ? '' : 's'} (${formatBytes(projectSize(files))}, ${formatBytes(zip.length)} zipped)…`));
   const started = Date.now();
-  const { function: fn } = await api('PUT', `/functions/${name}`, { body: { code: zip.toString('base64'), main: config.main, vars: config.vars || {} } });
+  const { function: fn } = await api('PUT', `/functions/${name}`, { body: { code: zip.toString('base64'), main: config.main, vars: config.vars || {}, kv: config.kv, buckets: config.buckets } });
   ok(`Deployed ${bold(name)} ${dim(`in ${((Date.now() - started) / 1000).toFixed(1)}s`)}`);
   console.log(`  ${cyan(fn.url)}`);
   if (fn.deploys === 1) {
@@ -285,7 +296,125 @@ async function remove(args, flags) {
   ok(`Deleted ${bold(name)}.`);
 }
 
-const COMMANDS = { login, logout, whoami, init, dev, deploy, list, ls: list, logs, tail: logs, delete: remove, rm: remove };
+// ---------------------------------------------------------------- storage
+
+const enc = (part) => encodeURIComponent(part);
+const need = (value, usage) => {
+  if (!value) throw new UsageError(`Usage: lyrcloud ${usage}`);
+  return value;
+};
+const typeFor = (file) => ({
+  '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
+  '.json': 'application/json', '.txt': 'text/plain; charset=utf-8', '.md': 'text/markdown; charset=utf-8', '.csv': 'text/csv; charset=utf-8',
+  '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.avif': 'image/avif',
+  '.ico': 'image/x-icon', '.pdf': 'application/pdf', '.zip': 'application/zip', '.mp4': 'video/mp4', '.mp3': 'audio/mpeg', '.woff2': 'font/woff2',
+}[path.extname(file).toLowerCase()] || 'application/octet-stream');
+
+async function storage() {
+  const { kv, buckets } = await api('GET', '/storage');
+  if (!kv.length && !buckets.length) {
+    console.log(`None yet. Add ${bold('"kv": { "CACHE": "my-cache" }')} or ${bold('"buckets": { "FILES": "uploads" }')} to lyrcloud.json and deploy.`);
+    return;
+  }
+  if (kv.length) console.log(`${bold('KV namespaces')}\n${kv.map((name) => `  ${name}`).join('\n')}`);
+  if (buckets.length) console.log(`${bold('Buckets')}\n${buckets.map((name) => `  ${name}`).join('\n')}`);
+}
+
+async function kvCommand([action, ns, key, value], flags) {
+  const usage = 'kv list|get|put|delete <namespace> [key] [value]';
+  need(action, usage);
+  need(ns, usage);
+  const base = `/storage/kv/${enc(ns)}/keys`;
+  if (action === 'list' || action === 'ls') {
+    let cursor;
+    let count = 0;
+    do {
+      const page = await api('GET', base, { query: { prefix: flags.prefix, cursor } });
+      for (const item of page.keys) {
+        console.log(item.expiration ? `${item.name}  ${dim(`expires ${new Date(item.expiration * 1000).toISOString()}`)}` : item.name);
+      }
+      count += page.keys.length;
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+    if (!count) console.log(dim(`No keys${flags.prefix ? ` starting with ${flags.prefix}` : ''} in ${ns}.`));
+    return;
+  }
+  need(key, usage);
+  const url = `${base}/${enc(key)}`;
+  if (action === 'get') {
+    const found = await api('GET', url);
+    process.stdout.write(Buffer.from(found.value, 'base64'));
+    if (process.stdout.isTTY) process.stdout.write('\n');
+    return;
+  }
+  if (action === 'put') {
+    let bytes;
+    if (typeof flags.file === 'string') bytes = readFileSync(flags.file);
+    else if (value !== undefined) bytes = Buffer.from(value);
+    else throw new UsageError('Give a value, or --file <path>.');
+    const ttl = flags.ttl === undefined ? undefined : Number(flags.ttl);
+    if (ttl !== undefined && !(ttl >= 60)) throw new UsageError('--ttl is in seconds, at least 60.');
+    await api('PUT', url, { body: { value: bytes.toString('base64'), expirationTtl: ttl } });
+    ok(`Stored ${bold(key)} in ${ns} ${dim(`(${formatBytes(bytes.length)}${ttl ? `, expires in ${ttl}s` : ''})`)}`);
+    return;
+  }
+  if (action === 'delete' || action === 'rm') {
+    await api('DELETE', url);
+    ok(`Deleted ${bold(key)} from ${ns}.`);
+    return;
+  }
+  throw new UsageError(`Usage: lyrcloud ${usage}`);
+}
+
+async function bucketCommand([action, bucket, key, file], flags) {
+  const usage = 'bucket list|put|get|delete <bucket> [key] [file]';
+  need(action, usage);
+  need(bucket, usage);
+  const base = `/storage/buckets/${enc(bucket)}/objects`;
+  if (action === 'list' || action === 'ls') {
+    const rows = [];
+    let cursor;
+    do {
+      const page = await api('GET', base, { query: { prefix: flags.prefix, cursor } });
+      rows.push(...page.objects.map((item) => [item.key, formatBytes(item.size), relativeTime(item.uploaded)]));
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    if (!rows.length) console.log(dim(`No files${flags.prefix ? ` starting with ${flags.prefix}` : ''} in ${bucket}.`));
+    else table(rows, ['KEY', 'SIZE', 'UPLOADED']);
+    return;
+  }
+  need(key, usage);
+  const url = `${base}/${key.split('/').map(enc).join('/')}`;
+  if (action === 'put') {
+    const source = file || (typeof flags.file === 'string' ? flags.file : null);
+    if (!source) throw new UsageError('Usage: lyrcloud bucket put <bucket> <key> <file>');
+    const bytes = readFileSync(source);
+    if (bytes.length > MAX_ZIP) throw new UsageError(`Files can be at most ${formatBytes(MAX_ZIP)}.`);
+    const contentType = typeof flags.type === 'string' ? flags.type : typeFor(source);
+    await api('PUT', url, { body: { body: bytes.toString('base64'), contentType } });
+    ok(`Uploaded ${bold(key)} to ${bucket} ${dim(`(${formatBytes(bytes.length)}, ${contentType})`)}`);
+    return;
+  }
+  if (action === 'get') {
+    const found = await api('GET', url);
+    const bytes = Buffer.from(found.body, 'base64');
+    if (typeof flags.out === 'string') {
+      writeFileSync(flags.out, bytes);
+      ok(`Saved ${bold(key)} to ${flags.out} ${dim(`(${formatBytes(bytes.length)})`)}`);
+    } else {
+      process.stdout.write(bytes);
+    }
+    return;
+  }
+  if (action === 'delete' || action === 'rm') {
+    await api('DELETE', url);
+    ok(`Deleted ${bold(key)} from ${bucket}.`);
+    return;
+  }
+  throw new UsageError(`Usage: lyrcloud ${usage}`);
+}
+
+const COMMANDS = { login, logout, whoami, init, dev, deploy, list, ls: list, logs, tail: logs, delete: remove, rm: remove, storage, kv: kvCommand, bucket: bucketCommand, buckets: bucketCommand };
 
 // ---------------------------------------------------------------- main
 

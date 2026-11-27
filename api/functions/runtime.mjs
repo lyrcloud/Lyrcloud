@@ -5,8 +5,9 @@
 //   export default { fetch(request, env, ctx) { return new Response('hi'); } }
 //
 // (or a bare function), hands it a standard Request and turns the Response it returns back into an
-// API Gateway result. `env` holds the function's variables (LYR_VARS) and nothing from Lambda's own
-// environment, and ctx.waitUntil(promise) work finishes before the invocation ends.
+// API Gateway result. `env` holds the function's variables (LYR_VARS) and storage bindings (LYR_BINDINGS:
+// KV namespaces and object buckets, which call the platform function with this function's token), and
+// nothing from Lambda's own environment. ctx.waitUntil(promise) work finishes before the invocation ends.
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -17,8 +18,129 @@ function load() {
   return loaded;
 }
 
-let vars;
-const varsOf = () => (vars ??= Object.freeze(JSON.parse(process.env.LYR_VARS || '{}')));
+// ---------------------------------------------------------------- storage bindings
+
+async function toBase64(value) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return Buffer.from(value, 'utf8').toString('base64');
+  if (value instanceof ArrayBuffer) return Buffer.from(value).toString('base64');
+  if (ArrayBuffer.isView(value)) return Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString('base64');
+  if (typeof Blob !== 'undefined' && value instanceof Blob) return Buffer.from(await value.arrayBuffer()).toString('base64');
+  if (typeof ReadableStream !== 'undefined' && value instanceof ReadableStream) return Buffer.from(await new Response(value).arrayBuffer()).toString('base64');
+  throw new TypeError('Store text, an ArrayBuffer, a typed array, a Blob or a ReadableStream.');
+}
+
+function decode(base64, type = 'text') {
+  const buf = Buffer.from(base64 || '', 'base64');
+  if (type === 'text') return buf.toString('utf8');
+  if (type === 'json') return JSON.parse(buf.toString('utf8'));
+  if (type === 'arrayBuffer') return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+  if (type === 'stream') return new Response(buf).body;
+  throw new TypeError('type must be "text", "json", "arrayBuffer" or "stream".');
+}
+
+// env.MY_KV: get/getWithMetadata/put/delete/list, in the same shape as other edge platforms' KV.
+export class KVNamespace {
+  #call;
+  #name;
+  constructor(name, call) {
+    this.#name = name;
+    this.#call = call;
+  }
+  async get(key, options) {
+    const found = await this.#call({ op: 'kv.get', store: this.#name, key: String(key) });
+    return found ? decode(found.value, typeof options === 'string' ? options : options?.type) : null;
+  }
+  async getWithMetadata(key, options) {
+    const found = await this.#call({ op: 'kv.get', store: this.#name, key: String(key) });
+    return { value: found ? decode(found.value, typeof options === 'string' ? options : options?.type) : null, metadata: found?.metadata ?? null };
+  }
+  async put(key, value, options = {}) {
+    const { expirationTtl, expiration, metadata } = options;
+    await this.#call({ op: 'kv.put', store: this.#name, key: String(key), value: await toBase64(value), options: { expirationTtl, expiration, metadata } });
+  }
+  async delete(key) {
+    await this.#call({ op: 'kv.delete', store: this.#name, key: String(key) });
+  }
+  list(options = {}) {
+    const { prefix, limit, cursor } = options;
+    return this.#call({ op: 'kv.list', store: this.#name, options: { prefix, limit, cursor } });
+  }
+}
+
+function objectBody(found) {
+  const { body, ...meta } = found;
+  const bytes = () => Buffer.from(body || '', 'base64');
+  return {
+    ...meta,
+    get body() { return new Response(bytes()).body; },
+    async arrayBuffer() { const buf = bytes(); return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength); },
+    async text() { return bytes().toString('utf8'); },
+    async json() { return JSON.parse(bytes().toString('utf8')); },
+    async blob() { return new Blob([bytes()], { type: meta.httpMetadata?.contentType }); },
+    writeHttpMetadata(headers) {
+      if (meta.httpMetadata?.contentType) headers.set('content-type', meta.httpMetadata.contentType);
+      if (meta.etag) headers.set('etag', `"${meta.etag}"`);
+    },
+  };
+}
+
+// env.MY_BUCKET: head/get/put/delete/list for files (objects).
+export class Bucket {
+  #call;
+  #name;
+  constructor(name, call) {
+    this.#name = name;
+    this.#call = call;
+  }
+  head(key) {
+    return this.#call({ op: 'object.head', store: this.#name, key: String(key) });
+  }
+  async get(key) {
+    const found = await this.#call({ op: 'object.get', store: this.#name, key: String(key) });
+    return found ? objectBody(found) : null;
+  }
+  async put(key, value, options = {}) {
+    let contentType = options.httpMetadata?.contentType;
+    if (typeof Headers !== 'undefined' && options.httpMetadata instanceof Headers) contentType = options.httpMetadata.get('content-type');
+    if (!contentType && typeof Blob !== 'undefined' && value instanceof Blob && value.type) contentType = value.type;
+    if (!contentType && typeof value === 'string') contentType = 'text/plain; charset=utf-8';
+    return this.#call({ op: 'object.put', store: this.#name, key: String(key), value: await toBase64(value), options: { contentType, customMetadata: options.customMetadata } });
+  }
+  async delete(keys) {
+    await this.#call({ op: 'object.delete', store: this.#name, keys: Array.isArray(keys) ? keys.map(String) : String(keys) });
+  }
+  list(options = {}) {
+    const { prefix, limit, cursor, delimiter } = options;
+    return this.#call({ op: 'object.list', store: this.#name, options: { prefix, limit, cursor, delimiter } });
+  }
+}
+
+// Builds `env`: the variables plus one binding object per entry in `bindings` ([{ binding, type, name }]).
+export function makeEnv(vars, bindings, call) {
+  const env = { ...vars };
+  for (const { binding, type, name } of bindings || []) {
+    env[binding] = type === 'kv' ? new KVNamespace(name, call) : new Bucket(name, call);
+  }
+  return Object.freeze(env);
+}
+
+// In Lambda, bindings invoke the platform function with this function's token.
+let lambdaClient;
+async function platformCall(request) {
+  const { LambdaClient, InvokeCommand } = await import('@aws-sdk/client-lambda');
+  lambdaClient ??= new LambdaClient({});
+  const res = await lambdaClient.send(new InvokeCommand({
+    FunctionName: process.env.LYR_PLATFORM,
+    Payload: Buffer.from(JSON.stringify({ ...request, token: process.env.LYR_TOKEN })),
+  }));
+  const out = JSON.parse(Buffer.from(res.Payload || []).toString('utf8') || '{}');
+  if (res.FunctionError || !out.ok) throw new Error(out.error || out.errorMessage || 'Lyrcloud Storage call failed.');
+  return out.result;
+}
+
+let env;
+const envOf = () => (env ??= makeEnv(JSON.parse(process.env.LYR_VARS || '{}'), JSON.parse(process.env.LYR_BINDINGS || '[]'), platformCall));
 
 export function toRequest(event) {
   const headers = new Headers();
@@ -62,7 +184,8 @@ export async function toResult(response) {
 
 const plain = (statusCode, text) => ({ statusCode, headers: { 'content-type': 'text/plain; charset=utf-8' }, body: text });
 
-export async function run(mod, event) {
+// `envOverride` lets `lyrcloud dev` pass bindings backed by local files.
+export async function run(mod, event, envOverride) {
   const app = mod.default ?? mod;
   const fetch = typeof app === 'function' ? app : app?.fetch;
   if (typeof fetch !== 'function') {
@@ -78,7 +201,7 @@ export async function run(mod, event) {
   };
   let response;
   try {
-    response = await fetch.call(app, toRequest(event), varsOf(), ctx);
+    response = await fetch.call(app, toRequest(event), envOverride || envOf(), ctx);
   } catch (err) {
     console.error('Uncaught error in fetch:', err);
     response = null;

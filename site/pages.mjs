@@ -360,6 +360,9 @@ const cliCommands = [
   ['lyrcloud logs [name] [-f]', 'Show recent logs; <code>-f</code> keeps following, <code>--since 2h</code> looks further back.'],
   ['lyrcloud delete [name]', 'Take a function offline and free its name.'],
   ['lyrcloud whoami / logout', 'Show who you’re signed in as, or sign out on this computer.'],
+  ['lyrcloud kv list|get|put|delete <ns>', 'Read and write a KV namespace your functions use.'],
+  ['lyrcloud bucket list|put|get|delete <bucket>', 'Upload, download and list files in a bucket.'],
+  ['lyrcloud storage', 'List the namespaces and buckets your functions bind.'],
 ];
 
 const developersPage = {
@@ -408,6 +411,30 @@ lyrcloud deploy
             <p><code class="inline">.dev.lyr</code> addresses open on devices set up for <a href="/lyr/">Lyr DNS</a>.</p>
           </li>
         </ol>
+      </section>
+
+      <section id="storage" class="section">
+        <div class="section-heading compact">
+          <span class="eyebrow">Storage</span>
+          <h2>Keys and files in your functions</h2>
+          <p>Name a KV namespace or a bucket in <code class="inline">lyrcloud.json</code>, and it appears on <code class="inline">env</code>. <code class="inline">lyrcloud dev</code> keeps the data in <code class="inline">.lyrcloud/</code> while you work.</p>
+        </div>
+        <div class="section-grid">
+          <pre class="snippet"><code>${escape(`{
+  "name": "hello-edge",
+  "main": "index.js",
+  "kv": { "CACHE": "cache" },
+  "buckets": { "FILES": "uploads" }
+}`)}</code></pre>
+          <pre class="snippet"><code>${escape(`const n = Number(await env.CACHE.get('visits') ?? 0) + 1;
+await env.CACHE.put('visits', String(n), { expirationTtl: 86400 });
+
+await env.FILES.put('notes/a.txt', 'hello');
+const file = await env.FILES.get('notes/a.txt');
+return new Response(file.body, {
+  headers: { 'content-type': file.httpMetadata.contentType },
+});`)}</code></pre>
+        </div>
       </section>
 
       <section id="cli" class="section">

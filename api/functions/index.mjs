@@ -10,6 +10,13 @@
 //   DELETE /functions/{name}           take it down and free the name
 //   GET    /admin/functions            every function (staff)
 //
+// Storage (also reached from deployed functions through env bindings and platform.mjs):
+//   GET    /storage                              namespaces and buckets your functions bind
+//   GET    /storage/kv/{ns}/keys                 ?prefix=&cursor=  list keys
+//   GET|PUT|DELETE /storage/kv/{ns}/keys/{key}  { value: base64, expirationTtl?, metadata? }
+//   GET    /storage/buckets/{b}/objects          ?prefix=&cursor=&delimiter=  list objects
+//   GET|PUT|DELETE /storage/buckets/{b}/objects/{key}  { body: base64, contentType? }
+//
 // A daily EventBridge rule sends { task: 'renew-certificate' } to keep the *.dev.lyr certificate fresh.
 import { generateKeyPairSync } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -53,6 +60,8 @@ import {
   RUNTIME_ENTRY,
   RUNTIME_HANDLER,
 } from './rules.mjs';
+import { platformSecret } from './platform.mjs';
+import { cleanBindings, perform, signToken, StorageError } from './storage.mjs';
 import { addZipEntry, listZip, ZipError } from './zip.mjs';
 
 const env = process.env;
@@ -62,6 +71,7 @@ const DOMAINS_TABLE = env.DOMAINS_TABLE_NAME; // holds the .lyr registry (lyr#de
 const DOMAIN = env.FUNCTIONS_DOMAIN || FUNCTIONS_DOMAIN_DEFAULT;
 const EXEC_ROLE_ARN = env.EXEC_ROLE_ARN;
 const INGRESS_API_ID = env.INGRESS_API_ID;
+const PLATFORM_FUNCTION = env.PLATFORM_FUNCTION;
 const LYR_CA_SECRET_NAME = env.LYR_CA_SECRET_NAME;
 const SUPER_ADMIN_EMAIL = env.SUPER_ADMIN_EMAIL || 'lyrclouds@gmail.com';
 const FUNCTION_MEMORY = Number(env.FUNCTION_MEMORY_MB || 256);
@@ -124,6 +134,7 @@ const publicFunction = (item) => ({
   status: item.status,
   main: item.main || null,
   vars: Object.keys(item.vars || {}),
+  bindings: item.bindings || [],
   codeBytes: item.codeBytes || 0,
   deploys: item.deploys || 0,
   createdAt: item.createdAt,
@@ -222,9 +233,18 @@ async function waitUntilReady(functionName) {
   throw new UserError(504, 'The function is taking longer than usual to start. Run deploy again in a minute.');
 }
 
-async function putLambda(name, zip, main, vars, ownerId) {
+async function putLambda(name, zip, main, vars, bindings, ownerId) {
   const FunctionName = lambdaName(name);
-  const Environment = { Variables: { LYR_MAIN: main, LYR_VARS: JSON.stringify(vars), NODE_OPTIONS: '--enable-source-maps' } };
+  const Environment = {
+    Variables: {
+      LYR_MAIN: main,
+      LYR_VARS: JSON.stringify(vars),
+      LYR_BINDINGS: JSON.stringify(bindings),
+      LYR_PLATFORM: PLATFORM_FUNCTION || '',
+      LYR_TOKEN: signToken(await platformSecret(), { fn: name, owner: ownerId }),
+      NODE_OPTIONS: '--enable-source-maps',
+    },
+  };
   let exists = true;
   try {
     await lambda.send(new GetFunctionConfigurationCommand({ FunctionName }));
@@ -328,6 +348,8 @@ async function deploy(event, name, who) {
   if (mainProblem) return error(400, mainProblem);
   const [vars, varsProblem] = cleanVars(body.vars);
   if (varsProblem) return error(400, varsProblem);
+  const [bindings, bindingsProblem] = cleanBindings({ kv: body.kv, buckets: body.buckets }, vars);
+  if (bindingsProblem) return error(400, bindingsProblem);
   if (typeof body.code !== 'string' || !body.code) return error(400, 'Send the code as a base64 zip in "code".');
   const code = Buffer.from(body.code, 'base64');
   if (code.length > MAX_CODE_BYTES) return error(413, `Functions can be at most ${MAX_CODE_BYTES / 1024 / 1024} MB zipped.`);
@@ -359,7 +381,7 @@ async function deploy(event, name, who) {
 
   const zip = addZipEntry(code, RUNTIME_ENTRY, runtime());
   try {
-    await putLambda(name, zip, main, vars, who.userId);
+    await putLambda(name, zip, main, vars, bindings, who.userId);
     const target = await ensureDomain(name);
     await setLyrRecord(hostFor(name, DOMAIN), target);
   } catch (err) {
@@ -368,7 +390,7 @@ async function deploy(event, name, who) {
     if (err instanceof UserError) return error(err.statusCode, err.message);
     throw err;
   }
-  const saved = { ...item, status: 'live', main, vars, codeBytes: code.length, deploys: (item.deploys || 0) + 1, updatedAt: now(), lastError: undefined };
+  const saved = { ...item, status: 'live', main, vars, bindings, codeBytes: code.length, deploys: (item.deploys || 0) + 1, updatedAt: now(), lastError: undefined };
   delete saved.lastError;
   await ddb.send(new PutCommand({ TableName: TABLE, Item: saved }));
   return json(200, { function: publicFunction(saved) });
@@ -421,6 +443,58 @@ async function functionRoutes(event, method, path, who) {
   return error(404, 'not_found');
 }
 
+// ---------------------------------------------------------------- storage routes (CLI)
+
+function segments(event) {
+  // rawPath keeps %2F inside keys; each segment is decoded on its own.
+  const raw = event.rawPath || event.requestContext?.http?.path || '';
+  return raw.split('/').filter((part, i) => i > 0).map((part) => decodeURIComponent(part));
+}
+
+async function storageRoutes(event, method, who) {
+  const parts = segments(event);
+  const query = event.queryStringParameters || {};
+  if (parts.length === 1 && method === 'GET') {
+    const kv = new Set();
+    const buckets = new Set();
+    for (const fn of await functionsOf(who.userId)) {
+      for (const binding of fn.bindings || []) (binding.type === 'kv' ? kv : buckets).add(binding.name);
+    }
+    return json(200, { kv: [...kv].sort(), buckets: [...buckets].sort() });
+  }
+  const [, kind, store, collection, ...rest] = parts;
+  const key = rest.join('/');
+  const call = (request) => perform(who.userId, { store, ...request });
+  if (kind === 'kv' && collection === 'keys') {
+    if (!key && method === 'GET') return json(200, await call({ op: 'kv.list', options: { prefix: query.prefix, cursor: query.cursor, limit: query.limit } }));
+    if (key && method === 'GET') {
+      const found = await call({ op: 'kv.get', key });
+      return found ? json(200, found) : error(404, `No key ${key} in ${store}.`);
+    }
+    if (key && method === 'PUT') {
+      const body = parseJson(event);
+      if (!body) return error(400, 'Invalid JSON body.');
+      await call({ op: 'kv.put', key, value: body.value, options: { expirationTtl: body.expirationTtl, metadata: body.metadata } });
+      return json(200, { ok: true });
+    }
+    if (key && method === 'DELETE') return json(200, await call({ op: 'kv.delete', key }));
+  }
+  if (kind === 'buckets' && collection === 'objects') {
+    if (!key && method === 'GET') return json(200, await call({ op: 'object.list', options: { prefix: query.prefix, cursor: query.cursor, delimiter: query.delimiter, limit: query.limit } }));
+    if (key && method === 'GET') {
+      const found = await call({ op: 'object.get', key });
+      return found ? json(200, found) : error(404, `No object ${key} in ${store}.`);
+    }
+    if (key && method === 'PUT') {
+      const body = parseJson(event);
+      if (!body) return error(400, 'Invalid JSON body.');
+      return json(200, await call({ op: 'object.put', key, value: body.body, options: { contentType: body.contentType } }));
+    }
+    if (key && method === 'DELETE') return json(200, await call({ op: 'object.delete', key }));
+  }
+  return error(404, 'not_found');
+}
+
 async function adminRoutes(method, path, who) {
   if (!isStaff(who.role)) return error(403, 'Staff only.');
   if (path === '/admin/functions' && method === 'GET') {
@@ -455,10 +529,13 @@ export const handler = async (event) => {
     if (who.profile.disabled === true && who.role !== 'superadmin') return error(403, 'This account has been disabled.');
     if (path.startsWith('/admin/')) return await adminRoutes(method, path, who);
     if (path === '/functions' || path.startsWith('/functions/')) return await functionRoutes(event, method, path, who);
+    if (path === '/storage' || path.startsWith('/storage/')) return await storageRoutes(event, method, who);
     return error(404, 'not_found');
   } catch (err) {
     console.error('Functions API failed', err);
     if (err instanceof UserError) return error(err.statusCode, err.message);
+    if (err instanceof StorageError) return error(err.status, err.message);
+    if (err instanceof URIError) return error(400, 'That key isn’t encoded correctly.');
     return error(500, 'Something went wrong on Lyrcloud’s side. Please try again.');
   }
 };

@@ -5,11 +5,13 @@ import { createServer } from 'node:http';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { loadProject } from './project.mjs';
-import { run } from './runtime.mjs';
+import { bindingsOf, localStorage } from './local-storage.mjs';
+import { makeEnv, run } from './runtime.mjs';
 
 const [root, portText] = process.argv.slice(2);
 const { config } = loadProject(root);
-process.env.LYR_VARS = JSON.stringify(config.vars || {});
+// KV namespaces and buckets are kept in .lyrcloud/storage/ while developing.
+const env = makeEnv(config.vars || {}, bindingsOf(config), localStorage(root));
 
 let mod;
 let loadError = null;
@@ -48,7 +50,7 @@ const server = createServer(async (req, res) => {
   if (loadError) {
     result = { statusCode: 500, headers: { 'content-type': 'text/plain; charset=utf-8' }, body: `Couldn’t load ${config.main}:\n\n${loadError.stack || loadError}` };
   } else {
-    result = await run(mod, toEvent(req, Buffer.concat(chunks), port));
+    result = await run(mod, toEvent(req, Buffer.concat(chunks), port), env);
   }
   const headers = { ...result.headers };
   if (result.cookies?.length) headers['set-cookie'] = result.cookies;
