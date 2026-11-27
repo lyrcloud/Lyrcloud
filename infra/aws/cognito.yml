@@ -35,6 +35,10 @@ Parameters:
     Type: String
     Default: lvuefq00fvgs397rlv9ibkrfu
     Description: App client in the Lyr pool allowed ADMIN_USER_PASSWORD_AUTH, used only by the migration trigger.
+  LyrshopFunctionName:
+    Type: String
+    Default: lyrshop-EcommerceApiFunction-3yN1zrPN4F5t
+    Description: Lyrshop's API function; the trigger invokes it directly to check a Lyrshop account. Empty turns that off.
 
 Conditions:
   HasLyrBridge: !Not [!Equals [!Ref LyrUserPoolId, '']]
@@ -65,6 +69,9 @@ Resources:
               - Effect: Allow
                 Action: [cognito-idp:AdminInitiateAuth, cognito-idp:AdminGetUser]
                 Resource: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${LyrUserPoolId}'
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LyrshopFunctionName}'
 
   LyrBridgeFunction:
     Type: AWS::Lambda::Function
@@ -73,16 +80,32 @@ Resources:
       FunctionName: lyrcloud-lyr-account-bridge
       Runtime: nodejs20.x
       Handler: index.handler
-      Timeout: 5
+      Timeout: 8
       Role: !GetAtt LyrBridgeRole.Arn
       Environment:
         Variables:
           LYR_POOL_ID: !Ref LyrUserPoolId
           LYR_CLIENT_ID: !Ref LyrBridgeClientId
+          LYRSHOP_FUNCTION: !Ref LyrshopFunctionName
       Code:
         ZipFile: |
           const { CognitoIdentityProviderClient, AdminInitiateAuthCommand, AdminGetUserCommand } = require('@aws-sdk/client-cognito-identity-provider');
+          const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
           const lyr = new CognitoIdentityProviderClient({});
+          const lambda = new LambdaClient({});
+          // Lyrshop keeps its own accounts: it checks the password itself (with its lockout) and answers
+          // {ok, email, name} for a verified email account; lookup: true only asks whether one exists
+          async function lyrshopAccount(email, password, lookup) {
+            if (!process.env.LYRSHOP_FUNCTION) return null;
+            const out = await lambda.send(new InvokeCommand({
+              FunctionName: process.env.LYRSHOP_FUNCTION,
+              Payload: Buffer.from(JSON.stringify({ lyrBridge: lookup ? { email, lookup: true } : { email, password } })),
+            }));
+            if (out.FunctionError) throw new Error('Lyrshop check failed: ' + out.FunctionError);
+            const answer = JSON.parse(Buffer.from(out.Payload).toString() || '{}');
+            if (!answer.ok || answer.email !== email) return null;
+            return answer.name ? { email, email_verified: 'true', name: answer.name } : { email, email_verified: 'true' };
+          }
           const PHONE_LOGIN_DOMAIN = '@phone.lyrtrip.com';
           // Attributes for the new Lyrcloud account, from a Lyr account whose email is verified; null otherwise
           async function lyrAccount(email) {
@@ -102,25 +125,33 @@ Resources:
           exports.handler = async (event) => {
             const email = String(event.userName || '').trim().toLowerCase();
             if (!email.includes('@')) throw new Error('Email or password is incorrect.');
-            if (event.triggerSource === 'UserMigration_Authentication') {
+            const signingIn = event.triggerSource === 'UserMigration_Authentication';
+            if (!signingIn && event.triggerSource !== 'UserMigration_ForgotPassword') throw new Error('Email or password is incorrect.');
+            // A Lyr account (Lyrpay, Lyrtrip) first
+            let attributes = null, from = 'Lyr';
+            let lyrPasswordOk = !signingIn;
+            if (signingIn) {
               try {
                 await lyr.send(new AdminInitiateAuthCommand({
                   UserPoolId: process.env.LYR_POOL_ID, ClientId: process.env.LYR_CLIENT_ID, AuthFlow: 'ADMIN_USER_PASSWORD_AUTH',
                   AuthParameters: { USERNAME: email, PASSWORD: event.request.password },
                 }));
+                lyrPasswordOk = true;
               } catch (err) {
-                // Wrong password, or a Lyr account that needs another step: not ours to bring over
-                throw new Error('Email or password is incorrect.');
+                lyrPasswordOk = false;   // wrong password, no such account, or another step needed there
               }
-            } else if (event.triggerSource !== 'UserMigration_ForgotPassword') {
-              throw new Error('Email or password is incorrect.');
             }
-            const attributes = await lyrAccount(email);
+            if (lyrPasswordOk) attributes = await lyrAccount(email);
+            // Then a Lyrshop account (its own password database)
+            if (!attributes) {
+              from = 'Lyrshop';
+              attributes = await lyrshopAccount(email, signingIn ? event.request.password : '', !signingIn);
+            }
             if (!attributes) throw new Error('Email or password is incorrect.');
             event.response.userAttributes = attributes;
             event.response.finalUserStatus = event.triggerSource === 'UserMigration_Authentication' ? 'CONFIRMED' : 'RESET_REQUIRED';
             event.response.messageAction = 'SUPPRESS';
-            console.log('Lyr account brought into Lyrcloud:', event.triggerSource);
+            console.log(from + ' account brought into Lyrcloud:', event.triggerSource);
             return event;
           };
 
