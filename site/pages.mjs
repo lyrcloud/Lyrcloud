@@ -85,23 +85,27 @@ const home = {
     <main>
       <section id="top" class="hero section-grid">
         <div class="hero-copy">
-          <a class="eyebrow" href="/products/edge-functions/">↗ Edge Functions now run in 180+ cities</a>
+          <a class="eyebrow announce" href="/developers/"><span class="announce-tag">New</span> Edge Functions and the <code>lyrcloud</code> CLI <span aria-hidden="true">→</span></a>
           <h1>Build, secure, and scale on <span class="text-gradient">one cloud</span>.</h1>
           <p class="hero-lede">Lyrcloud brings application delivery, edge compute, Zero Trust access, and AI workflow hosting into a single, elegant control plane for modern teams.</p>
           <div class="cta-row">
             <a class="button primary large" href="/sign-up/">Start building for free <span aria-hidden="true">→</span></a>
             <a class="button secondary large" href="/products/">Explore products</a>
           </div>
+          <div class="install-pill">
+            <code><span aria-hidden="true">$</span> npm install -g lyrcloud</code>
+            <button type="button" class="copy-button" data-copy="npm install -g lyrcloud" aria-label="Copy the install command"><span class="copy-label">Copy</span></button>
+          </div>
         </div>
-        <div class="hero-visual" aria-label="Lyrcloud global network dashboard illustration">
+        <div class="hero-visual">
           <div class="orbit orbit-one" aria-hidden="true"></div>
           <div class="orbit orbit-two" aria-hidden="true"></div>
           <div class="map-card glass-card">
             <div class="map-header">
-              <span>Region: Earth</span>
-              <strong>Live</strong>
+              <span>Edge network demo</span>
+              <strong>Click the globe</strong>
             </div>
-            <div class="globe" aria-hidden="true">
+            <div class="globe" role="button" tabindex="0" aria-label="Send a demo request to the nearest edge node">
               <span class="node node-a"></span>
               <span class="node node-b"></span>
               <span class="node node-c"></span>
@@ -109,19 +113,20 @@ const home = {
               <span class="path path-one"></span>
               <span class="path path-two"></span>
             </div>
-            <div class="traffic-grid">
-              <div><b>12.8M</b><span>requests today</span></div>
-              <div><b>98%</b><span>cached safely</span></div>
-              <div><b>2.1B</b><span>threats blocked</span></div>
+            <div class="traffic-grid" aria-live="polite">
+              <div><b data-demo="requests">0</b><span>requests sent</span></div>
+              <div><b data-demo="latency">—</b><span>avg. response</span></div>
+              <div><b data-demo="blocked">0</b><span>bots challenged</span></div>
             </div>
+            <ul class="demo-log" aria-label="Demo request log"></ul>
           </div>
         </div>
       </section>
 
       <section class="metrics" aria-label="Lyrcloud platform metrics">
-        <div class="metric"><strong>99.99%</strong><span>availability target</span></div>
-        <div class="metric"><strong>180+</strong><span>edge locations</span></div>
-        <div class="metric"><strong>42 ms</strong><span>median global response</span></div>
+        <div class="metric"><strong data-count="99.99" data-suffix="%">99.99%</strong><span>availability target</span></div>
+        <div class="metric"><strong data-count="5" data-prefix="~" data-suffix=" s">~5 s</strong><span>from <code>lyrcloud deploy</code> to live</span></div>
+        <div class="metric"><strong data-count="0">0</strong><span>dependencies in the CLI</span></div>
         <div class="metric"><strong>24/7</strong><span>threat monitoring</span></div>
       </section>
 
@@ -135,21 +140,73 @@ const home = {
         </div>
       </section>
 
+
+      <section id="try" class="section playground-section">
+        <div class="section-heading">
+          <span class="eyebrow">Try it now</span>
+          <h2>Write an edge function. Run it right here.</h2>
+          <p>Edit the code and press Run. It runs in a sandbox in your browser using the same <code class="inline">fetch(request, env)</code> shape as a deployed function.</p>
+        </div>
+        <div class="playground glass-card">
+          <div class="pg-tabs" role="tablist" aria-label="Examples">
+            <button type="button" role="tab" data-preset="hello" aria-selected="true">Hello</button>
+            <button type="button" role="tab" data-preset="json" aria-selected="false">JSON API</button>
+            <button type="button" role="tab" data-preset="redirect" aria-selected="false">Redirects</button>
+            <button type="button" role="tab" data-preset="headers" aria-selected="false">Request info</button>
+          </div>
+          <div class="pg-body">
+            <div class="pg-editor">
+              <label class="visually-hidden" for="pg-code">Function code</label>
+              <textarea id="pg-code" spellcheck="false" autocapitalize="off" autocomplete="off">${escape(`export default {
+  fetch(request, env) {
+    const url = new URL(request.url);
+    return new Response(\`\${env.GREETING} from \${url.hostname}!\`);
+  },
+};`)}</textarea>
+            </div>
+            <div class="pg-result">
+              <div class="pg-request">
+                <label class="visually-hidden" for="pg-method">Method</label>
+                <select id="pg-method"><option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option></select>
+                <span class="pg-host">hello-edge.dev.lyr</span>
+                <label class="visually-hidden" for="pg-path">Path</label>
+                <input id="pg-path" value="/" spellcheck="false" autocomplete="off" />
+                <button type="button" class="button primary pg-run">Run <span aria-hidden="true">▶</span></button>
+              </div>
+              <div class="pg-response" aria-live="polite">
+                <div class="pg-response-head"><span class="pg-status">Ready</span><span class="pg-meta">Ctrl + Enter runs it</span></div>
+                <pre class="pg-output">Press Run to call your function.</pre>
+              </div>
+            </div>
+          </div>
+          <div class="pg-foot">
+            <span>Happy with it? Deploy it for real:</span>
+            <code>npm install -g lyrcloud &amp;&amp; lyrcloud deploy</code>
+            <a class="text-link" href="/developers/#quickstart">Quickstart →</a>
+          </div>
+        </div>
+      </section>
+
       <section class="workflow section-grid reverse">
         <div class="terminal-card glass-card">
-          <div class="terminal-bar" aria-hidden="true"><span></span><span></span><span></span></div>
-          <code>
-            <span>$ lyrcloud deploy</span>
-            <span>✓ bundling web app</span>
-            <span>✓ applying zero-trust policy</span>
-            <span>✓ warming 180 edge locations</span>
-            <span>✓ www.lyrcloud.com is live</span>
+          <div class="terminal-bar"><span aria-hidden="true"></span><span aria-hidden="true"></span><span aria-hidden="true"></span><button type="button" class="terminal-replay" aria-label="Replay the terminal">↻ Replay</button></div>
+          <code class="typed" data-typed='[{"kind": "cmd", "text": "$ npm install -g lyrcloud"}, {"kind": "dim", "text": "added 1 package in 0.7s"}, {"kind": "gap", "text": ""}, {"kind": "cmd", "text": "$ lyrcloud init hello-edge"}, {"kind": "ok", "text": "✓ Created hello-edge in ./hello-edge"}, {"kind": "gap", "text": ""}, {"kind": "cmd", "text": "$ cd hello-edge && lyrcloud deploy"}, {"kind": "dim", "text": "Uploading 4 files (1.2 KB, 1.0 KB zipped)…"}, {"kind": "ok", "text": "✓ Deployed hello-edge in 4.2s"}, {"kind": "url", "text": "  https://hello-edge.dev.lyr"}]'>
+            <span class="cmd">$ npm install -g lyrcloud</span>
+            <span class="dim">added 1 package in 0.7s</span>
+            <span class="gap"></span>
+            <span class="cmd">$ lyrcloud init hello-edge</span>
+            <span class="ok">✓ Created hello-edge in ./hello-edge</span>
+            <span class="gap"></span>
+            <span class="cmd">$ cd hello-edge && lyrcloud deploy</span>
+            <span class="dim">Uploading 4 files (1.2 KB, 1.0 KB zipped)…</span>
+            <span class="ok">✓ Deployed hello-edge in 4.2s</span>
+            <span class="url">  https://hello-edge.dev.lyr</span>
           </code>
         </div>
         <div>
           <span class="eyebrow">Developer first</span>
           <h2>Deploy globally without rebuilding your stack.</h2>
-          <p>Connect GitHub, push your framework of choice, and let Lyrcloud handle routing, cache strategy, certificates, secrets, and production observability.</p>
+          <p>Install the CLI, run your function locally with <code class="inline">lyrcloud dev</code>, and deploy in seconds. Lyrcloud handles the routing, certificates and logs.</p>
           <div class="pill-grid">
             <a class="pillar" href="/products/cdn/">☍ Network & CDN</a>
             <a class="pillar" href="/products/edge-functions/">{} Edge Functions</a>
@@ -170,6 +227,7 @@ const home = {
       </section>
 ${ctaBand('Make your site feel instant everywhere.', 'Launch an edge-ready experience with security, performance, and AI infrastructure built in from the first request.')}
     </main>`,
+  scripts: ['/src/home.js'],
 };
 
 // ---------------------------------------------------------------- Products
