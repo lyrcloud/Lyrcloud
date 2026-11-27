@@ -63,6 +63,7 @@ import {
 import { azureAccessToken, azureSetupScript, CONNECTION_RE, FederationError, gcpAccessToken, gcpSetupScript, identity } from './federation.mjs';
 import { PROVIDER_OPS, ProviderError } from './providers.mjs';
 import { applyManifests, eksToken, KubeError, parseManifests, workloads } from './kube.mjs';
+import { billingError, CREDIT_PACKS, GRACE_DAYS, HOSTING_SIZES, hostingAppTemplate, hourlyCents, monthlyCents, PLAN_INCLUDED } from './hosting.mjs';
 import { awsServerTemplate, IMAGES, SERVER_OPS, SERVER_SIZES, serverError, serverEstimate, SERVERS_LIMIT, sshCommand } from './servers.mjs';
 
 const env = process.env;
@@ -868,6 +869,222 @@ async function serverRoutes(event, method, path, who) {
   return error(404, 'not_found');
 }
 
+// ---------------------------------------------------------------- managed hosting (hosting.mjs)
+
+const appKey = (id) => ({ pk: `app#${id}`, sk: 'app' });
+const creditKey = (userId) => ({ pk: `credit#${userId}`, sk: 'credit' });
+const HOSTING_KEY = { pk: '#settings', sk: 'hosting' }; // the base stack's outputs, saved by deploy-hosting.sh
+
+async function hostingBase() {
+  const [features, base] = await Promise.all([getFeatures(), getItem(HOSTING_KEY)]);
+  return features.hosting && base?.ListenerArn ? base : null;
+}
+const creditOf = async (userId) => Number((await getItem(creditKey(userId)))?.cents || 0);
+async function addCredit(userId, cents) {
+  const { Attributes } = await ddb.send(new UpdateCommand({ TableName: TABLE, Key: creditKey(userId), UpdateExpression: 'ADD cents :c SET updatedAt = :t', ExpressionAttributeValues: { ':c': cents, ':t': now() }, ReturnValues: 'ALL_NEW' }));
+  return Number(Attributes.cents);
+}
+
+const publicApp = (item) => ({
+  id: item.id, name: item.name, image: item.image, port: item.port, size: item.size, sizeLabel: HOSTING_SIZES[item.size]?.label, count: item.count, env: item.env || {},
+  healthPath: item.healthPath, billing: item.billing, status: item.status, failureReason: item.failureReason || null, url: item.outputs?.Url || null,
+  paidThrough: item.paidThrough || null, payUrl: item.pendingPayment?.url || null, stoppedReason: item.stoppedReason || null,
+  monthlyCents: monthlyCents(item), hourlyCents: hourlyCents(item), privateRegistry: Boolean(item.privateRegistry), registryUser: item.registryUser || null, createdAt: item.createdAt,
+});
+
+// Creates or updates the app's stack. registry: a new login, null to drop it, undefined to keep it.
+async function deployApp(app, base, { create = false, running = true, registry } = {}) {
+  const cf = clients.cloudformation(base.Region || 'us-east-1');
+  const input = { StackName: app.stackName, TemplateBody: JSON.stringify(hostingAppTemplate(app, base, { running })), Parameters: registryParameters(registry, app) };
+  if (create) await cf.send(new CreateStackCommand({ ...input, OnFailure: 'ROLLBACK', Tags: [{ Key: 'lyrcloud', Value: 'hosting' }] }));
+  else {
+    try {
+      await cf.send(new UpdateStackCommand(input));
+    } catch (err) {
+      if (!(err.name === 'ValidationError' && /No updates/.test(err.message))) throw err;
+    }
+  }
+}
+
+async function nextPriority() {
+  const { Attributes } = await ddb.send(new UpdateCommand({ TableName: TABLE, Key: { pk: '#hosting', sk: 'priority' }, UpdateExpression: 'ADD n :one', ExpressionAttributeValues: { ':one': 1 }, ReturnValues: 'ALL_NEW' }));
+  return 1 + (Number(Attributes.n) % 49_000);
+}
+
+async function openAppPayment(app, who) {
+  const keys = await getLyrpay();
+  if (!lyrpay.usable(keys)) throw new CloudError(503, 'Payments aren’t switched on yet.');
+  const n = (app.payments || 0) + 1;
+  const payment = await lyrpay.openPayment(keys, {
+    orderId: `hostapp-${app.id}-${n}`, amountCents: monthlyCents(app), title: `Lyrcloud hosting: ${app.name}, 1 month (${HOSTING_SIZES[app.size].label} × ${app.count})`,
+    returnUrl: `${SITE_URL}/dash/#/cloud?app=${app.id}`, cancelUrl: `${SITE_URL}/dash/#/cloud`, metadata: { kind: 'hosting-app', app: app.id }, email: who.email,
+  }).catch((err) => { throw err instanceof lyrpay.LyrpayError ? new CloudError(502, `Lyrpay: ${err.message}`) : err; });
+  return { id: payment.id, url: payment.url, n, openedAt: now() };
+}
+
+// A monthly app's open payment: paid adds a month and builds or restarts the app; expired drops a new order.
+async function settleApp(item, base) {
+  const pending = item.pendingPayment;
+  if (!pending) return item;
+  const payment = await lyrpay.getPayment(await getLyrpay(), pending.id).catch(() => null);
+  if (payment?.status === 'paid' && lyrpay.paidCents(payment) === monthlyCents(item)) {
+    const next = { ...item, paidThrough: addMonth(item.paidThrough), payments: pending.n, pendingPayment: null, stoppedReason: null };
+    if (item.status === 'awaiting_payment') await deployApp({ ...next }, base, { create: true, registry: undefined }).then(() => { next.status = 'creating'; }, (err) => { next.status = 'failed'; next.failureReason = err.message; });
+    else if (item.status === 'stopped') {
+      await deployApp(next, base, { running: true });
+      next.status = 'updating';
+    }
+    await put(next);
+    return next;
+  }
+  if (payment && ['expired', 'cancelled'].includes(payment.status)) {
+    if (item.status === 'awaiting_payment') {
+      await remove(appKey(item.id));
+      return { ...item, status: 'deleted' };
+    }
+    return update(appKey(item.id), { pendingPayment: null });
+  }
+  return item;
+}
+
+async function stopApp(item, base, reason) {
+  await deployApp(item, base, { running: false });
+  return update(appKey(item.id), { status: 'stopped', stoppedReason: reason, updatedAt: now() });
+}
+
+async function hostingRoutes(event, method, path, who) {
+  const base = await hostingBase();
+  if (!base) return error(404, 'Managed hosting isn’t available yet.');
+  const items = await itemsOf(who.userId);
+  const apps = items.filter((row) => row.row === 'app');
+  if (path === '/cloud/hosting' && method === 'GET') {
+    for (const app of apps.filter((a) => a.pendingPayment)) await settleApp(app, base).catch(() => {});
+    const fresh = (await itemsOf(who.userId)).filter((row) => row.row === 'app');
+    const refreshed = await Promise.all(fresh.map((a) => (['creating', 'updating', 'deleting'].includes(a.status) ? refresh(a, appKey(a.id)).catch(() => a) : a)));
+    return json(200, { sizes: HOSTING_SIZES, creditPacks: CREDIT_PACKS, credit: await creditOf(who.userId), plan: who.plan, apps: refreshed.filter((a) => a.status !== 'deleted').map(publicApp) });
+  }
+  if (path === '/cloud/hosting/credit' && method === 'POST') {
+    const cents = Number(parseJson(event)?.cents);
+    if (!CREDIT_PACKS.includes(cents)) return error(400, `Buy credit in packs of ${CREDIT_PACKS.map((c) => `$${c / 100}`).join(', ')}.`);
+    const keys = await getLyrpay();
+    if (!lyrpay.usable(keys)) return error(503, 'Payments aren’t switched on yet.');
+    const id = shortId();
+    const payment = await lyrpay.openPayment(keys, { orderId: `hostcredit-${id}`, amountCents: cents, title: `Lyrcloud hosting credit $${cents / 100}`, returnUrl: `${SITE_URL}/dash/#/cloud?credit=1`, cancelUrl: `${SITE_URL}/dash/#/cloud`, metadata: { kind: 'hosting-credit' }, email: who.email });
+    await put({ pk: `creditpay#${id}`, sk: 'creditpay', row: 'creditpay', id, ownerId: who.userId, cents, paymentId: payment.id, status: 'open', createdAt: now() });
+    return json(200, { payUrl: payment.url });
+  }
+  if (path === '/cloud/hosting/credit/check' && method === 'POST') {
+    let credit = await creditOf(who.userId);
+    for (const row of items.filter((r) => r.row === 'creditpay' && r.status === 'open')) {
+      const payment = await lyrpay.getPayment(await getLyrpay(), row.paymentId).catch(() => null);
+      if (payment?.status === 'paid' && lyrpay.paidCents(payment) === row.cents) {
+        try {
+          await ddb.send(new UpdateCommand({ TableName: TABLE, Key: { pk: row.pk, sk: row.sk }, UpdateExpression: 'SET #s = :paid', ConditionExpression: '#s = :open', ExpressionAttributeNames: { '#s': 'status' }, ExpressionAttributeValues: { ':paid': 'paid', ':open': 'open' } }));
+          credit = await addCredit(who.userId, row.cents);
+        } catch (err) {
+          if (err.name !== 'ConditionalCheckFailedException') throw err;
+        }
+      } else if (payment && ['expired', 'cancelled'].includes(payment.status)) await remove({ pk: row.pk, sk: row.sk });
+    }
+    // Credit back: restart pay-as-you-go apps that ran out.
+    if (credit > 0) for (const app of apps.filter((a) => a.billing === 'payg' && a.status === 'stopped')) {
+      await deployApp(app, base, { running: true });
+      await update(appKey(app.id), { status: 'updating', stoppedReason: null });
+    }
+    return json(200, { credit });
+  }
+  if (path === '/cloud/hosting/apps' && method === 'POST') {
+    const body = parseJson(event) || {};
+    const refused = serviceError(body) || billingError({ billing: body.billing, size: body.size || 'small', count: body.count ?? 1 }, { plan: who.plan, apps, credit: await creditOf(who.userId) });
+    if (refused) return error(...refused);
+    const name = cleanName(body.name);
+    if (apps.some((a) => a.name === name && a.status !== 'deleted')) return error(409, `You already host an app called ${name}.`);
+    const id = shortId();
+    const app = {
+      ...appKey(id), row: 'app', id, ownerId: who.userId, ownerEmail: who.email, region: base.Region || 'us-east-1', name, ...serviceConfig(body), count: body.count ?? 1,
+      billing: body.billing, ...registryFields(body.registry), token: randomBytes(24).toString('hex'), priority: await nextPriority(),
+      stackName: `lyrcloud-app-${id}`, status: 'creating', createdAt: now(),
+    };
+    if (body.billing === 'monthly') {
+      if (body.registry) return error(400, 'Add a private registry login after the first month is paid (Change → Private image).');
+      const pendingPayment = await openAppPayment(app, who);
+      const saved = { ...app, status: 'awaiting_payment', pendingPayment };
+      await put(saved);
+      return json(200, { app: publicApp(saved), payUrl: pendingPayment.url });
+    }
+    await deployApp(app, base, { create: true, registry: body.registry });
+    await put(app);
+    return json(200, { app: publicApp(app) });
+  }
+  const match = path.match(/^\/cloud\/hosting\/apps\/([a-f0-9]{8})(\/pay|\/payment)?$/);
+  const app = match && apps.find((a) => a.id === match[1]);
+  if (!app) return error(404, 'That app isn’t yours.');
+  if (match[2] === '/payment' && method === 'POST') return json(200, { app: publicApp(await settleApp(app, base)) });
+  if (match[2] === '/pay' && method === 'POST') {
+    if (app.billing !== 'monthly') return error(400, 'Only monthly apps are paid this way.');
+    const pendingPayment = await openAppPayment(app, who);
+    await update(appKey(app.id), { pendingPayment });
+    return json(200, { payUrl: pendingPayment.url });
+  }
+  if (method === 'GET') return json(200, { app: publicApp(app.pendingPayment ? await settleApp(app, base) : await refresh(app, appKey(app.id))) });
+  if (method === 'PUT') {
+    const body = parseJson(event) || {};
+    const refused = serviceError(body, { partial: true });
+    if (refused) return error(...refused);
+    if (!['ready', 'failed'].includes(app.status)) return error(409, app.status === 'stopped' ? 'Pay or add credit to restart the app first.' : 'Wait until the last change finishes.');
+    const next = { ...app, ...serviceConfig(body, app), ...registryFields(body.registry, app) };
+    if ('size' in body || 'count' in body) {
+      next.count = body.count ?? app.count;
+      if (app.billing === 'plan' && (next.size !== 'small' || next.count !== 1)) return error(400, 'The included app is one small copy.');
+      if (app.billing === 'monthly' && monthlyCents(next) !== monthlyCents(app)) return error(400, 'A monthly app keeps its size; make a new app for a different size.');
+    }
+    await deployApp(next, base, { registry: body.registry });
+    const { image, port, size, count, env: vars, healthPath, privateRegistry, registryUser } = next;
+    return json(200, { app: publicApp(await update(appKey(app.id), { image, port, size, count, env: vars, healthPath, privateRegistry, registryUser, status: 'updating', updatedAt: now() })) });
+  }
+  if (method === 'DELETE') {
+    if (app.status === 'awaiting_payment') await remove(appKey(app.id));
+    else {
+      await clients.cloudformation(app.region).send(new DeleteStackCommand({ StackName: app.stackName }));
+      await update(appKey(app.id), { status: 'deleting', updatedAt: now() });
+    }
+    return json(200, { deleted: true });
+  }
+  return error(404, 'not_found');
+}
+
+// Hourly: charge pay-as-you-go apps, stop apps whose month or plan ran out. Runs only with hosting on.
+export async function hostingTick(at = new Date()) {
+  const base = await hostingBase();
+  if (!base) return { skipped: 'hosting off' };
+  const rows = [];
+  let ExclusiveStartKey;
+  do {
+    const page = await ddb.send(new ScanCommand({ TableName: TABLE, FilterExpression: '#r = :app', ExpressionAttributeNames: { '#r': 'row' }, ExpressionAttributeValues: { ':app': 'app' }, ExclusiveStartKey }));
+    rows.push(...(page.Items || []));
+    ExclusiveStartKey = page.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  const result = { charged: 0, stopped: 0 };
+  for (const app of rows.filter((a) => ['ready', 'updating', 'creating'].includes(a.status))) {
+    try {
+      if (app.billing === 'payg') {
+        const left = await addCredit(app.ownerId, -hourlyCents(app));
+        result.charged += hourlyCents(app);
+        if (left <= 0) { await stopApp(app, base, 'Your Lyrcloud credit ran out. Add credit to restart it.'); result.stopped += 1; }
+      } else if (app.billing === 'monthly' && Date.parse(app.paidThrough || 0) + GRACE_DAYS * 864e5 < at.getTime()) {
+        await stopApp(app, base, 'This month isn’t paid. Pay to restart it.');
+        result.stopped += 1;
+      } else if (app.billing === 'plan') {
+        const owner = (await ddb.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId: app.ownerId } }))).Item;
+        if (!PLAN_INCLUDED.includes(planFor(owner))) { await stopApp(app, base, 'Your plan no longer includes an app. Upgrade to restart it.'); result.stopped += 1; }
+      }
+    } catch (err) {
+      console.error('hosting tick', app.id, err.message);
+    }
+  }
+  return result;
+}
+
 // ---------------------------------------------------------------- overview and admin
 
 async function overview(who) {
@@ -932,6 +1149,7 @@ async function admin(who) {
 // ---------------------------------------------------------------- entry
 
 export const handler = async (event) => {
+  if (event?.lyrcloudTask === 'hosting-tick') return hostingTick();
   const method = event.requestContext?.http?.method;
   const path = event.requestContext?.http?.path || '';
   try {
@@ -946,6 +1164,7 @@ export const handler = async (event) => {
     if (path === '/cloud/clusters' || path.startsWith('/cloud/clusters/')) return await clusterRoutes(event, method, path, who);
     if (path.startsWith('/cloud/services/')) return await serviceRoutes(event, method, path, who);
     if (path === '/cloud/servers' || path.startsWith('/cloud/servers/')) return await serverRoutes(event, method, path, who);
+    if (path === '/cloud/hosting' || path.startsWith('/cloud/hosting/')) return await hostingRoutes(event, method, path, who);
     return error(404, 'not_found');
   } catch (err) {
     if (err instanceof CloudError || err instanceof FederationError || err instanceof ProviderError || err instanceof KubeError) return error(err.status, err.message);

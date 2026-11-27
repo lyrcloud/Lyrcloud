@@ -47,11 +47,28 @@ DynamoDBDocumentClient.prototype.send = async function send(command) {
   if (name === 'PutCommand') return table.set(keyOf(input.TableName, input.Item), structuredClone(input.Item)), {};
   if (name === 'DeleteCommand') return table.delete(keyOf(input.TableName, input.Key)), {};
   if (name === 'UpdateCommand') {
-    const item = table.get(keyOf(input.TableName, input.Key));
-    for (const part of input.UpdateExpression.replace(/^SET /, '').split(', ')) {
-      const [field, value] = part.split(' = ');
-      item[input.ExpressionAttributeNames[field]] = structuredClone(input.ExpressionAttributeValues[value]);
+    // SET a = :x, b = :y; ADD n :x (numbers, creating the item); ConditionExpression "#f = :v".
+    const k = keyOf(input.TableName, input.Key);
+    const item = table.get(k) || { ...input.Key };
+    const names = input.ExpressionAttributeNames || {};
+    const values = input.ExpressionAttributeValues || {};
+    if (input.ConditionExpression) {
+      const [field, value] = input.ConditionExpression.split(' = ');
+      if (item[names[field] || field] !== values[value]) throw Object.assign(new Error('condition'), { name: 'ConditionalCheckFailedException' });
     }
+    for (const clause of input.UpdateExpression.split(/ (?=SET |ADD )/)) {
+      const [verb, ...rest] = clause.split(' ');
+      for (const part of rest.join(' ').split(', ')) {
+        if (verb === 'SET') {
+          const [field, value] = part.split(' = ');
+          item[names[field] || field] = structuredClone(values[value]);
+        } else {
+          const [field, value] = part.split(' ');
+          item[names[field] || field] = (item[names[field] || field] || 0) + values[value];
+        }
+      }
+    }
+    table.set(k, item);
     return { Attributes: structuredClone(item) };
   }
   if (name === 'QueryCommand') return { Items: structuredClone([...table.values()].filter((item) => item.ownerId === input.ExpressionAttributeValues[':o'])) };
@@ -88,7 +105,7 @@ clients.cloudformation = (region, credentials) => ({
   send: async (command) => {
     const name = command.constructor.name;
     const input = command.input;
-    calls.push({ name, region, input, session: credentials.sessionToken });
+    calls.push({ name, region, input, session: (credentials?.sessionToken ?? "lyrcloud-own-account") });
     const key = `${region}|${input.StackName}`;
     if (name === 'CreateStackCommand') {
       if (region === 'ap-east-1') throw Object.assign(new Error('The region is not opted in'), { name: 'OptInRequired' });
@@ -394,4 +411,78 @@ test('Linux servers on AWS: their key, SSH only from where they say, web open; p
   assert.equal((await call(ALICE, 'DELETE', '/cloud/connections/aws')).status, 409, 'servers first');
   assert.equal((await call(BOB, 'GET', `/cloud/servers/${id}`)).status, 404);
   assert.equal((await call(ALICE, 'DELETE', `/cloud/servers/${id}`)).body.server.status, 'deleting');
+});
+
+const HOSTING_BASE = {
+  pk: '#settings', sk: 'hosting', Region: 'us-east-1', ClusterName: 'lyrcloud-hosting', VpcId: 'vpc-h', SubnetIds: 'subnet-1,subnet-2',
+  ExecutionRoleArn: 'arn:aws:iam::479664683751:role/lyrcloud-hosting-exec', ListenerArn: 'arn:listener', BalancerSecurityGroup: 'sg-lb', BalancerDns: 'lb.example.com',
+};
+const hostingOn = async () => {
+  tables.cloud.set('#settings|hosting', { ...HOSTING_BASE });
+  await call(SUPER, 'PUT', '/admin/cloud/settings', { hosting: true });
+};
+
+test('managed hosting stays hidden until it is built and switched on', async () => {
+  assert.equal((await call(ALICE, 'GET', '/cloud/hosting')).status, 404);
+  tables.cloud.set('#settings|hosting', { ...HOSTING_BASE });
+  assert.equal((await call(ALICE, 'GET', '/cloud/hosting')).status, 404, 'built but off');
+  await call(SUPER, 'PUT', '/admin/cloud/settings', { hosting: true });
+  const res = await call(ALICE, 'GET', '/cloud/hosting');
+  assert.deepEqual([res.status, res.body.credit, res.body.apps], [200, 0, []]);
+});
+
+test('hosting, monthly: paid first, built behind CloudFront with a secret header, stopped when unpaid', async () => {
+  await hostingOn();
+  const ordered = await call(ALICE, 'POST', '/cloud/hosting/apps', { name: 'site', image: 'nginx', size: 'medium', billing: 'monthly' });
+  assert.equal(ordered.body.app.status, 'awaiting_payment');
+  assert.equal([...lyrpayments.values()][0].amount, '24.00');
+  payAll();
+  const paid = await call(ALICE, 'POST', `/cloud/hosting/apps/${ordered.body.app.id}/payment`);
+  assert.equal(paid.body.app.status, 'creating');
+  const template = stacks.get(`us-east-1|lyrcloud-app-${ordered.body.app.id}`).template;
+  const token = template.Resources.Rule.Properties.Conditions[0].HttpHeaderConfig.Values[0];
+  assert.match(token, /^[a-f0-9]{48}$/);
+  assert.deepEqual(template.Resources.Distribution.Properties.DistributionConfig.Origins[0].OriginCustomHeaders, [{ HeaderName: 'x-lyr-app', HeaderValue: token }]);
+  assert.equal(template.Resources.TaskSecurity.Properties.SecurityGroupIngress[0].SourceSecurityGroupId, 'sg-lb', 'only the load balancer reaches the containers');
+  assert.equal(template.Resources.Service.Properties.DesiredCount, 1);
+  assert.equal((await call(BOB, 'GET', `/cloud/hosting/apps/${ordered.body.app.id}`)).status, 404);
+
+  finish('us-east-1', `lyrcloud-app-${ordered.body.app.id}`, { Url: 'https://d123.cloudfront.net' });
+  const row = tables.cloud.get(`app#${ordered.body.app.id}|app`);
+  assert.equal((await call(ALICE, 'GET', `/cloud/hosting/apps/${row.id}`)).body.app.url, 'https://d123.cloudfront.net');
+  const { hostingTick } = await import('./index.mjs');
+  assert.deepEqual(await hostingTick(new Date(Date.now() + 20 * 864e5)), { charged: 0, stopped: 0 }, 'inside the month');
+  assert.deepEqual(await hostingTick(new Date(Date.now() + 40 * 864e5)), { charged: 0, stopped: 1 }, 'a month and the grace days later');
+  assert.equal(stacks.get(`us-east-1|lyrcloud-app-${row.id}`).template.Resources.Service.Properties.DesiredCount, 0, 'stopped, not deleted');
+  assert.equal(tables.cloud.get(`app#${row.id}|app`).status, 'stopped');
+});
+
+test('hosting, plan and pay as you go: one small app with Scale; credit is charged hourly and stops at zero', async () => {
+  await hostingOn();
+  tables.users.get(ALICE.userId).plan = 'launch';
+  assert.equal((await call(ALICE, 'POST', '/cloud/hosting/apps', { name: 'free', image: 'nginx', billing: 'plan' })).status, 402);
+  tables.users.get(ALICE.userId).plan = 'scale';
+  assert.equal((await call(ALICE, 'POST', '/cloud/hosting/apps', { name: 'free', image: 'nginx', size: 'large', billing: 'plan' })).status, 400, 'the included app is small');
+  assert.equal((await call(ALICE, 'POST', '/cloud/hosting/apps', { name: 'free', image: 'nginx', billing: 'plan' })).body.app.status, 'creating');
+  assert.equal((await call(ALICE, 'POST', '/cloud/hosting/apps', { name: 'free2', image: 'nginx', billing: 'plan' })).status, 409, 'one per plan');
+
+  assert.equal((await call(ALICE, 'POST', '/cloud/hosting/apps', { name: 'api', image: 'nginx', size: 'small', billing: 'payg' })).status, 402, 'credit first');
+  assert.equal((await call(ALICE, 'POST', '/cloud/hosting/credit', { cents: 123 })).status, 400);
+  const buy = await call(ALICE, 'POST', '/cloud/hosting/credit', { cents: 1000 });
+  assert.match(buy.body.payUrl, /lyrpay/);
+  payAll();
+  assert.equal((await call(ALICE, 'POST', '/cloud/hosting/credit/check')).body.credit, 1000);
+  assert.equal((await call(ALICE, 'POST', '/cloud/hosting/credit/check')).body.credit, 1000, 'counted once');
+  const api = await call(ALICE, 'POST', '/cloud/hosting/apps', { name: 'api', image: 'nginx', size: 'small', count: 2, billing: 'payg' });
+  assert.equal(api.status, 200, JSON.stringify(api.body));
+  const { hostingTick } = await import('./index.mjs');
+  assert.equal((await hostingTick()).charged, 4, '2 copies × 2¢ an hour');
+  assert.equal(tables.cloud.get(`credit#${ALICE.userId}|credit`).cents, 996);
+  tables.cloud.get(`credit#${ALICE.userId}|credit`).cents = 3;
+  assert.equal((await hostingTick()).stopped, 1, 'credit gone');
+  assert.equal(tables.cloud.get(`app#${api.body.app.id}|app`).status, 'stopped');
+  tables.users.get(ALICE.userId).plan = 'launch';
+  const free = [...tables.cloud.values()].find((r) => r.row === 'app' && r.billing === 'plan');
+  free.status = 'ready';
+  assert.equal((await hostingTick()).stopped, 1, 'plan downgraded: the included app stops');
 });

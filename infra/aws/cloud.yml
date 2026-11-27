@@ -176,6 +176,16 @@ Resources:
     Type: AWS::ApiGatewayV2::Route
     Properties: { ApiId: !Ref HttpApi, RouteKey: 'GET /admin/cloud', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }
 
+  # Managed hosting's hourly run (pay-as-you-go charges, unpaid apps stop). Does nothing while hosting is off.
+  HostingTick:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(1 hour)
+      Targets: [{ Id: hosting, Arn: !GetAtt CloudFunction.Arn, Input: '{"lyrcloudTask":"hosting-tick"}' }]
+  HostingTickPermission:
+    Type: AWS::Lambda::Permission
+    Properties: { FunctionName: !Ref CloudFunction, Action: lambda:InvokeFunction, Principal: events.amazonaws.com, SourceArn: !GetAtt HostingTick.Arn }
+
   AdminSettingsRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties: { ApiId: !Ref HttpApi, RouteKey: 'PUT /admin/cloud/settings', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref JwtAuthorizer }

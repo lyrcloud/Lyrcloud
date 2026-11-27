@@ -1,0 +1,153 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Lyrcloud managed hosting: customers' apps run on Lyrcloud's own AWS account (ECS Fargate). One shared
+  network, cluster and load balancer; each app adds its own target group, listener rule, service and a
+  CloudFront distribution (made by the cloud API, api/cloud/hosting.mjs). The load balancer only accepts
+  CloudFront, and each app's rule needs that app's secret header, so apps are only reachable through their
+  own address. Deploy with scripts/deploy-hosting.sh; nothing here is used until the super admin switches
+  managed hosting on (Admin console > Cloud).
+
+Parameters:
+  CloudFunctionRoleName:
+    Type: String
+    Description: The lyrcloud-cloud Lambda's role, which builds and removes app stacks.
+  CloudFrontPrefixListId:
+    Type: String
+    Description: The com.amazonaws.global.cloudfront.origin-facing managed prefix list in this region (deploy-hosting.sh finds it).
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties: { CidrBlock: 10.90.0.0/16, EnableDnsHostnames: true, EnableDnsSupport: true, Tags: [{ Key: Name, Value: lyrcloud-hosting }] }
+  Gateway:
+    Type: AWS::EC2::InternetGateway
+  Attach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref Gateway }
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties: { VpcId: !Ref Vpc, CidrBlock: 10.90.0.0/20, MapPublicIpOnLaunch: true, AvailabilityZone: !Select [0, !GetAZs ''], Tags: [{ Key: Name, Value: lyrcloud-hosting-a }] }
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties: { VpcId: !Ref Vpc, CidrBlock: 10.90.16.0/20, MapPublicIpOnLaunch: true, AvailabilityZone: !Select [1, !GetAZs ''], Tags: [{ Key: Name, Value: lyrcloud-hosting-b }] }
+  Routes:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  Internet:
+    Type: AWS::EC2::Route
+    DependsOn: Attach
+    Properties: { RouteTableId: !Ref Routes, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref Gateway }
+  RoutesA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetA, RouteTableId: !Ref Routes }
+  RoutesB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetB, RouteTableId: !Ref Routes }
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: lyrcloud-hosting
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      DefaultCapacityProviderStrategy: [{ CapacityProvider: FARGATE, Weight: 1 }]
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lyrcloud-hosting-exec
+      AssumeRolePolicyDocument: { Version: '2012-10-17', Statement: [{ Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }] }
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy]
+      Policies:
+        - PolicyName: PrivateRegistries
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:lyrcloud-app-*'
+
+  # Only CloudFront reaches the load balancer.
+  BalancerSecurity:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: lyrcloud-hosting load balancer (CloudFront only)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress: [{ IpProtocol: tcp, FromPort: 80, ToPort: 80, SourcePrefixListId: !Ref CloudFrontPrefixListId }]
+  Balancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties: { Name: lyrcloud-hosting, Scheme: internet-facing, Type: application, Subnets: [!Ref SubnetA, !Ref SubnetB], SecurityGroups: [!Ref BalancerSecurity] }
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Balancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{ Type: fixed-response, FixedResponseConfig: { StatusCode: '404', ContentType: text/plain, MessageBody: 'No Lyrcloud app here.' } }]
+
+  # What the cloud API may do in this account: build and remove app stacks named lyrcloud-app-*.
+  AppBuilder:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: LyrcloudHostingApps
+      Roles: [!Ref CloudFunctionRoleName]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: [cloudformation:CreateStack, cloudformation:UpdateStack, cloudformation:DeleteStack, cloudformation:DescribeStacks, cloudformation:DescribeStackEvents]
+            Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/lyrcloud-app-*/*'
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:CreateTargetGroup
+              - elasticloadbalancing:DeleteTargetGroup
+              - elasticloadbalancing:ModifyTargetGroup
+              - elasticloadbalancing:ModifyTargetGroupAttributes
+              - elasticloadbalancing:CreateRule
+              - elasticloadbalancing:DeleteRule
+              - elasticloadbalancing:ModifyRule
+              - elasticloadbalancing:AddTags
+              - elasticloadbalancing:Describe*
+              - ecs:RegisterTaskDefinition
+              - ecs:DeregisterTaskDefinition
+              - ecs:CreateService
+              - ecs:UpdateService
+              - ecs:DeleteService
+              - ecs:Describe*
+              - ecs:TagResource
+              - ec2:CreateSecurityGroup
+              - ec2:DeleteSecurityGroup
+              - ec2:AuthorizeSecurityGroupIngress
+              - ec2:RevokeSecurityGroupIngress
+              - ec2:CreateTags
+              - ec2:Describe*
+              - logs:CreateLogGroup
+              - logs:DeleteLogGroup
+              - logs:PutRetentionPolicy
+              - logs:TagResource
+              - logs:DescribeLogGroups
+              - cloudfront:CreateDistribution
+              - cloudfront:UpdateDistribution
+              - cloudfront:DeleteDistribution
+              - cloudfront:GetDistribution
+              - cloudfront:GetDistributionConfig
+              - cloudfront:TagResource
+              - cloudfront:ListTagsForResource
+              - ssm:GetParameters
+            Resource: '*'
+          - Effect: Allow
+            Action: [secretsmanager:CreateSecret, secretsmanager:DeleteSecret, secretsmanager:UpdateSecret, secretsmanager:PutSecretValue, secretsmanager:DescribeSecret, secretsmanager:TagResource]
+            Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:lyrcloud-app-*'
+          - Effect: Allow
+            Action: iam:PassRole
+            Resource: !GetAtt ExecutionRole.Arn
+          - Effect: Allow
+            Action: [iam:PutRolePolicy, iam:DeleteRolePolicy, iam:GetRolePolicy]
+            Resource: !GetAtt ExecutionRole.Arn
+
+Outputs:
+  ClusterName: { Value: !Ref Cluster }
+  VpcId: { Value: !Ref Vpc }
+  SubnetIds: { Value: !Join [',', [!Ref SubnetA, !Ref SubnetB]] }
+  ExecutionRoleArn: { Value: !GetAtt ExecutionRole.Arn }
+  ListenerArn: { Value: !Ref Listener }
+  BalancerSecurityGroup: { Value: !Ref BalancerSecurity }
+  BalancerDns: { Value: !GetAtt Balancer.DNSName }

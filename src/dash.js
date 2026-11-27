@@ -2775,12 +2775,59 @@ function cloudView() {
           </tr>`).join('')}</tbody></table></div>` : '<p class="muted">No clusters yet.</p>'}
       </section>
       ${Object.values(data.connections || {}).some((c) => c?.status === 'connected') || data.connection?.status === 'connected' ? clusterForm(data.connections || { aws: data.connection }) : ''}
+      ${data.features?.hosting ? hostingPanel() : ''}
       ${serversPanel(data)}
       <section class="panel">
         <div class="panel-head"><h2>Other clouds</h2></div>
         <p class="muted">Their regions are on the map. Clusters there come later.</p>
         <div class="provider-legend">${PROVIDERS.filter((p) => !p.provisioning).map((p) => `<span><i style="background:${p.color}"></i>${esc(p.fullName)} <small>coming soon</small></span>`).join('')}</div>
       </section>`}`;
+}
+
+// Managed hosting: apps on Lyrcloud's own cloud (shown when the super admin switches it on).
+function hostingPanel() {
+  if (!cloud.hosting && !cloud.hostingLoading) {
+    cloud.hostingLoading = true;
+    const params = currentRoute?.params;
+    const after = params?.get('credit') ? cloudApi('/cloud/hosting/credit/check', { method: 'POST' }) : params?.get('app') ? cloudApi(`/cloud/hosting/apps/${params.get('app')}/payment`, { method: 'POST' }) : Promise.resolve();
+    after.catch(() => {}).then(() => cloudApi('/cloud/hosting')).then((data) => { cloud.hosting = data; }, (error) => { cloud.hosting = { error: error.message }; }).finally(() => { cloud.hostingLoading = false; render(); });
+  }
+  const h = cloud.hosting;
+  if (!h) return '<section class="panel"><p class="muted">Loading Lyrcloud hosting…</p></section>';
+  if (h.error) return '';
+  const money = (cents) => `$${(cents / 100).toFixed(2)}`;
+  const billingLabel = { monthly: 'Monthly', plan: 'Included with your plan', payg: 'Pay as you go' };
+  const sizes = Object.entries(h.sizes);
+  return `
+    <section class="panel">
+      <div class="panel-head"><h2>Lyrcloud hosting</h2><span class="muted">No cloud account needed · runs on Lyrcloud</span></div>
+      ${settingRow('Credit', `For pay-as-you-go apps. Balance <b>${money(h.credit)}</b>.`, h.creditPacks.map((c) => `<button class="btn small" data-action="hosting-credit" data-cents="${c}">+ ${money(c)}</button>`).join(' '))}
+      ${h.apps.length ? `<ul class="service-list">${h.apps.map((a) => `
+        <li class="service-card"><div class="service-main">
+          <div><b class="mono">${esc(a.name)}</b> ${a.status === 'stopped' ? '<span class="status bad">■ Stopped</span>' : cloudStatus(a.status)}
+            <div class="muted small mono">${esc(a.image)} · ${esc(a.sizeLabel)} × ${a.count} · ${billingLabel[a.billing]}${a.billing === 'monthly' ? ` ${money(a.monthlyCents)}/mo${a.paidThrough ? `, paid through ${formatDate(a.paidThrough)}` : ''}` : a.billing === 'payg' ? ` ${money(a.hourlyCents)}/hour` : ''}</div>
+            ${a.url ? `<a class="link" href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.url)} ↗</a>` : ''}
+            ${a.stoppedReason ? `<p class="form-error">${esc(a.stoppedReason)}</p>` : ''}${a.failureReason ? `<p class="form-error">${esc(a.failureReason)}</p>` : ''}</div>
+          <div class="row tight">${a.billing === 'monthly' ? `<button class="btn small${a.status === 'awaiting_payment' || a.status === 'stopped' ? ' primary' : ''}" data-action="hosting-pay" data-id="${a.id}">${a.status === 'awaiting_payment' ? 'Pay to start' : 'Pay a month'}</button>` : ''}
+            <button class="btn small danger" data-action="hosting-delete" data-id="${a.id}" data-name="${esc(a.name)}">Delete</button></div>
+        </div></li>`).join('')}</ul>` : '<p class="muted">Deploy a container and Lyrcloud runs it for you, with an HTTPS address. Put it on your own domain later from Sites.</p>'}
+      <form class="stack" data-form="hosting-create">
+        <div class="field-grid">
+          <label class="field">Name<input name="name" required pattern="[a-z][a-z0-9-]{1,30}[a-z0-9]" maxlength="32" placeholder="web" autocomplete="off" /></label>
+          <label class="field">Container image<input name="image" class="mono" required placeholder="nginx:latest" autocomplete="off" /></label>
+          <label class="field">Port<input name="port" type="number" min="1" max="65535" value="80" /></label>
+          <label class="field">Size<select name="size">${sizes.map(([id, s]) => `<option value="${id}">${s.label} · ${money(s.monthlyCents)}/mo or ${money(s.hourlyCents)}/h</option>`).join('')}</select></label>
+          <label class="field">Copies<input name="count" type="number" min="1" max="3" value="1" /></label>
+        </div>
+        <div class="plan-options">
+          <label class="plan-option"><input type="radio" name="billing" value="monthly" checked /><span><b>Monthly</b><small>A fixed price, paid with Lyrpay before it starts.</small></span></label>
+          <label class="plan-option"><input type="radio" name="billing" value="plan"${['scale', 'enterprise'].includes(h.plan) ? '' : ' disabled'} /><span><b>Included with your plan</b><small>One small app with Scale or Enterprise.</small></span></label>
+          <label class="plan-option"><input type="radio" name="billing" value="payg" /><span><b>Pay as you go</b><small>By the hour, from your credit. Stops when the credit runs out.</small></span></label>
+        </div>
+        <label class="field">Environment variables (NAME=value, one per line)<textarea name="env" rows="2" class="mono"></textarea></label>
+        <div class="row"><button class="btn primary" type="submit">Deploy</button></div>
+      </form>
+    </section>`;
 }
 
 const SERVER_IMAGES = { ubuntu: 'Ubuntu 24.04 LTS', debian: 'Debian 12', 'amazon-linux': 'Amazon Linux 2023 (AWS)' };
@@ -3070,6 +3117,12 @@ const cloudClickActions = {
     go('#/');
   },
   'cloud-workloads': (target) => cloudRun(target, () => cloudApi(`/cloud/clusters/${currentRoute.clusterId}/workloads`), '', (result) => { cloud.workloads = result; render(); }),
+  'hosting-credit': (target) => cloudRun(target, () => cloudApi('/cloud/hosting/credit', { method: 'POST', body: JSON.stringify({ cents: Number(target.dataset.cents) }) }), '', ({ payUrl }) => { location.href = payUrl; }),
+  'hosting-pay': (target) => cloudRun(target, () => cloudApi(`/cloud/hosting/apps/${target.dataset.id}/pay`, { method: 'POST' }), '', ({ payUrl }) => { location.href = payUrl; }),
+  'hosting-delete': (target) => {
+    if (!confirmed(target, `Delete ${target.dataset.name}? It stops and its address goes away.`)) return;
+    cloudRun(target, () => cloudApi(`/cloud/hosting/apps/${target.dataset.id}`, { method: 'DELETE' }), 'Deleting…', () => { cloud.hosting = null; render(); });
+  },
   'cloud-delete-server': (target) => {
     if (!confirmed(target, `Delete ${target.dataset.name}? The server and its disk are erased.`)) return;
     cloudRun(target, () => cloudApi(`/cloud/servers/${target.dataset.id}`, { method: 'DELETE' }), `Deleting ${target.dataset.name}…`, loadCloud);
@@ -3147,6 +3200,21 @@ const cloudFormActions = {
     }, (error) => {
       button.disabled = false;
       showFormError(form, error.message);
+    });
+  },
+  'hosting-create': (form, data) => {
+    let env;
+    try {
+      env = parseEnv(data.get('env'));
+    } catch (error) {
+      return toast(error.message);
+    }
+    const body = { name: String(data.get('name')).trim(), image: String(data.get('image')).trim(), port: Number(data.get('port')), size: String(data.get('size')), count: Number(data.get('count')), billing: String(data.get('billing')), env };
+    cloudRun(form.querySelector('[type="submit"]'), () => cloudApi('/cloud/hosting/apps', { method: 'POST', body: JSON.stringify(body) }), '', ({ payUrl }) => {
+      if (payUrl) { location.href = payUrl; return; }
+      toast('Deploying… your address is ready in about 5 minutes');
+      cloud.hosting = null;
+      render();
     });
   },
   'cloud-create-server': (form, data) => cloudRun(form.querySelector('[type="submit"]'),
