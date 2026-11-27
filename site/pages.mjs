@@ -803,6 +803,7 @@ const authShell = ({ mode }) => {
           <p class="auth-divider"><span>or with email</span></p>
         </div>
         ${authSteps({ isSignUp })}
+        ${isSignUp ? '' : '<p class="muted small auth-switch">One login for every Lyr app: your Lyrpay, Lyrtrip or Lyrshop email and password work here too.</p>'}
         <p class="auth-switch">${isSignUp ? 'Already have an account? <a class="text-link" href="/login/">Log in</a>' : 'New to Lyrcloud? <a class="text-link" href="/sign-up/">Create an account</a>'}</p>
       </div>
     </main>`;
