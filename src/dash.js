@@ -549,7 +549,7 @@ const views = {
           : ''
       }
       <div class="grid-3">
-        <a class="panel quick" href="#/workers"><span aria-hidden="true">{}</span><h3>Edge Functions</h3><p>${state.workers.length} created · run code in 180+ cities</p></a>
+        <a class="panel quick" href="#/workers"><span aria-hidden="true">{}</span><h3>Edge Functions</h3><p>${state.workers.length} created · deploy with <code>lyrcloud deploy</code></p></a>
         <a class="panel quick" href="/developers/#quickstart"><span aria-hidden="true">⌘</span><h3>Install the CLI</h3><p>Deploy from your terminal with <code>lyrcloud deploy</code></p></a>
         <a class="panel quick" href="#/plans"><span aria-hidden="true">${icons.plans}</span><h3>${state.plan === 'launch' ? 'Upgrade plan' : 'Your plan'}</h3><p>${esc(planName(state.plan))} · ${state.plan === 'launch' ? 'unlock the managed WAF and image optimization' : 'change plan or apply it to your sites'}</p></a>
       </div>`;

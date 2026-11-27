@@ -6,7 +6,7 @@ export const products = [
     name: 'Global CDN',
     group: 'Application performance',
     tagline: 'Cache everything, everywhere, in milliseconds.',
-    summary: 'Serve static and dynamic content from 180+ edge locations with tiered caching, smart routing, and instant purges.',
+    summary: 'Serve static and dynamic content from a global edge network with tiered caching, smart routing, and instant purges.',
     features: [
       ['Tiered cache', 'Upper-tier data centers shield your origin so cache misses rarely leave the network.'],
       ['Instant purge', 'Purge by URL, tag, prefix, or everything — propagated worldwide in under 150 ms.'],
@@ -46,21 +46,23 @@ lyrcloud waf rule create \\
     icon: '{}',
     name: 'Edge Functions',
     group: 'Developer platform',
-    tagline: 'Run code within milliseconds of every user.',
-    summary: 'Deploy serverless JavaScript, TypeScript, and WebAssembly to the edge with no cold starts and no regions to pick.',
+    tagline: 'Write a fetch handler. Live in seconds.',
+    summary: 'Deploy JavaScript fetch handlers from the lyrcloud CLI. Each function runs in its own isolated sandbox and goes live at https://<name>.dev.lyr.',
     features: [
-      ['Zero cold starts', 'Lightweight isolates spin up in under 5 ms — no containers to warm.'],
-      ['Global by default', 'One deploy command ships your code to every edge location at once.'],
-      ['KV & Durable state', 'Low-latency key-value storage and strongly consistent objects built in.'],
-      ['Queues & Cron', 'Background jobs and scheduled triggers without managing infrastructure.'],
-      ['Framework adapters', 'First-class support for Next.js, Astro, Remix, SvelteKit, and Hono.'],
-      ['Local dev', 'A full local runtime that mirrors production for fast, offline iteration.'],
+      ['Deploys in seconds', '<code>lyrcloud deploy</code> uploads your project and it’s live in about five seconds.'],
+      ['Standard Web APIs', 'Request, Response, URL and fetch: the same code runs in <code>lyrcloud dev</code>, the playground and production.'],
+      ['Isolated by design', 'Every function runs in its own sandbox with no access to any other customer’s code or data.'],
+      ['Variables', 'Put settings under <code>vars</code> in <code>lyrcloud.json</code> and read them from <code>env</code>.'],
+      ['Live logs', 'Anything you <code>console.log</code> shows up in <code>lyrcloud logs -f</code>.'],
+      ['Local dev', '<code>lyrcloud dev</code> runs the production runtime on your machine and reloads on every save.'],
     ],
     code: `export default {
-  async fetch(request, env) {
-    const country = request.geo.country;
-    const greeting = await env.KV.get(\`hello:\${country}\`);
-    return new Response(greeting ?? 'Hello from the edge!');
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (url.pathname === '/api/time') {
+      return Response.json({ now: new Date() });
+    }
+    return new Response(\`Hi from \${url.hostname}\`);
   },
 };`,
   },

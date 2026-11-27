@@ -241,7 +241,7 @@ const productsIndex = {
 ${pageHero({
   eyebrow: 'The Lyrcloud platform',
   title: 'One network. Every service your apps need.',
-  lede: 'Every Lyrcloud product runs on every edge location, so performance, security, and compute work together instead of fighting over a request.',
+  lede: 'Lyrcloud products are built to work together, so performance, security, and compute share one control plane instead of fighting over a request.',
   ctas: '<a class="button primary large" href="/sign-up/">Start building</a><a class="button secondary large" href="/pricing/">See pricing</a>',
 })}
       ${[...new Set(products.map((product) => product.group))]
@@ -449,24 +449,28 @@ const cities = [
   ['Auckland', 174.8, -36.8], ['Perth', 115.9, -31.9],
 ];
 
-const regions = [
-  ['North America', 54], ['Latin America', 23], ['Europe', 48], ['Middle East & Africa', 21], ['Asia Pacific', 38],
+// How a request is handled, layer by layer.
+const layers = [
+  ['Global', 'Delivery: sites and assets are cached and served from edge locations worldwide.'],
+  ['US East', 'Compute: Edge Functions run in Lyrcloud’s compute region, each in its own sandbox.'],
+  ['.lyr', 'DNS: Lyrcloud answers .lyr names from its own DNS-over-HTTPS resolver.'],
+  ['Lyr Root CA', 'TLS: .lyr addresses get HTTPS certificates from Lyrcloud’s own root.'],
 ];
 
 const networkPage = {
   route: '/network/',
   title: 'Global network',
-  description: 'Lyrcloud runs every product in 180+ cities across six continents.',
+  description: 'How Lyrcloud delivers, runs, and resolves your traffic: global delivery, a compute region for Edge Functions, and its own .lyr DNS.',
   body: `
     <main>
 ${pageHero({
   eyebrow: 'Global network',
-  title: 'Within 50 ms of 95% of the internet.',
-  lede: 'Every Lyrcloud location runs every service — CDN, security, compute, and storage — so requests are handled where they land.',
+  title: 'One network, four layers.',
+  lede: 'Lyrcloud serves content from a global edge network, runs Edge Functions in its compute region, answers .lyr names from its own resolver, and secures them with its own certificate authority.',
 })}
       <section class="section">
         <div class="network-map glass-card">
-          <svg viewBox="0 0 360 180" role="img" aria-label="Map of Lyrcloud edge locations">
+          <svg viewBox="0 0 360 180" role="img" aria-label="Map of cities the delivery network serves content from">
             <defs>
               <pattern id="dots" width="4" height="4" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="0.45" fill="currentColor" opacity="0.25" /></pattern>
             </defs>
@@ -477,8 +481,9 @@ ${pageHero({
           </svg>
         </div>
         <div class="metrics region-grid">
-          ${regions.map(([name, count]) => `<div class="metric"><strong>${count}</strong><span>${name}</span></div>`).join('\n          ')}
+          ${layers.map(([name, text]) => `<div class="metric"><strong>${name}</strong><span>${text}</span></div>`).join('\n          ')}
         </div>
+        <p class="center-text muted-note">Some of the cities the delivery network serves content from.</p>
         <ul class="city-list">
           ${cities.map(([name]) => `<li>${name}</li>`).join('')}
         </ul>

@@ -1249,8 +1249,16 @@ code.inline {
 }
 
 .region-grid {
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   margin-top: 18px;
+}
+
+.region-grid .metric span { display: block; margin-top: 6px; line-height: 1.45; }
+
+.muted-note {
+  margin: 28px 0 10px;
+  color: var(--muted);
+  font-size: 0.9rem;
 }
 
 .city-list {
