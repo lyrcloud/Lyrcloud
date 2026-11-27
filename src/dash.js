@@ -391,7 +391,7 @@ const pageHead = (title, subtitle = '', actions = '') => `
   </div>`;
 
 const statusBadge = (status) =>
-  status === 'active' ? '<span class="status ok">● Active</span>' : '<span class="status pending">◌ Pending nameservers</span>';
+  status === 'active' ? '<span class="status ok">● Active</span>' : '<span class="status pending">◌ Preview</span>';
 
 const toggle = (action, checked, label) => `
   <label class="switch"><input type="checkbox" data-action="${action}"${checked ? ' checked' : ''} /><span class="switch-track"></span><span class="visually-hidden">${label}</span></label>`;
@@ -745,12 +745,10 @@ const zoneViews = {
       ${
         zone.status !== 'active'
           ? `<section class="panel callout">
-              <h2>Finish setup: update your nameservers</h2>
-              <p>Log in to your domain registrar and replace the current nameservers with:</p>
-              <ul class="ns-list">${zone.nameservers.map((ns) => `<li><code>${ns}</code><button class="btn small" data-action="copy" data-value="${ns}">Copy</button></li>`).join('')}</ul>
-              <p class="muted" id="ns-result">Changes can take up to 24 hours to propagate.</p>
+              <h2>Preview: keep your current nameservers</h2>
+              <p><b>Don’t change your nameservers for this site.</b> Lyrcloud doesn’t host DNS for websites added here yet, so there are no Lyrcloud nameservers to point to; changing them would take ${esc(zone.name)} offline. This page is a preview kept in your browser.</p>
+              <p class="muted">Domains you buy or transfer in <a href="#/domains">Domains</a> are real: their DNS is managed there. Edge Functions, Storage, AI, Access, Security and caching are live through the <a href="/developers/">lyrcloud CLI</a>.</p>
               <div class="row">
-                <button class="btn primary" data-action="check-ns">Check nameservers now</button>
                 <button class="btn" data-action="force-active" title="Preview only">Mark active (preview)</button>
               </div>
             </section>`
@@ -774,7 +772,7 @@ const zoneViews = {
           <div class="panel-head"><h2>Domain</h2></div>
           <dl class="facts">
             <dt>Plan</dt><dd>${planSelect('zone-plan', zone.plan, ' aria-label="Plan for this site"')}</dd>
-            <dt>Nameservers</dt><dd>${zone.nameservers.map((ns) => `<code>${ns}</code>`).join('<br>')}</dd>
+            <dt>Nameservers</dt><dd>${zone.registered ? zone.nameservers.map((ns) => `<code>${esc(ns)}</code>`).join('<br>') : '<span class="muted">Keep your current ones (preview)</span>'}</dd>
             <dt>SSL/TLS</dt><dd>${esc(zone.ssl.mode)}</dd>
             <dt>DNS records</dt><dd>${zone.dns.length}</dd>
             <dt>Added</dt><dd>${formatDate(zone.createdAt)}</dd>
