@@ -165,19 +165,25 @@ export function alibabaSetupScript({ connectionId, issuer, fingerprints }) {
     Version: '1',
     Statement: [{ Action: 'sts:AssumeRole', Effect: 'Allow', Principal: { Federated: ['acs:ram::ACCOUNT:oidc-provider/' + name] }, Condition: { StringEquals: { 'oidc:iss': issuer, 'oidc:aud': name } } }],
   });
+  // Each step says what it did; a failing step stops the script with Alibaba's own message.
   return `# Lyrcloud: connect this Alibaba Cloud account (run in Cloud Shell: shell.alibabacloud.com)
-set -e
-ACCOUNT=$(aliyun sts GetCallerIdentity | sed -n 's/.*"AccountId": *"\\([0-9]*\\)".*/\\1/p')
-# Switch on Function Compute and Container Service (both pay-as-you-go, nothing runs until you create it)
-aliyun fc-open OpenFunctionComputeService --Type Open >/dev/null 2>&1 || true
-aliyun cs POST /service/open --type propayasgo >/dev/null 2>&1 || true
-aliyun ims CreateOIDCProvider --OIDCProviderName ${name} --IssuerUrl "${issuer}" \\
-  --Fingerprints "${fingerprints.join(',')}" --ClientIds ${name} --Description "Lyrcloud ${connectionId}" >/dev/null
-aliyun ram CreateRole --RoleName ${name} --Description "Lyrcloud builds here for connection ${connectionId}" --MaxSessionDuration 3600 \\
-  --AssumeRolePolicyDocument "$(echo '${trust}' | sed "s/ACCOUNT/$ACCOUNT/")" >/dev/null
+step() { echo "== $1"; shift; if OUT=$("$@" 2>&1); then echo "   ok"; else case "$OUT" in *EntityAlreadyExists*|*AlreadyExist*) echo "   already there";; *) echo "$OUT" | tail -5; echo "Stopped here. Send this message to Lyrcloud support."; return 1;; esac; fi; }
+run() {
+ACCOUNT=$(aliyun sts GetCallerIdentity 2>&1 | sed -n 's/.*"AccountId": *"\\([0-9]*\\)".*/\\1/p')
+[ -n "$ACCOUNT" ] || { echo "Couldn't read your account ID: is Cloud Shell signed in?"; return 1; }
+echo "Account $ACCOUNT"
+# Function Compute and Container Service: pay-as-you-go, nothing runs (or costs) until you create something
+aliyun fc-open OpenFunctionComputeService --Type Open >/dev/null 2>&1 && echo "== Function Compute switched on" || echo "== Function Compute: already on (or switch it on in the console)"
+aliyun cs POST /service/open --type propayasgo >/dev/null 2>&1 && echo "== Container Service switched on" || echo "== Container Service: already on (or switch it on in the console)"
+step "OIDC provider ${name}" aliyun ims CreateOIDCProvider --force --version 2019-08-15 --OIDCProviderName ${name} --IssuerUrl "${issuer}" \\
+  --Fingerprints "${fingerprints.join(',')}" --ClientIds ${name} --Description "Lyrcloud ${connectionId}" || return 1
+step "Role ${name}" aliyun ram CreateRole --RoleName ${name} --Description "Lyrcloud builds here for connection ${connectionId}" --MaxSessionDuration 3600 \\
+  --AssumeRolePolicyDocument "$(echo '${trust}' | sed "s/ACCOUNT/$ACCOUNT/")" || return 1
 for POLICY in ${ALIBABA_POLICIES.join(' ')}; do
-  aliyun ram AttachPolicyToRole --PolicyType System --PolicyName $POLICY --RoleName ${name} >/dev/null
+  step "Permission $POLICY" aliyun ram AttachPolicyToRole --PolicyType System --PolicyName $POLICY --RoleName ${name} || return 1
 done
 echo; echo "Done. Paste this into Lyrcloud:"; echo "  Account ID: $ACCOUNT"
+}
+run
 `;
 }

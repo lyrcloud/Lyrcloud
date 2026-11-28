@@ -178,7 +178,7 @@ test('Alibaba Cloud: the setup script trusts only this connection, and a strange
   const { connectionId, setupScript, status } = started.body.connection;
   assert.equal(status, 'pending');
   const name = `lyrcloud-${connectionId}`;
-  assert.ok(setupScript.includes(`CreateOIDCProvider --OIDCProviderName ${name} --IssuerUrl "${ISSUER}"`));
+  assert.ok(setupScript.includes(`CreateOIDCProvider --force --version 2019-08-15 --OIDCProviderName ${name} --IssuerUrl "${ISSUER}"`));
   assert.ok(setupScript.includes('--Fingerprints "AA11,BB22"') && setupScript.includes(`--ClientIds ${name}`));
   assert.ok(setupScript.includes(`"oidc:aud":"${name}"`) && setupScript.includes(`"oidc:iss":"${ISSUER}"`));
   assert.equal((await call(ALICE, 'PUT', '/cloud/connections/alibaba', { accountId: 'abc' })).status, 400);
