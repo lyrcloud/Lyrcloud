@@ -91,9 +91,14 @@ Resources:
               - Effect: Allow
                 Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:Scan]
                 Resource: [!GetAtt CloudTable.Arn, !Sub '${CloudTable.Arn}/index/*']
+              # Reads the caller's profile; AWS Marketplace subscriptions also set the plan (marketplace.mjs).
               - Effect: Allow
-                Action: dynamodb:GetItem
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
                 Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${UsersTableName}'
+              # AWS Marketplace (this account is the seller): sign-up tokens, entitlements, hourly usage.
+              - Effect: Allow
+                Action: [aws-marketplace:ResolveCustomer, aws-marketplace:GetEntitlements, aws-marketplace:BatchMeterUsage]
+                Resource: '*'
               # Customers' accounts, only through the role they created for Lyrcloud (which also checks the ExternalId).
               - Effect: Allow
                 Action: sts:AssumeRole
@@ -185,6 +190,21 @@ Resources:
   HostingTickPermission:
     Type: AWS::Lambda::Permission
     Properties: { FunctionName: !Ref CloudFunction, Action: lambda:InvokeFunction, Principal: events.amazonaws.com, SourceArn: !GetAtt HostingTick.Arn }
+
+  # AWS Marketplace posts new buyers here (a browser form post, before they have a Lyrcloud login).
+  MarketplaceFulfillRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'POST /public/marketplace', Target: !Sub 'integrations/${Integration}' }
+
+  # AWS Marketplace agreement and license events re-read entitlements at once (the hourly run also does).
+  MarketplaceEvents:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern: { source: [aws.agreement-marketplace, aws.marketplacecatalog] }
+      Targets: [{ Id: marketplace, Arn: !GetAtt CloudFunction.Arn }]
+  MarketplaceEventsPermission:
+    Type: AWS::Lambda::Permission
+    Properties: { FunctionName: !Ref CloudFunction, Action: lambda:InvokeFunction, Principal: events.amazonaws.com, SourceArn: !GetAtt MarketplaceEvents.Arn }
 
   AdminSettingsRoute:
     Type: AWS::ApiGatewayV2::Route

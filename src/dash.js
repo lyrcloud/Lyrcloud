@@ -2538,6 +2538,38 @@ async function loadCloud() {
   if (isCloudView(currentRoute?.view)) render();
 }
 
+// ------------------------------------------------------------------ AWS Marketplace sign-up
+// AWS sends new buyers to #/marketplace/<code> (through the cloud API); signed in, we link the subscription.
+const marketplace = { code: null, state: 'idle', message: '', result: null };
+const MARKETPLACE_ERRORS = {
+  missing: 'AWS didn’t send a sign-up token. Open Lyrcloud again from your AWS Marketplace subscriptions (Set up product).',
+  token: 'AWS couldn’t confirm this subscription. It may have expired: open Lyrcloud again from your AWS Marketplace subscriptions.',
+};
+views.marketplace = (route) => {
+  const failed = MARKETPLACE_ERRORS[route.params.get('error')] || (marketplace.state === 'error' ? marketplace.message : '');
+  const linked = marketplace.state === 'done' && marketplace.code === route.code ? marketplace.result : null;
+  const planName = { scale: 'Scale', enterprise: 'Enterprise' }[linked?.plan] || 'Launch';
+  return `
+    <section class="panel">
+      <div class="panel-head"><h2>AWS Marketplace</h2></div>
+      ${failed ? `<p class="form-error">${esc(failed)}</p>`
+        : linked ? `<p><b>Your AWS Marketplace subscription is linked.</b> This account is on the <b>${planName}</b> plan, billed on your AWS invoice (AWS account <span class="mono">${esc(linked.awsAccountId)}</span>).</p>
+          <p class="muted">Kubernetes clusters you create from now on are billed by the hour on your AWS invoice too, instead of a monthly Lyrpay payment.</p>
+          <div class="row"><a class="btn primary" href="#/cloud">Go to Cloud</a><a class="btn" href="#/plans">See your plan</a></div>`
+        : route.code ? '<p class="muted">Linking your AWS Marketplace subscription to this Lyrcloud account…</p>'
+        : '<p class="muted">Subscribe to Lyrcloud in AWS Marketplace, then choose “Set up your account” there to come back here.</p>'}
+    </section>`;
+};
+function marketplaceAfterRender(route) {
+  if (!route.code || route.params.get('error') || marketplace.code === route.code) return;
+  marketplace.code = route.code;
+  marketplace.state = 'linking';
+  cloudApi('/cloud/marketplace/link', { method: 'POST', body: JSON.stringify({ code: route.code }) })
+    .then((data) => { marketplace.state = 'done'; marketplace.result = data.marketplace; })
+    .catch((error) => { marketplace.state = 'error'; marketplace.message = error.message; })
+    .finally(() => { if (currentRoute?.view === 'marketplace') render(); });
+}
+
 async function loadCloudCluster(id) {
   cloud.loadingDetail = true;
   cloud.detailFor = id;
@@ -3274,6 +3306,7 @@ function parseRoute() {
   if (parts[0] === 'projects' && parts[1]) return { view: 'project', projectId: parts[1], params };
   if (parts[0] === 'domains' && parts[1] === 'buy') return { view: 'domain-buy', params };
   if (parts[0] === 'domains' && parts[1] === 'lyr' && parts[2]) return { view: 'domain-lyr', lyr: parts[2].toLowerCase(), params };
+  if (parts[0] === 'marketplace') return { view: 'marketplace', code: parts[1] || null, params };
   if (parts[0] === 'cloud' && parts[1] === 'clusters' && /^[a-f0-9]{8}$/.test(parts[2] || '')) return { view: 'cloud-cluster', clusterId: parts[2], params };
   if (parts[0] === 'domains' && parts[1] === 'sub' && parts[2]) return { view: 'subdomain', label: parts[2].toLowerCase(), params };
   if (parts[0] === 'domains' && parts[1]) return { view: 'domain', domain: parts[1].toLowerCase(), params };
@@ -3298,6 +3331,7 @@ function render() {
   if (isDomainView(currentRoute.view)) domainsAfterRender(currentRoute);
   sitesAfterRender(currentRoute);
   if (isCloudView(currentRoute.view)) cloudAfterRender(currentRoute);
+  if (currentRoute.view === 'marketplace') marketplaceAfterRender(currentRoute);
   if (isAdminView() && profile && isStaff(profile.role)) {
     if (!adminUsers.list && !adminUsers.loading && !adminUsers.error) loadUsers();
     if (currentRoute.params.get('tab') === 'settings' && !adminSettings.data && !adminSettings.loading) loadAdminSettings();

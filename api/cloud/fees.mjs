@@ -35,6 +35,8 @@ export function serviceLimitError(plan, services, staff = false) {
 // Whether Lyrcloud may change a cluster: Kubernetes needs its fee paid (or staff).
 export function feeState(cluster, now = new Date(), staff = false) {
   if (cluster.kind !== 'kubernetes' || staff || cluster.feeExempt) return { needsFee: false, active: true };
+  // Billed hourly on the buyer's AWS bill through AWS Marketplace (marketplace.mjs).
+  if (cluster.billing === 'marketplace') return { needsFee: false, active: true, marketplace: true };
   const paidThrough = cluster.paidThrough ? Date.parse(cluster.paidThrough) : 0;
   return {
     needsFee: true,

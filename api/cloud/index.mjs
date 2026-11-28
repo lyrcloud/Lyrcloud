@@ -29,6 +29,9 @@
 //   POST   /cloud/servers                         { name, provider, region, image, size, sshKey, sshFrom? } a Linux server (servers.mjs)
 //   GET    /cloud/servers/{id}                    a server, refreshed (public IP, ssh command)
 //   DELETE /cloud/servers/{id}                    delete it and everything made for it
+//   POST   /public/marketplace                    AWS Marketplace sign-up (form with x-amzn-marketplace-token, no login)
+//   GET    /cloud/marketplace                     your AWS Marketplace subscription, if linked (marketplace.mjs)
+//   POST   /cloud/marketplace/link                { code } link a Marketplace subscription to this account
 //   GET    /admin/cloud                           every connection, cluster and service (staff)
 //   PUT    /admin/cloud/settings                  { upsell?, hosting? } switch features on or off (super admin)
 import { randomBytes } from 'node:crypto';
@@ -38,6 +41,8 @@ import { CreateServiceLinkedRoleCommand, IAMClient } from '@aws-sdk/client-iam';
 import { AssumeRoleCommand, STSClient } from '@aws-sdk/client-sts';
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { BatchMeterUsageCommand, MarketplaceMeteringClient, ResolveCustomerCommand } from '@aws-sdk/client-marketplace-metering';
+import { GetEntitlementsCommand, MarketplaceEntitlementServiceClient } from '@aws-sdk/client-marketplace-entitlement-service';
 import { DeleteCommand, DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { isStaff, planFor, roleFor } from '../account/roles.mjs';
 import * as lyrpay from '../domains/lyrpay.mjs';
@@ -71,6 +76,7 @@ const FEDERATED = ['gcp', 'azure', 'alibaba'];
 const ACCOUNT_NAMES = { gcp: 'Google Cloud project', azure: 'Azure subscription', alibaba: 'Alibaba Cloud account' };
 import { applyManifests, eksToken, KubeError, parseManifests, workloads } from './kube.mjs';
 import { billingError, CREDIT_PACKS, GRACE_DAYS, HOSTING_SIZES, hostingAppTemplate, hourlyCents, monthlyCents, PLAN_INCLUDED } from './hosting.mjs';
+import { newCode, planFromEntitlements, profileChange, REGISTRATION_HOURS, startOfHour, tokenFrom, usageRecord } from './marketplace.mjs';
 import { awsServerTemplate, IMAGES, SERVER_OPS, SERVER_SIZES, serverError, serverEstimate, SERVERS_LIMIT, sshCommand } from './servers.mjs';
 
 const env = process.env;
@@ -90,6 +96,9 @@ export const clients = {
   fetch: (...args) => fetch(...args),
   fingerprints: (issuer) => issuerFingerprints(issuer),
   secrets: () => new SecretsManagerClient({}),
+  // AWS Marketplace runs in us-east-1 (the seller account is this one).
+  metering: () => new MarketplaceMeteringClient({ region: 'us-east-1' }),
+  entitlements: () => new MarketplaceEntitlementServiceClient({ region: 'us-east-1' }),
 };
 
 // ---------------------------------------------------------------- helpers
@@ -253,6 +262,7 @@ const publicCluster = (item) => ({
   estimate: clusterEstimate(item), createdAt: item.createdAt, updatedAt: item.updatedAt || null,
   stackName: item.stackName || null,
   fee: feeState(item),
+  billing: item.billing || null,
   payUrl: item.pendingPayment?.url || null,
 });
 
@@ -449,13 +459,15 @@ async function createCluster(event, who) {
   if (body.provider === 'aws') await credentialsFor(connection); // fail now, not after payment
   else await providerContext(connection);
   const id = shortId();
+  // A Marketplace buyer's Kubernetes clusters are metered on their AWS bill instead of the Lyrpay fee.
+  const billing = body.kind === 'kubernetes' && who.profile.planSource === 'marketplace' && (await getItem(marketplaceKey(who.userId))) ? { billing: 'marketplace' } : {};
   const config = body.kind !== 'kubernetes' ? {}
     : body.provider === 'aws' ? { nodeType: body.nodeType || 't3.medium', nodes: body.nodes ?? 2, adminArn: body.adminArn.trim() }
     : body.provider === 'azure' ? { nodeType: body.nodeType || 'Standard_B2s', nodes: body.nodes ?? 2 }
     : body.provider === 'alibaba' ? { nodeType: body.nodeType || 'ecs.c7.large', nodes: body.nodes ?? 2 } : {};
   const item = {
     ...clusterKey(id), row: 'cluster', id, ownerId: who.userId, ownerEmail: who.email, provider: body.provider, region: region.code, name, kind: body.kind, ...config,
-    status: 'creating', createdAt: now(), ...(who.staff ? { feeExempt: true } : {}),
+    status: 'creating', createdAt: now(), ...(who.staff ? { feeExempt: true } : {}), ...billing,
   };
   // Kubernetes is built once its first month of management is paid.
   if (feeState(item).needsFee) {
@@ -887,6 +899,116 @@ async function serverRoutes(event, method, path, who) {
   return error(404, 'not_found');
 }
 
+// ---------------------------------------------------------------- AWS Marketplace (marketplace.mjs)
+
+const registrationKey = (code) => ({ pk: `mpreg#${code}`, sk: 'registration' });
+const marketplaceKey = (userId) => ({ pk: `mp#${userId}`, sk: 'link' });
+const licenseKey = (licenseArn) => ({ pk: `mplicense#${licenseArn}`, sk: 'owner' });
+
+const publicMarketplace = (link) => link && ({ awsAccountId: link.awsAccountId, plan: link.plan || null, expiresAt: link.expiresAt || null, linkedAt: link.linkedAt, checkedAt: link.checkedAt || null, lastMeteredHour: link.lastMeteredHour || null });
+
+// AWS posts the buyer here after they subscribe; no Lyrcloud login yet, so park it under a one-time code.
+async function marketplaceFulfill(event) {
+  const token = tokenFrom(event);
+  const back = (fragment) => ({ statusCode: 303, headers: { location: `${SITE_URL}/dash/#/marketplace${fragment}`, 'cache-control': 'no-store' }, body: '' });
+  if (!token) return back('?error=missing');
+  let customer;
+  try {
+    customer = await clients.metering().send(new ResolveCustomerCommand({ RegistrationToken: token }));
+  } catch (err) {
+    console.error('ResolveCustomer failed', err.name, err.message);
+    return back('?error=token');
+  }
+  const code = newCode();
+  await put({
+    ...registrationKey(code), row: 'marketplace-registration', awsAccountId: customer.CustomerAWSAccountId, licenseArn: customer.LicenseArn,
+    productCode: customer.ProductCode, customerIdentifier: customer.CustomerIdentifier || null, createdAt: now(),
+  });
+  return back(`/${code}`);
+}
+
+// Reads the buyer's entitlements and brings their Lyrcloud plan (and clusters' billing) in line.
+async function syncMarketplace(link) {
+  const entitlements = [];
+  let NextToken;
+  do {
+    const page = await clients.entitlements().send(new GetEntitlementsCommand({ ProductCode: link.productCode, Filter: { LICENSE_ARN: [link.licenseArn] }, NextToken }));
+    entitlements.push(...(page.Entitlements || []));
+    NextToken = page.NextToken;
+  } while (NextToken);
+  const entitled = planFromEntitlements(entitlements);
+  const profile = (await ddb.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId: link.ownerId } }))).Item || { userId: link.ownerId };
+  const change = profileChange(profile, entitled);
+  if (change) {
+    await ddb.send(new UpdateCommand({
+      TableName: USERS_TABLE, Key: { userId: link.ownerId },
+      UpdateExpression: 'SET #p = :p, #s = :s, #t = :t, #u = :u',
+      ExpressionAttributeNames: { '#p': 'plan', '#s': 'planSource', '#t': 'planPaidThrough', '#u': 'updatedAt' }, ExpressionAttributeValues: { ':p': change.plan, ':s': change.planSource, ':t': change.planPaidThrough, ':u': now() },
+    }));
+  }
+  if (!entitled) {
+    // The subscription ended: its clusters go back to the monthly Lyrpay fee (due now).
+    for (const row of (await itemsOf(link.ownerId)).filter((r) => r.row === 'cluster' && r.billing === 'marketplace')) {
+      await update(clusterKey(row.id), { billing: null, paidThrough: now() });
+    }
+  }
+  return update(marketplaceKey(link.ownerId), { plan: entitled?.plan || null, expiresAt: entitled?.expiresAt || null, checkedAt: now() });
+}
+
+async function marketplaceRoutes(event, method, path, who) {
+  if (path === '/cloud/marketplace' && method === 'GET') return json(200, { marketplace: publicMarketplace(await getItem(marketplaceKey(who.userId))) || null });
+  if (path === '/cloud/marketplace/link' && method === 'POST') {
+    const code = String(parseJson(event)?.code || '');
+    const registration = /^[\w-]{20,40}$/.test(code) && (await getItem(registrationKey(code)));
+    if (!registration || Date.now() - Date.parse(registration.createdAt) > REGISTRATION_HOURS * 3_600_000) return error(404, 'That AWS Marketplace link has expired. Open Lyrcloud from your AWS Marketplace subscriptions again (Set up product).');
+    const owner = await getItem(licenseKey(registration.licenseArn));
+    if (owner && owner.ownerId !== who.userId) return error(409, 'This AWS Marketplace subscription is already linked to another Lyrcloud account.');
+    const existing = await getItem(marketplaceKey(who.userId));
+    if (existing && existing.licenseArn !== registration.licenseArn) return error(409, 'This Lyrcloud account already has an AWS Marketplace subscription.');
+    await put({ ...licenseKey(registration.licenseArn), row: 'marketplace-license', ownerId: who.userId, createdAt: now() });
+    const link = {
+      ...marketplaceKey(who.userId), row: 'marketplace', ownerId: who.userId, ownerEmail: who.email, awsAccountId: registration.awsAccountId,
+      licenseArn: registration.licenseArn, productCode: registration.productCode, linkedAt: existing?.linkedAt || now(),
+    };
+    await put(link);
+    await remove(registrationKey(code));
+    const synced = await syncMarketplace(link);
+    return json(200, { marketplace: publicMarketplace(synced) });
+  }
+  return error(404, 'not_found');
+}
+
+// Every hour (and on Marketplace events): re-check every subscription, then meter the last full hour.
+export async function marketplaceTick(at = new Date(), { meter = true } = {}) {
+  const links = [];
+  let ExclusiveStartKey;
+  do {
+    const page = await ddb.send(new ScanCommand({ TableName: TABLE, FilterExpression: '#r = :r', ExpressionAttributeNames: { '#r': 'row' }, ExpressionAttributeValues: { ':r': 'marketplace' }, ExclusiveStartKey }));
+    links.push(...(page.Items || []).filter((item) => item.row === 'marketplace'));
+    ExclusiveStartKey = page.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  const hour = new Date(startOfHour(at).getTime() - 3_600_000);
+  let metered = 0;
+  for (const link of links) {
+    try {
+      await syncMarketplace(link);
+      if (!meter || link.lastMeteredHour >= hour.toISOString()) continue;
+      const record = usageRecord(link, (await itemsOf(link.ownerId)).filter((r) => r.row === 'cluster'), hour);
+      if (record) {
+        const result = await clients.metering().send(new BatchMeterUsageCommand({ UsageRecords: [record] }));
+        if (result.UnprocessedRecords?.length) throw new Error(`usage not accepted: ${JSON.stringify(result.UnprocessedRecords).slice(0, 300)}`);
+        const status = result.Results?.[0]?.Status;
+        if (status && status !== 'Success' && status !== 'DuplicateRecord') throw new Error(`usage ${status}`);
+        metered += 1;
+      }
+      await update(marketplaceKey(link.ownerId), { lastMeteredHour: hour.toISOString() });
+    } catch (err) {
+      console.error('marketplace', link.ownerId, err.name, err.message.split('\n').slice(0, 6).join(' '));
+    }
+  }
+  return { links: links.length, metered };
+}
+
 // ---------------------------------------------------------------- managed hosting (hosting.mjs)
 
 const appKey = (id) => ({ pk: `app#${id}`, sk: 'app' });
@@ -1167,9 +1289,15 @@ async function admin(who) {
 // ---------------------------------------------------------------- entry
 
 export const handler = async (event) => {
-  if (event?.lyrcloudTask === 'hosting-tick') return hostingTick();
+  if (event?.lyrcloudTask === 'hosting-tick') {
+    const [hosting, marketplace] = await Promise.allSettled([hostingTick(), marketplaceTick()]);
+    return { hosting: hosting.value ?? String(hosting.reason), marketplace: marketplace.value ?? String(marketplace.reason) };
+  }
+  // AWS Marketplace agreement and license events (EventBridge): re-read entitlements now, meter on the hour.
+  if (typeof event?.source === 'string' && event.source.startsWith('aws.') && /marketplace/.test(event.source)) return marketplaceTick(new Date(), { meter: false });
   const method = event.requestContext?.http?.method;
   const path = event.requestContext?.http?.path || '';
+  if (path === '/public/marketplace' && method === 'POST') return marketplaceFulfill(event).catch((err) => (console.error('marketplace fulfill', err), error(500, 'Something went wrong.')));
   try {
     const who = await caller(event);
     if (!who) return error(401, 'unauthorized');
@@ -1183,6 +1311,7 @@ export const handler = async (event) => {
     if (path.startsWith('/cloud/services/')) return await serviceRoutes(event, method, path, who);
     if (path === '/cloud/servers' || path.startsWith('/cloud/servers/')) return await serverRoutes(event, method, path, who);
     if (path === '/cloud/hosting' || path.startsWith('/cloud/hosting/')) return await hostingRoutes(event, method, path, who);
+    if (path === '/cloud/marketplace' || path.startsWith('/cloud/marketplace/')) return await marketplaceRoutes(event, method, path, who);
     return error(404, 'not_found');
   } catch (err) {
     if (err instanceof CloudError || err instanceof FederationError || err instanceof ProviderError || err instanceof KubeError) return error(err.status, err.message);
