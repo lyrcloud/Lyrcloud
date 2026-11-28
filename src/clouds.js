@@ -190,7 +190,7 @@ export const PROVIDERS = [
     ],
   },
   {
-    id: 'alibaba', name: 'Alibaba Cloud', fullName: 'Alibaba Cloud', color: '#ff6a00', provisioning: false,
+    id: 'alibaba', name: 'Alibaba Cloud', fullName: 'Alibaba Cloud', color: '#ff6a00', provisioning: true,
     regions: [
     ['cn-hangzhou', "Hangzhou", 'CN', 30.3, 120.2],
     ['cn-shanghai', "Shanghai", 'CN', 31.2, 121.5],

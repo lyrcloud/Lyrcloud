@@ -610,7 +610,7 @@ ${pageHero({
       <section class="section" id="cloud-regions">
         <div class="section-heading compact">
           <h2>Every major cloud, on one map</h2>
-          <p>${REGIONS.length} data center regions from ${PROVIDERS.length} providers. Connect your own cloud account and Lyrcloud builds Kubernetes or serverless container clusters in the region you pick — on AWS, Google Cloud and Azure today, the others next.</p>
+          <p>${REGIONS.length} data center regions from ${PROVIDERS.length} providers. Connect your own cloud account and Lyrcloud builds Kubernetes or serverless container clusters in the region you pick — on AWS, Google Cloud, Azure and Alibaba Cloud today, the others next.</p>
         </div>
         <div class="provider-filter" role="group" aria-label="Show providers">
           ${PROVIDERS.map((provider) => `<label class="provider-chip"><input type="checkbox" value="${provider.id}" checked /><i style="background:${provider.color}"></i>${provider.name} <small>${provider.regions.length}${provider.provisioning ? ' · clusters' : ''}</small></label>`).join('\n          ')}
@@ -638,7 +638,7 @@ const comparison = [
   ['Image optimization', '—', '✓', '✓'],
   ['Bot management', '—', 'Basic', 'Advanced'],
   ['Zero Trust seats', '5', '50', 'Unlimited'],
-  ['Managed cloud clusters (AWS, Google Cloud, Azure)', '1 serverless', '3', '20'],
+  ['Managed cloud clusters (AWS, Google Cloud, Azure, Alibaba Cloud)', '1 serverless', '3', '20'],
   ['Managed container services', '2', '10', '50'],
   ['Kubernetes clusters (EKS, GKE, AKS)', '—', '$49 / month each', '$49 / month each'],
   ['Analytics retention', '24 hours', '30 days', '1 year'],

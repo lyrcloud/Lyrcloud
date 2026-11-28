@@ -2,15 +2,17 @@
 // Lyrcloud deploys into the customer's own AWS account (they own and pay for everything it creates).
 
 export const CLUSTER_KINDS = ['kubernetes', 'serverless'];
-export const PROVISIONED = ['aws', 'gcp', 'azure'];
+export const PROVISIONED = ['aws', 'gcp', 'azure', 'alibaba'];
 export const MAX_CLUSTERS = 5;
+// Alibaba Cloud regions without Function Compute (serverless clusters).
+export const NO_FUNCTION_COMPUTE = ['ap-southeast-6'];
 export const MAX_SERVICES_PER_CLUSTER = 10;
 // The role customers create in their account (access-role template) and the prefix for everything
 // it may create in IAM.
 export const ACCESS_ROLE_NAME = 'LyrcloudAccess';
 export const IAM_PREFIX = 'lyrcloud-';
 
-import { AKS_VM_SIZES, clusterEstimate, NODE_TYPES, serviceEstimate, SERVICE_SIZES } from '../../src/cloud-pricing.js';
+import { AKS_VM_SIZES, ALIBABA_NODE_TYPES, clusterEstimate, NODE_TYPES, serviceEstimate, SERVICE_SIZES } from '../../src/cloud-pricing.js';
 
 export { clusterEstimate, NODE_TYPES, serviceEstimate, SERVICE_SIZES };
 // Availability zones where EKS can't place a control plane (by zone ID, the same in every account).
@@ -38,11 +40,17 @@ const PRINCIPAL_RE = /^arn:aws:(iam|sts)::\d{12}:(user|role|assumed-role)\/[\w+=
 export function clusterError(body, region) {
   if (!body || typeof body !== 'object') return [400, 'Invalid JSON body.'];
   if (!cleanName(body.name)) return [400, 'Name the cluster with 3–32 lowercase letters, digits and hyphens, starting with a letter.'];
-  if (!PROVISIONED.includes(body.provider)) return [400, 'Clusters can be created on AWS, Google Cloud and Azure.'];
+  if (!PROVISIONED.includes(body.provider)) return [400, 'Clusters can be created on AWS, Google Cloud, Azure and Alibaba Cloud.'];
   if (!region || region.provider !== body.provider) return [400, 'Pick a region of that cloud.'];
   if (!CLUSTER_KINDS.includes(body.kind)) return [400, 'Kind must be kubernetes or serverless.'];
+  if (body.provider === 'alibaba' && body.kind === 'serverless' && NO_FUNCTION_COMPUTE.includes(region.code)) return [400, `Function Compute isn’t offered in ${region.city}. Pick another Alibaba Cloud region, or a Kubernetes cluster.`];
   if (body.kind === 'kubernetes' && body.provider === 'azure') {
     if (!AKS_VM_SIZES[body.nodeType || 'Standard_B2s']) return [400, `Node size must be one of ${Object.keys(AKS_VM_SIZES).join(', ')}.`];
+    const nodes = body.nodes ?? 2;
+    if (!Number.isInteger(nodes) || nodes < 1 || nodes > 20) return [400, 'Use 1 to 20 nodes.'];
+  }
+  if (body.kind === 'kubernetes' && body.provider === 'alibaba') {
+    if (!ALIBABA_NODE_TYPES[body.nodeType || 'ecs.c7.large']) return [400, `Node size must be one of ${Object.keys(ALIBABA_NODE_TYPES).join(', ')}.`];
     const nodes = body.nodes ?? 2;
     if (!Number.isInteger(nodes) || nodes < 1 || nodes > 20) return [400, 'Use 1 to 20 nodes.'];
   }

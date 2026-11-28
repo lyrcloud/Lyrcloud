@@ -8,11 +8,12 @@
 //   POST   /cloud/connections/aws                 start connecting: your ExternalId and the one-click setup link
 //   PUT    /cloud/connections/aws                 { roleArn | accountId } finish connecting (Lyrcloud checks it can sign in)
 //   DELETE /cloud/connections/aws                 forget the connection (no clusters left)
-//   POST   /cloud/connections/{gcp|azure}         start connecting: connection ID and the Cloud Shell setup script
+//   POST   /cloud/connections/{gcp|azure|alibaba} start connecting: connection ID and the Cloud Shell setup script
 //   PUT    /cloud/connections/gcp                 { projectId, projectNumber }        finish (Lyrcloud signs in to check)
 //   PUT    /cloud/connections/azure               { tenantId, subscriptionId, clientId }
-//   DELETE /cloud/connections/{gcp|azure}         forget it (no clusters left on that cloud)
-// Google Cloud and Azure are keyless (federation.mjs) and built over their REST APIs (providers.mjs).
+//   PUT    /cloud/connections/alibaba             { accountId }
+//   DELETE /cloud/connections/{gcp|azure|alibaba} forget it (no clusters left on that cloud)
+// Google Cloud, Azure and Alibaba Cloud are keyless (federation.mjs) and built over their APIs (providers.mjs, alibaba.mjs).
 //   POST   /cloud/clusters                        { name, provider: "aws", region, kind, nodeType?, nodes?, adminArn? }
 //   GET    /cloud/clusters/{id}                   a cluster, refreshed from CloudFormation
 //   PUT    /cloud/clusters/{id}                   { nodes } resize a Kubernetes cluster
@@ -60,8 +61,14 @@ import {
   serviceTemplate,
   stackState,
 } from './rules.mjs';
-import { azureAccessToken, azureSetupScript, CONNECTION_RE, FederationError, gcpAccessToken, gcpSetupScript, identity } from './federation.mjs';
-import { PROVIDER_OPS, ProviderError } from './providers.mjs';
+import { alibabaCredentials, alibabaSetupScript, azureAccessToken, azureSetupScript, CONNECTION_RE, FederationError, gcpAccessToken, gcpSetupScript, identity, issuerFingerprints } from './federation.mjs';
+import { PROVIDER_OPS as REST_OPS, ProviderError } from './providers.mjs';
+import { alibaba } from './alibaba.mjs';
+import { AlibabaError } from './alibaba-api.mjs';
+
+const PROVIDER_OPS = { ...REST_OPS, alibaba };
+const FEDERATED = ['gcp', 'azure', 'alibaba'];
+const ACCOUNT_NAMES = { gcp: 'Google Cloud project', azure: 'Azure subscription', alibaba: 'Alibaba Cloud account' };
 import { applyManifests, eksToken, KubeError, parseManifests, workloads } from './kube.mjs';
 import { billingError, CREDIT_PACKS, GRACE_DAYS, HOSTING_SIZES, hostingAppTemplate, hourlyCents, monthlyCents, PLAN_INCLUDED } from './hosting.mjs';
 import { awsServerTemplate, IMAGES, SERVER_OPS, SERVER_SIZES, serverError, serverEstimate, SERVERS_LIMIT, sshCommand } from './servers.mjs';
@@ -81,6 +88,7 @@ export const clients = {
   ec2: (region, credentials) => new EC2Client({ region, credentials }),
   iam: (credentials) => new IAMClient({ region: 'us-east-1', credentials }),
   fetch: (...args) => fetch(...args),
+  fingerprints: (issuer) => issuerFingerprints(issuer),
   secrets: () => new SecretsManagerClient({}),
 };
 
@@ -224,6 +232,7 @@ const publicConnection = (item) => item && item.provider && item.provider !== 'a
   subscriptionId: item.subscriptionId || null,
   tenantId: item.tenantId || null,
   clientId: item.clientId || null,
+  accountId: item.accountId || null,
   connectedAt: item.connectedAt || null,
   setupScript: item.connectedAt ? null : item.setupScript || null,
 }) : item && ({
@@ -276,14 +285,16 @@ async function refresh(item, key, credentials) {
   return update(key, set);
 }
 
-// ---------------------------------------------------------------- Google Cloud and Azure
+// ---------------------------------------------------------------- Google Cloud, Azure and Alibaba Cloud
 
-// A token for the customer's Google Cloud or Azure account, and the operations for that provider.
+// Short-lived access to the customer's Google Cloud, Azure or Alibaba Cloud account, and that provider's operations.
 async function providerContext(connection) {
-  if (!connection?.connectedAt) throw new CloudError(409, `Connect your ${connection?.provider === 'azure' ? 'Azure subscription' : 'Google Cloud project'} first.`);
+  if (!connection?.connectedAt) throw new CloudError(409, `Connect your ${ACCOUNT_NAMES[connection?.provider] || 'cloud account'} first.`);
   const deps = { sts, fetchImpl: clients.fetch };
+  const ops = PROVIDER_OPS[connection.provider];
+  if (connection.provider === 'alibaba') return { credentials: await alibabaCredentials(deps, connection), connection, fetchImpl: clients.fetch, ops };
   const token = connection.provider === 'gcp' ? await gcpAccessToken(deps, connection) : await azureAccessToken(deps, connection);
-  return { token, connection, fetchImpl: clients.fetch, ops: PROVIDER_OPS[connection.provider] };
+  return { token, connection, fetchImpl: clients.fetch, ops };
 }
 
 // Brings a Google Cloud / Azure cluster or service row up to date. Gone resources remove the row.
@@ -303,6 +314,7 @@ async function refreshRemote(item, key, ctx, cluster) {
 let ourIdentity;
 const setupScriptFor = async (provider, connectionId) => {
   ourIdentity ||= await identity(sts);
+  if (provider === 'alibaba') return alibabaSetupScript({ connectionId, issuer: ourIdentity.issuer, fingerprints: await clients.fingerprints(ourIdentity.issuer) });
   return provider === 'gcp' ? gcpSetupScript({ connectionId, issuer: ourIdentity.issuer }) : azureSetupScript({ connectionId, ...ourIdentity });
 };
 
@@ -328,6 +340,10 @@ async function federatedConnectionRoutes(event, method, who, provider) {
       const projectNumber = String(body.projectNumber || '').trim();
       if (!GCP_PROJECT_RE.test(projectId) || !/^\d{6,20}$/.test(projectNumber)) return error(400, 'Paste the project ID and project number the setup script printed.');
       fields = { projectId, projectNumber };
+    } else if (provider === 'alibaba') {
+      const accountId = String(body.accountId || '').trim();
+      if (!/^\d{10,20}$/.test(accountId)) return error(400, 'Paste the account ID the setup script printed (only digits).');
+      fields = { accountId };
     } else {
       const ids = Object.fromEntries(['tenantId', 'subscriptionId', 'clientId'].map((name) => [name, String(body[name] || '').trim().toLowerCase()]));
       if (!Object.values(ids).every((id) => UUID_RE.test(id))) return error(400, 'Paste the tenant, subscription and client IDs the setup script printed.');
@@ -435,7 +451,8 @@ async function createCluster(event, who) {
   const id = shortId();
   const config = body.kind !== 'kubernetes' ? {}
     : body.provider === 'aws' ? { nodeType: body.nodeType || 't3.medium', nodes: body.nodes ?? 2, adminArn: body.adminArn.trim() }
-    : body.provider === 'azure' ? { nodeType: body.nodeType || 'Standard_B2s', nodes: body.nodes ?? 2 } : {};
+    : body.provider === 'azure' ? { nodeType: body.nodeType || 'Standard_B2s', nodes: body.nodes ?? 2 }
+    : body.provider === 'alibaba' ? { nodeType: body.nodeType || 'ecs.c7.large', nodes: body.nodes ?? 2 } : {};
   const item = {
     ...clusterKey(id), row: 'cluster', id, ownerId: who.userId, ownerEmail: who.email, provider: body.provider, region: region.code, name, kind: body.kind, ...config,
     status: 'creating', createdAt: now(), ...(who.staff ? { feeExempt: true } : {}),
@@ -850,7 +867,8 @@ async function serverRoutes(event, method, path, who) {
       }
     } else {
       const ctx = await providerContext(connection);
-      await SERVER_OPS[body.provider].create(ctx, item);
+      const state = await SERVER_OPS[body.provider].create(ctx, item);
+      if (state?.outputs) item.outputs = state.outputs;
     }
     await put(item);
     return json(200, { server: publicServer(item) });
@@ -1160,7 +1178,7 @@ export const handler = async (event) => {
     if (path === '/admin/cloud/settings' && method === 'PUT') return await saveSettings(event, who);
     if (path === '/cloud' && method === 'GET') return await overview(who);
     if (path === '/cloud/connections/aws') return await connectionRoutes(event, method, who);
-    if (path === '/cloud/connections/gcp' || path === '/cloud/connections/azure') return await federatedConnectionRoutes(event, method, who, path.split('/').pop());
+    if (FEDERATED.some((provider) => path === `/cloud/connections/${provider}`)) return await federatedConnectionRoutes(event, method, who, path.split('/').pop());
     if (path === '/cloud/clusters' || path.startsWith('/cloud/clusters/')) return await clusterRoutes(event, method, path, who);
     if (path.startsWith('/cloud/services/')) return await serviceRoutes(event, method, path, who);
     if (path === '/cloud/servers' || path.startsWith('/cloud/servers/')) return await serverRoutes(event, method, path, who);
@@ -1168,6 +1186,7 @@ export const handler = async (event) => {
     return error(404, 'not_found');
   } catch (err) {
     if (err instanceof CloudError || err instanceof FederationError || err instanceof ProviderError || err instanceof KubeError) return error(err.status, err.message);
+    if (err instanceof AlibabaError) return error(err.status, `Alibaba Cloud: ${err.message}`);
     const message = awsMessage(err);
     if (message) return error(400, message);
     console.error('Cloud API failed', err);

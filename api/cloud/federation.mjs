@@ -7,6 +7,9 @@
 //                 workload identity provider only accepts tokens with their own ID (attribute condition).
 //   Azure         federated credentials can't check custom claims, so Lyrcloud only ever works inside the
 //                 resource group lyrcloud-<connection ID>, the only place the customer gave its app access.
+//   Alibaba Cloud each connection has its own RAM OIDC provider whose only client ID (token audience) is
+//                 lyrcloud-<connection ID>; the role trusts only that provider and audience.
+import { connect } from 'node:tls';
 import { GetWebIdentityTokenCommand } from '@aws-sdk/client-sts';
 
 export const GCP_POOL = 'lyrcloud';
@@ -15,6 +18,9 @@ export const AZURE_AUDIENCE = 'api://AzureADTokenExchange';
 export const CONNECTION_RE = /^lyr[a-f0-9]{10}$/;
 
 export const azureGroup = (connectionId) => `lyrcloud-${connectionId}`;
+// Alibaba Cloud: the OIDC provider, role and token audience are all named after the connection.
+export const alibabaName = (connectionId) => `lyrcloud-${connectionId}`;
+export const ALIBABA_POLICIES = ['AliyunFCFullAccess', 'AliyunCSFullAccess', 'AliyunECSFullAccess', 'AliyunVPCFullAccess', 'AliyunSLBFullAccess', 'AliyunEIPFullAccess'];
 export const gcpProviderPath = (projectNumber, connectionId) =>
   `//iam.googleapis.com/projects/${projectNumber}/locations/global/workloadIdentityPools/${GCP_POOL}/providers/${connectionId}`;
 export const gcpServiceAccount = (projectId) => `${GCP_SERVICE_ACCOUNT}@${projectId}.iam.gserviceaccount.com`;
@@ -76,6 +82,39 @@ export async function azureAccessToken({ sts, fetchImpl = fetch }, connection) {
   return data.access_token;
 }
 
+// Alibaba Cloud: AWS token -> AssumeRoleWithOIDC (an anonymous STS call: the token is the proof) -> STS keys.
+export async function alibabaCredentials({ sts, fetchImpl = fetch }, connection) {
+  const name = alibabaName(connection.connectionId);
+  const token = await awsToken(sts, name, connection.connectionId);
+  const params = new URLSearchParams({
+    Action: 'AssumeRoleWithOIDC', Version: '2015-04-01', Format: 'JSON', Timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+    OIDCProviderArn: `acs:ram::${connection.accountId}:oidc-provider/${name}`, RoleArn: `acs:ram::${connection.accountId}:role/${name}`,
+    RoleSessionName: 'lyrcloud', DurationSeconds: '900', OIDCToken: token,
+  });
+  const res = await fetchImpl('https://sts.aliyuncs.com/', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: params, signal: AbortSignal.timeout(15_000) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.Credentials) throw new FederationError(403, `Alibaba Cloud didn’t accept Lyrcloud’s sign-in. Check the account ID, or run the setup script again: ${data.Code || res.status} ${data.Message || ''}`.trim().slice(0, 400));
+  const c = data.Credentials;
+  return { accessKeyId: c.AccessKeyId, accessKeySecret: c.AccessKeySecret, securityToken: c.SecurityToken };
+}
+
+// SHA-1 fingerprints of the issuer's certificate chain, for Alibaba's OIDC provider (up to five; leaf first).
+export function issuerFingerprints(issuer, { connectImpl = connect } = {}) {
+  const host = new URL(issuer).hostname;
+  return new Promise((resolve, reject) => {
+    const socket = connectImpl(443, host, { servername: host }, () => {
+      const prints = [];
+      for (let cert = socket.getPeerCertificate(true); cert?.fingerprint && !prints.includes(cert.fingerprint.replace(/:/g, '')) && prints.length < 5; cert = cert.issuerCertificate) {
+        prints.push(cert.fingerprint.replace(/:/g, ''));
+      }
+      socket.end();
+      resolve(prints);
+    });
+    socket.setTimeout(10_000, () => socket.destroy(new Error('Timed out reading the token issuer’s certificate.')));
+    socket.on('error', reject);
+  });
+}
+
 // ---------------------------------------------------------------- setup scripts (pasted into Cloud Shell)
 
 export function gcpSetupScript({ connectionId, issuer }) {
@@ -116,5 +155,29 @@ az ad app federated-credential create --id "$APP" --parameters '${credential}' >
 sleep 30 # let the new app reach Azure's role service
 az role assignment create --assignee "$APP" --role Contributor --scope "/subscriptions/$SUB/resourceGroups/${group}" >/dev/null
 echo; echo "Done. Paste these into Lyrcloud:"; echo "  Tenant ID:       $TENANT"; echo "  Subscription ID: $SUB"; echo "  Client ID:       $APP"
+`;
+}
+
+export function alibabaSetupScript({ connectionId, issuer, fingerprints }) {
+  const name = alibabaName(connectionId);
+  // Alibaba's trust policy language wants Version "1" and condition keys oidc:iss / oidc:aud.
+  const trust = JSON.stringify({
+    Version: '1',
+    Statement: [{ Action: 'sts:AssumeRole', Effect: 'Allow', Principal: { Federated: ['acs:ram::ACCOUNT:oidc-provider/' + name] }, Condition: { StringEquals: { 'oidc:iss': issuer, 'oidc:aud': name } } }],
+  });
+  return `# Lyrcloud: connect this Alibaba Cloud account (run in Cloud Shell: shell.alibabacloud.com)
+set -e
+ACCOUNT=$(aliyun sts GetCallerIdentity | sed -n 's/.*"AccountId": *"\\([0-9]*\\)".*/\\1/p')
+# Switch on Function Compute and Container Service (both pay-as-you-go, nothing runs until you create it)
+aliyun fc-open OpenFunctionComputeService --Type Open >/dev/null 2>&1 || true
+aliyun cs POST /service/open --type propayasgo >/dev/null 2>&1 || true
+aliyun ims CreateOIDCProvider --OIDCProviderName ${name} --IssuerUrl "${issuer}" \\
+  --Fingerprints "${fingerprints.join(',')}" --ClientIds ${name} --Description "Lyrcloud ${connectionId}" >/dev/null
+aliyun ram CreateRole --RoleName ${name} --Description "Lyrcloud builds here for connection ${connectionId}" --MaxSessionDuration 3600 \\
+  --AssumeRolePolicyDocument "$(echo '${trust}' | sed "s/ACCOUNT/$ACCOUNT/")" >/dev/null
+for POLICY in ${ALIBABA_POLICIES.join(' ')}; do
+  aliyun ram AttachPolicyToRole --PolicyType System --PolicyName $POLICY --RoleName ${name} >/dev/null
+done
+echo; echo "Done. Paste this into Lyrcloud:"; echo "  Account ID: $ACCOUNT"
 `;
 }

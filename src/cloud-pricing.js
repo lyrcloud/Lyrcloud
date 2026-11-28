@@ -37,10 +37,17 @@ export const AKS_VM_SIZES = {
   Standard_D2s_v5: { vcpu: 2, memory: 8, hourly: 0.096 },
   Standard_D4s_v5: { vcpu: 4, memory: 16, hourly: 0.192 },
 };
-export const nodeTypesFor = (provider) => (provider === 'azure' ? AKS_VM_SIZES : NODE_TYPES);
-export const defaultNodeType = (provider) => (provider === 'azure' ? 'Standard_B2s' : 't3.medium');
-// Always-on containers (minimum copies) on Cloud Run / Container Apps, per vCPU and GB hour.
-const SERVERLESS = { gcp: { vcpu: 0.0648, gb: 0.0072 }, azure: { vcpu: 0.0864, gb: 0.0108 } };
+// Alibaba Cloud ACK nodes (pay-as-you-go in us-east-1, with a 40 GB ESSD disk). ACK wants at least 2 vCPU and 4 GB.
+export const ALIBABA_NODE_TYPES = {
+  'ecs.c7.large': { vcpu: 2, memory: 4, hourly: 0.0854 },
+  'ecs.g7.large': { vcpu: 2, memory: 8, hourly: 0.0944 },
+  'ecs.g7.xlarge': { vcpu: 4, memory: 16, hourly: 0.1814 },
+};
+const ACK_PRO_HOURLY = 0.09; // ACK Pro (small) cluster management fee
+export const nodeTypesFor = (provider) => (provider === 'azure' ? AKS_VM_SIZES : provider === 'alibaba' ? ALIBABA_NODE_TYPES : NODE_TYPES);
+export const defaultNodeType = (provider) => (provider === 'azure' ? 'Standard_B2s' : provider === 'alibaba' ? 'ecs.c7.large' : 't3.medium');
+// Always-on containers (minimum copies) on Cloud Run / Container Apps / Function Compute, per vCPU and GB hour.
+const SERVERLESS = { gcp: { vcpu: 0.0648, gb: 0.0072 }, azure: { vcpu: 0.0864, gb: 0.0108 }, alibaba: { vcpu: 0.0576, gb: 0.0058 } };
 export const SERVERLESS_SPECS = { small: { vcpu: 0.25, gb: 0.5 }, medium: { vcpu: 0.5, gb: 1 }, large: { vcpu: 1, gb: 2 }, xlarge: { vcpu: 2, gb: 4 } };
 
 // Rough monthly cost (USD) of a cluster in us-east-1, before any services or data transfer.
@@ -48,6 +55,12 @@ export function clusterEstimate({ provider = 'aws', kind, nodeType, nodes = 2 })
   if (provider === 'gcp') {
     if (kind === 'serverless') return { monthly: 0, lines: [['Cloud Run region', 0]] };
     return { monthly: 73, lines: [['GKE Autopilot cluster fee (one is covered by Google’s free tier credit)', 73], ['Pods', 0]] };
+  }
+  if (provider === 'alibaba') {
+    if (kind === 'serverless') return { monthly: 0, lines: [['Function Compute region', 0]] };
+    const type = nodeType || 'ecs.c7.large';
+    const lines = [['ACK Pro control plane', money(ACK_PRO_HOURLY * HOURS)], [`${nodes} × ${type} node${nodes === 1 ? '' : 's'}`, money(ALIBABA_NODE_TYPES[type].hourly * HOURS * nodes)], ['API server load balancer and traffic', 0]];
+    return { monthly: money(lines.reduce((sum, [, usd]) => sum + usd, 0)), lines };
   }
   if (provider === 'azure') {
     if (kind === 'serverless') return { monthly: 0, lines: [['Container Apps environment', 0]] };
@@ -68,7 +81,7 @@ export function clusterEstimate({ provider = 'aws', kind, nodeType, nodes = 2 })
 
 // Rough monthly cost (USD) of a Fargate service in us-east-1.
 export function serviceEstimate({ provider = 'aws', size = 'small', count = 1 }) {
-  if (provider === 'gcp' || provider === 'azure') {
+  if (provider === 'gcp' || provider === 'azure' || provider === 'alibaba') {
     const spec = SERVERLESS_SPECS[size];
     const rate = SERVERLESS[provider];
     const always = money((spec.vcpu * rate.vcpu + spec.gb * rate.gb) * HOURS * count);

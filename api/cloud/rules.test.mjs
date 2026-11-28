@@ -3,9 +3,9 @@ import { test } from 'node:test';
 import { REGIONS, findRegion, PROVIDERS, LAND } from '../../src/clouds.js';
 import { accessRoleTemplate, clusterEstimate, roleArnFrom, serviceEstimate, stackState } from './rules.mjs';
 
-test('the region catalog covers the major clouds; AWS, Azure and Google Cloud provision', () => {
+test('the region catalog covers the major clouds; AWS, Azure, Google Cloud and Alibaba Cloud provision', () => {
   assert.deepEqual(PROVIDERS.map((p) => p.id), ['aws', 'azure', 'gcp', 'oracle', 'alibaba', 'ibm', 'digitalocean']);
-  assert.equal(PROVIDERS.filter((p) => p.provisioning).map((p) => p.id).join(), 'aws,azure,gcp');
+  assert.equal(PROVIDERS.filter((p) => p.provisioning).map((p) => p.id).join(), 'aws,azure,gcp,alibaba');
   assert.equal(findRegion('aws', 'eu-west-1').city, 'Ireland');
   assert.equal(findRegion('aws', 'ap-east-1').optIn, true);
   for (const region of REGIONS) {

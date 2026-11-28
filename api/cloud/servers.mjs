@@ -3,9 +3,11 @@
 //   Google Cloud  a Compute Engine VM on the default network, with a lyrcloud-ssh firewall rule
 //   Azure         an ARM deployment: shared lyrcloud VNet per region, an NSG, and a VM that owns its disk,
 //                 network card and public IP (deleteOption: Delete), so deleting the VM removes them
+//   Alibaba Cloud an ECS instance in the region's lyrcloud VPC with its own security group (alibaba.mjs)
 // Statuses as for clusters: creating, ready, failed, deleting, deleted.
 import { azureGroup } from './federation.mjs';
 import { ProviderError, remoteName } from './providers.mjs';
+import { alibabaServers } from './alibaba.mjs';
 
 export const IMAGES = {
   ubuntu: { label: 'Ubuntu 24.04 LTS', user: 'ubuntu' },
@@ -13,9 +15,9 @@ export const IMAGES = {
   'amazon-linux': { label: 'Amazon Linux 2023', user: 'ec2-user', only: 'aws' },
 };
 export const SERVER_SIZES = {
-  small: { label: '2 vCPU · 2 GB', aws: 't3.small', gcp: 'e2-small', azure: 'Standard_B1ms', monthly: { aws: 15.2, gcp: 12.2, azure: 15.1 } },
-  medium: { label: '2 vCPU · 4 GB', aws: 't3.medium', gcp: 'e2-medium', azure: 'Standard_B2s', monthly: { aws: 30.4, gcp: 24.5, azure: 30.4 } },
-  large: { label: '2 vCPU · 8 GB', aws: 't3.large', gcp: 'e2-standard-2', azure: 'Standard_B2ms', monthly: { aws: 60.7, gcp: 48.9, azure: 60.7 } },
+  small: { label: '2 vCPU · 2 GB', aws: 't3.small', gcp: 'e2-small', azure: 'Standard_B1ms', alibaba: 'ecs.t6-c1m1.large', monthly: { aws: 15.2, gcp: 12.2, azure: 15.1, alibaba: 19.3 } },
+  medium: { label: '2 vCPU · 4 GB', aws: 't3.medium', gcp: 'e2-medium', azure: 'Standard_B2s', alibaba: 'ecs.t6-c1m2.large', monthly: { aws: 30.4, gcp: 24.5, azure: 30.4, alibaba: 32.4 } },
+  large: { label: '2 vCPU · 8 GB', aws: 't3.large', gcp: 'e2-standard-2', azure: 'Standard_B2ms', alibaba: 'ecs.t6-c1m4.large', monthly: { aws: 60.7, gcp: 48.9, azure: 60.7, alibaba: 58.7 } },
 };
 export const DISK_GB = 30;
 export const SERVERS_LIMIT = { launch: 1, scale: 5, enterprise: 50 };
@@ -27,7 +29,7 @@ const CIDR_RE = /^(\d{1,3}\.){3}\d{1,3}\/(\d|[12]\d|3[0-2])$/;
 export function serverError(body, region) {
   if (!body || typeof body !== 'object') return [400, 'Invalid JSON body.'];
   if (!/^[a-z][a-z0-9-]{1,30}[a-z0-9]$/.test(String(body.name || ''))) return [400, 'Name the server with 3–32 lowercase letters, digits and hyphens, starting with a letter.'];
-  if (!['aws', 'gcp', 'azure'].includes(body.provider) || !region || region.provider !== body.provider) return [400, 'Pick a cloud you’ve connected and one of its regions.'];
+  if (!['aws', 'gcp', 'azure', 'alibaba'].includes(body.provider) || !region || region.provider !== body.provider) return [400, 'Pick a cloud you’ve connected and one of its regions.'];
   const image = IMAGES[body.image || 'ubuntu'];
   if (!image) return [400, `Image must be one of ${Object.keys(IMAGES).join(', ')}.`];
   if (image.only && image.only !== body.provider) return [400, `${image.label} runs on AWS only.`];
@@ -38,7 +40,8 @@ export function serverError(body, region) {
   return null;
 }
 
-export const serverEstimate = ({ provider, size }) => ({ monthly: SERVER_SIZES[size]?.monthly[provider] ?? 0, lines: [[`${SERVER_SIZES[size]?.label} server`, SERVER_SIZES[size]?.monthly[provider] ?? 0], [`${DISK_GB} GB disk and a public IP`, provider === 'gcp' ? 4.2 : 6.1]] });
+const DISK_AND_IP = { gcp: 4.2, alibaba: 0 }; // Alibaba's price includes the disk; its public IP bills traffic only
+export const serverEstimate = ({ provider, size }) => ({ monthly: SERVER_SIZES[size]?.monthly[provider] ?? 0, lines: [[`${SERVER_SIZES[size]?.label} server`, SERVER_SIZES[size]?.monthly[provider] ?? 0], [provider === 'alibaba' ? `${DISK_GB} GB disk (included) and a public IP (traffic billed per GB)` : `${DISK_GB} GB disk and a public IP`, DISK_AND_IP[provider] ?? 6.1]] });
 
 // ---------------------------------------------------------------- AWS (CloudFormation)
 
@@ -227,5 +230,5 @@ export const azureServers = {
   },
 };
 
-export const SERVER_OPS = { gcp: gcpServers, azure: azureServers };
+export const SERVER_OPS = { gcp: gcpServers, azure: azureServers, alibaba: alibabaServers({ sizes: SERVER_SIZES, user: (server) => IMAGES[server.image].user }) };
 export const sshCommand = (server) => (server.outputs?.PublicIp ? `ssh ${IMAGES[server.image].user}@${server.outputs.PublicIp}` : null);

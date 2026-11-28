@@ -2570,12 +2570,14 @@ function cloudAfterRender(route) {
   updateClusterEstimate();
 }
 
-const DEFAULT_REGION = { aws: 'us-east-1', gcp: 'us-central1', azure: 'eastus' };
-const CLOUD_NAMES = { aws: 'AWS', gcp: 'Google Cloud', azure: 'Azure' };
+const DEFAULT_REGION = { aws: 'us-east-1', gcp: 'us-central1', azure: 'eastus', alibaba: 'ap-southeast-1' };
+const CLOUD_NAMES = { aws: 'AWS', gcp: 'Google Cloud', azure: 'Azure', alibaba: 'Alibaba Cloud' };
+const CLOUD_IDS = ['aws', 'gcp', 'azure', 'alibaba'];
 const CLOUD_KINDS = {
   aws: { serverless: ['Serverless containers', 'ECS on Fargate. Pay only for running containers; Lyrcloud deploys your images with a load balancer.'], kubernetes: ['Kubernetes', 'Amazon EKS with worker nodes. Full Kubernetes; you deploy with kubectl or Helm.'] },
   gcp: { serverless: ['Serverless containers', 'Cloud Run. Scales to zero, HTTPS address included; Lyrcloud deploys your images.'], kubernetes: ['Kubernetes', 'GKE Autopilot. Google runs the nodes and bills per pod; deploy with kubectl or Helm.'] },
   azure: { serverless: ['Serverless containers', 'Azure Container Apps. Scales to zero, HTTPS address included; Lyrcloud deploys your images.'], kubernetes: ['Kubernetes', 'AKS with a node pool you size. Deploy with kubectl or Helm.'] },
+  alibaba: { serverless: ['Serverless containers', 'Function Compute. Scales to zero, HTTPS address included; Lyrcloud deploys your images.'], kubernetes: ['Kubernetes', 'ACK managed (Pro) with a node pool you size. Deploy with kubectl or Helm.'] },
 };
 
 function regionOptions(provider = 'aws') {
@@ -2588,44 +2590,48 @@ function regionOptions(provider = 'aws') {
 
 const nodeOptions = (provider) => Object.entries(nodeTypesFor(provider)).map(([type, spec]) => `<option value="${type}"${type === defaultNodeType(provider) ? ' selected' : ''}>${type} · ${spec.vcpu} vCPU · ${spec.memory} GB</option>`).join('');
 
-// Google Cloud and Azure: a setup script for the provider's Cloud Shell, then paste back what it prints.
+// Google Cloud, Azure and Alibaba Cloud: a setup script for the provider's Cloud Shell, then paste back what it prints.
 function federatedPanel(provider, connection) {
   const name = CLOUD_NAMES[provider];
   if (!connection) {
     return `
       <div class="cloud-connect-card">
         <h3>${name}</h3>
-        <p class="muted small">${provider === 'gcp' ? 'Cloud Run and GKE Autopilot in your own project.' : 'Container Apps and AKS in your own subscription.'} No keys are shared: your cloud trusts Lyrcloud’s signed sign-in, for your connection only.</p>
+        <p class="muted small">${{ gcp: 'Cloud Run and GKE Autopilot in your own project.', azure: 'Container Apps and AKS in your own subscription.', alibaba: 'Function Compute, ACK and ECS servers in your own account.' }[provider]} No keys are shared: your cloud trusts Lyrcloud’s signed sign-in, for your connection only.</p>
         <button class="btn primary" data-action="cloud-connect" data-provider="${provider}">Connect ${name}</button>
       </div>`;
   }
   if (connection.status === 'connected') {
-    const id = provider === 'gcp' ? connection.projectId : connection.subscriptionId;
+    const id = { gcp: connection.projectId, azure: connection.subscriptionId, alibaba: connection.accountId }[provider];
     return `
       <div class="cloud-connect-card">
         <h3>${name} <span class="status ok">● Connected</span></h3>
-        <p class="muted small">${provider === 'gcp' ? 'Project' : 'Subscription'} <span class="mono">${esc(id)}</span>${provider === 'azure' ? ` · resource group <span class="mono">lyrcloud-${esc(connection.connectionId)}</span>` : ''}</p>
+        <p class="muted small">${{ gcp: 'Project', azure: 'Subscription', alibaba: 'Account' }[provider]} <span class="mono">${esc(id)}</span>${provider === 'azure' ? ` · resource group <span class="mono">lyrcloud-${esc(connection.connectionId)}</span>` : ''}</p>
         <button class="btn small" data-action="cloud-disconnect" data-provider="${provider}">Disconnect</button>
       </div>`;
   }
-  const shell = provider === 'gcp' ? 'https://shell.cloud.google.com/?show=terminal' : 'https://shell.azure.com/bash';
+  const shell = { gcp: 'https://shell.cloud.google.com/?show=terminal', azure: 'https://shell.azure.com/bash', alibaba: 'https://shell.alibabacloud.com/' }[provider];
   return `
     <div class="cloud-connect-card wide">
       <h3>Connect ${name} <span class="status pending">◌ Waiting for you</span></h3>
       <ol class="steps-list">
-        <li><b>Open ${provider === 'gcp' ? 'Google Cloud Shell in the project to use' : 'Azure Cloud Shell (Bash) in the subscription to use'}.</b> <a class="btn small primary" href="${shell}" target="_blank" rel="noopener">Open Cloud Shell ↗</a>
-          ${provider === 'gcp' ? '<br><span class="muted small">Pick the project first: <code>gcloud config set project YOUR-PROJECT</code>. You need Owner (or IAM Admin) on it.</span>' : '<br><span class="muted small">You need Owner on the subscription and permission to create app registrations.</span>'}</li>
+        <li><b>Open ${{ gcp: 'Google Cloud Shell in the project to use', azure: 'Azure Cloud Shell (Bash) in the subscription to use', alibaba: 'Alibaba Cloud Shell, signed in to the account to use' }[provider]}.</b> <a class="btn small primary" href="${shell}" target="_blank" rel="noopener">Open Cloud Shell ↗</a>
+          <br><span class="muted small">${{ gcp: 'Pick the project first: <code>gcloud config set project YOUR-PROJECT</code>. You need Owner (or IAM Admin) on it.', azure: 'You need Owner on the subscription and permission to create app registrations.', alibaba: 'Use the main account or a RAM user with RAM admin rights (it creates an OIDC provider and a role).' }[provider]}</span></li>
         <li><b>Paste and run this script.</b> <button class="btn small" data-action="cloud-copy-script" data-provider="${provider}">Copy script</button>
           <pre class="preview-output setup-script">${esc(connection.setupScript || '')}</pre></li>
         <li><b>Paste what it printed.</b>
           <form class="stack" data-form="cloud-connect-finish" data-provider="${provider}">
-            ${provider === 'gcp'
+            ${provider === 'alibaba'
+              ? `<div class="field-grid"><label class="field">Account ID<input name="accountId" class="mono" required inputmode="numeric" placeholder="5123456789012345" autocomplete="off" /></label></div>`
+              : provider === 'gcp'
               ? `<div class="field-grid"><label class="field">Project ID<input name="projectId" class="mono" required placeholder="my-project" autocomplete="off" /></label><label class="field">Project number<input name="projectNumber" class="mono" required inputmode="numeric" placeholder="123456789012" autocomplete="off" /></label></div>`
               : `<div class="field-grid"><label class="field">Tenant ID<input name="tenantId" class="mono" required autocomplete="off" /></label><label class="field">Subscription ID<input name="subscriptionId" class="mono" required autocomplete="off" /></label><label class="field">Client ID<input name="clientId" class="mono" required autocomplete="off" /></label></div>`}
             <div class="row"><button class="btn primary" type="submit">Connect</button><button class="btn ghost" type="button" data-action="cloud-disconnect" data-provider="${provider}">Cancel</button></div>
           </form></li>
       </ol>
-      <p class="muted small">${provider === 'gcp'
+      <p class="muted small">${provider === 'alibaba'
+        ? `The script switches on Function Compute and Container Service (pay-as-you-go, nothing runs until you create it), makes an OIDC provider that only accepts Lyrcloud sign-ins for this connection, and the role <span class="mono">lyrcloud-${esc(connection.connectionId)}</span> with Function Compute, ACK, ECS, VPC and load balancer rights. Delete the role to cut access.`
+        : provider === 'gcp'
         ? 'The script makes a workload identity provider that only accepts Lyrcloud sign-ins carrying your connection ID, and a service account <span class="mono">lyrcloud-access</span> with Cloud Run and GKE admin roles. Delete either to cut access.'
         : `The script makes the resource group <span class="mono">lyrcloud-${esc(connection.connectionId)}</span> and an app that trusts Lyrcloud’s sign-in, with Contributor on that group only. Delete the app to cut access.`}</p>
     </div>`;
@@ -2633,7 +2639,7 @@ function federatedPanel(provider, connection) {
 
 function connectionsPanel(data) {
   const all = data.connections || {};
-  const connected = ['aws', 'gcp', 'azure'].filter((p) => all[p]?.status === 'connected');
+  const connected = CLOUD_IDS.filter((p) => all[p]?.status === 'connected');
   return `
     <section class="panel">
       <div class="panel-head"><h2>Your clouds</h2><span class="muted">${connected.length ? `${connected.map((p) => CLOUD_NAMES[p]).join(', ')} connected` : 'Connect at least one'}</span></div>
@@ -2642,6 +2648,7 @@ function connectionsPanel(data) {
         ${awsCard(all.aws || data.connection)}
         ${federatedPanel('gcp', all.gcp)}
         ${federatedPanel('azure', all.azure)}
+        ${federatedPanel('alibaba', all.alibaba)}
       </div>
     </section>`;
 }
@@ -2697,7 +2704,7 @@ function connectionPanel(connection) {
 }
 
 function clusterForm(connections) {
-  const ready = ['aws', 'gcp', 'azure'].filter((p) => connections?.[p]?.status === 'connected');
+  const ready = CLOUD_IDS.filter((p) => connections?.[p]?.status === 'connected');
   const provider = ready.includes(cloud.formProvider) ? cloud.formProvider : ready[0];
   const kinds = CLOUD_KINDS[provider];
   return `
@@ -2717,12 +2724,13 @@ function clusterForm(connections) {
           <legend>Kubernetes</legend>
           ${provider === 'gcp' ? '<p class="muted small">Autopilot has no nodes to pick: Google sizes the cluster to your pods. Anyone with Kubernetes Engine access in your project can use it.</p>' : `
           <div class="field-grid">
-            <label class="field">${provider === 'azure' ? 'Node size' : 'Worker size'}<select name="nodeType" data-action="cloud-estimate">${nodeOptions(provider)}</select></label>
-            <label class="field">${provider === 'azure' ? 'Nodes' : 'Workers'}<input name="nodes" type="number" min="1" max="20" value="2" data-action="cloud-estimate" /></label>
+            <label class="field">${provider === 'aws' ? 'Worker size' : 'Node size'}<select name="nodeType" data-action="cloud-estimate">${nodeOptions(provider)}</select></label>
+            <label class="field">${provider === 'aws' ? 'Workers' : 'Nodes'}<input name="nodes" type="number" min="1" max="20" value="2" data-action="cloud-estimate" /></label>
           </div>`}
           ${provider === 'aws' ? `<label class="field">Cluster admin (your IAM user or role ARN)<input name="adminArn" class="mono" placeholder="arn:aws:iam::123456789012:user/you" autocomplete="off" /></label>
           <p class="muted small">Find it with <code>aws sts get-caller-identity</code>. This identity gets kubectl admin access.</p>` : ''}
           ${provider === 'azure' ? '<p class="muted small">Anyone with access to the lyrcloud resource group can get kubectl credentials.</p>' : ''}
+          ${provider === 'alibaba' ? '<p class="muted small">First Kubernetes cluster on this account? Open <a class="link" href="https://cs.console.alibabacloud.com/" target="_blank" rel="noopener">the Container Service console</a> once and accept the roles it asks for. Nodes get public IPs, so there’s no NAT gateway to pay for.</p>' : ''}
         </fieldset>
         <div class="estimate" id="cluster-estimate"></div>
         <p class="form-error" hidden></p>
@@ -2835,7 +2843,7 @@ const SERVER_SIZE_LABELS = { small: '2 vCPU · 2 GB', medium: '2 vCPU · 4 GB', 
 
 function serversPanel(data) {
   const servers = data.servers || [];
-  const ready = ['aws', 'gcp', 'azure'].filter((p) => (data.connections || {})[p]?.status === 'connected' || (p === 'aws' && data.connection?.status === 'connected'));
+  const ready = CLOUD_IDS.filter((p) => (data.connections || {})[p]?.status === 'connected' || (p === 'aws' && data.connection?.status === 'connected'));
   const provider = ready.includes(cloud.serverProvider) ? cloud.serverProvider : ready[0];
   return `
     <section class="panel">
@@ -2884,11 +2892,13 @@ const KIND_LABELS = {
   aws: { kubernetes: 'Kubernetes (EKS)', serverless: 'Serverless (ECS Fargate)' },
   gcp: { kubernetes: 'Kubernetes (GKE Autopilot)', serverless: 'Serverless (Cloud Run)' },
   azure: { kubernetes: 'Kubernetes (AKS)', serverless: 'Serverless (Container Apps)' },
+  alibaba: { kubernetes: 'Kubernetes (ACK)', serverless: 'Serverless (Function Compute)' },
 };
 const IMAGE_HELP = {
   aws: 'Public images (Docker Hub, GHCR, ECR Public) and private ECR images in your account work.',
   gcp: 'Docker Hub and Artifact Registry images work (Cloud Run doesn’t pull from GHCR).',
   azure: 'Public images from Docker Hub, GHCR and other registries work.',
+  alibaba: 'Images from Alibaba Container Registry work best; for other registries, add the login under private registry.',
 };
 const envText = (env) => Object.entries(env || {}).map(([key, value]) => `${key}=${value}`).join('\n');
 
@@ -2974,7 +2984,7 @@ function cloudClusterView(route) {
         <pre class="preview-output">${cluster.provider === 'aws' ? `aws eks update-kubeconfig --region ${esc(cluster.region)} --name ${esc(cluster.outputs.ClusterName || `lyrcloud-${cluster.name}`)}
 kubectl get nodes` : esc(detail.kubectl || '')}</pre>
         <p class="muted small">${cluster.provider === 'aws' ? `Run these as <span class="mono">${esc(cluster.adminArn)}</span>. Services of type LoadBalancer get a public AWS load balancer.` : `Run these in ${cluster.provider === 'gcp' ? 'Google' : 'Azure'} Cloud Shell, or anywhere their CLI is signed in to your account.`}</p>
-        ${cluster.provider === 'gcp' ? '' : `<form class="row" data-form="cloud-resize"><label class="inline-check">${cluster.provider === 'azure' ? 'Nodes' : 'Workers'} <input name="nodes" type="number" min="1" max="20" value="${cluster.nodes}" /></label><button class="btn" type="submit">Resize</button></form>`}
+        ${cluster.provider === 'gcp' ? '' : `<form class="row" data-form="cloud-resize"><label class="inline-check">${cluster.provider === 'aws' ? 'Workers' : 'Nodes'} <input name="nodes" type="number" min="1" max="20" value="${cluster.nodes}" /></label><button class="btn" type="submit">Resize</button></form>`}
       </section>` : ''}
     ${kube && ready ? `
       <section class="panel">
@@ -3102,7 +3112,7 @@ const cloudClickActions = {
   'cloud-disconnect': (target) => {
     const provider = target.dataset.provider || 'aws';
     if (!confirmed(target, `Disconnect ${CLOUD_NAMES[provider]} from Lyrcloud?`)) return;
-    const after = { aws: 'Delete the lyrcloud-access stack in AWS to remove the role.', gcp: 'Delete the lyrcloud workload identity provider in Google Cloud to remove access.', azure: 'Delete the Lyrcloud app registration in Azure to remove access.' }[provider];
+    const after = { aws: 'Delete the lyrcloud-access stack in AWS to remove the role.', gcp: 'Delete the lyrcloud workload identity provider in Google Cloud to remove access.', azure: 'Delete the Lyrcloud app registration in Azure to remove access.', alibaba: 'Delete the lyrcloud-… role and OIDC provider in Alibaba Cloud RAM to remove access.' }[provider];
     cloudRun(target, () => cloudApi(`/cloud/connections/${provider}`, { method: 'DELETE' }), `Disconnected. ${after}`, loadCloud);
   },
   'cloud-pay': (target) => cloudRun(target, () => cloudApi(`/cloud/clusters/${currentRoute.clusterId}/pay`, { method: 'POST' }), '', ({ payUrl }) => { location.href = payUrl; }),
