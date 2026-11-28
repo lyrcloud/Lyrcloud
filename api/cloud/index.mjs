@@ -336,6 +336,8 @@ async function federatedConnectionRoutes(event, method, who, provider) {
   const existing = await getItem(key);
   if (method === 'POST') {
     if (existing) return json(200, { connection: publicConnection(existing) });
+    // Alibaba Cloud opens to customers when the super admin switches it on; staff can always try it.
+    if (provider === 'alibaba' && !who.staff && !(await getFeatures()).alibaba) return error(403, 'Alibaba Cloud is coming soon.');
     const connectionId = `lyr${randomBytes(5).toString('hex')}`;
     const item = { ...key, row: 'connection', ownerId: who.userId, ownerEmail: who.email, provider, connectionId, setupScript: await setupScriptFor(provider, connectionId), createdAt: now() };
     await put(item);
@@ -1245,6 +1247,7 @@ async function overview(who) {
     serverLimit: who.staff ? null : SERVERS_LIMIT[who.plan] ?? 1,
     accessRoleName: ACCESS_ROLE_NAME,
     plan: who.plan,
+    staff: who.staff,
     limits: who.staff ? null : (await import('./fees.mjs')).limitsFor(who.plan),
     kubernetesFeeCents: KUBERNETES_FEE_CENTS,
     features: await getFeatures(),
@@ -1253,7 +1256,7 @@ async function overview(who) {
 
 // Features the super admin switches on: the "your domain + CDN" upsell on services, and managed hosting.
 const SETTINGS_KEY = { pk: '#settings', sk: 'cloud' };
-export const FEATURES = ['upsell', 'hosting'];
+export const FEATURES = ['upsell', 'hosting', 'alibaba'];
 async function getFeatures() {
   const row = (await getItem(SETTINGS_KEY)) || {};
   return Object.fromEntries(FEATURES.map((name) => [name, row[name] === true]));

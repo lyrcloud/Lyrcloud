@@ -2680,7 +2680,7 @@ function connectionsPanel(data) {
         ${awsCard(all.aws || data.connection)}
         ${federatedPanel('gcp', all.gcp)}
         ${federatedPanel('azure', all.azure)}
-        ${federatedPanel('alibaba', all.alibaba)}
+        ${all.alibaba || data.features?.alibaba || data.staff ? federatedPanel('alibaba', all.alibaba) : ''}
       </div>
     </section>`;
 }
@@ -3077,6 +3077,7 @@ function adminCloudTab() {
     </div>
     <section class="panel">
       <div class="panel-head"><h2>Cloud features</h2></div>
+      ${toggle('alibaba', 'Alibaba Cloud for customers', 'Shows the Alibaba Cloud connect card to everyone (staff always see it). Switch on once a real account has connected and built a service.')}
       ${toggle('upsell', 'Domain + CDN offer on services', 'Each running service shows “Put it on your own domain with the Lyrcloud CDN”, which opens Sites with the service as a cloud-app origin. Needs the lyrcloud-sites AppDistribution (deploy-sites.sh, then deploy-domains.sh).')}
       ${toggle('hosting', 'Managed hosting', 'Customers deploy apps on Lyrcloud’s own AWS account, without a cloud account of their own, paid with Lyrpay. Needs the hosting account set up first (scripts/deploy-hosting.sh).')}
     </section>
@@ -3204,7 +3205,7 @@ const cloudClickActions = {
 const cloudChangeActions = {
   'cloud-estimate': () => updateClusterEstimate(),
   'cloud-feature': (target) => cloudRun(target, () => cloudApi('/admin/cloud/settings', { method: 'PUT', body: JSON.stringify({ [target.dataset.feature]: target.checked }) }),
-    `${target.dataset.feature === 'upsell' ? 'Domain + CDN offer' : 'Managed hosting'} ${target.checked ? 'on' : 'off'}`, () => { adminCloud.data = null; cloud.data = null; loadAdminCloud(); }),
+    `${{ upsell: 'Domain + CDN offer', hosting: 'Managed hosting', alibaba: 'Alibaba Cloud' }[target.dataset.feature]} ${target.checked ? 'on' : 'off'}`, () => { adminCloud.data = null; cloud.data = null; loadAdminCloud(); }),
   'cloud-server-provider': (target) => {
     cloud.serverProvider = target.value;
     render();

@@ -162,6 +162,14 @@ beforeEach(() => {
   lyrpayments = new Map();
   accounts = {};
   requests = [];
+  tables.cloud.set('#settings|cloud', { pk: '#settings', sk: 'cloud', alibaba: true });
+});
+
+test('Alibaba Cloud stays hidden from customers until the super admin switches it on', async () => {
+  tables.cloud.delete('#settings|cloud');
+  const refused = await call(ALICE, 'POST', '/cloud/connections/alibaba');
+  assert.equal(refused.status, 403);
+  assert.equal((await call(ALICE, 'GET', '/cloud')).body.features.alibaba, false);
 });
 
 test('signing: canonical query and nested RPC parameters', () => {
